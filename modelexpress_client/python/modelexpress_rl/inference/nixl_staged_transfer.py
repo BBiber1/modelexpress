@@ -1339,10 +1339,11 @@ class _NixlStagedTransfer:
             context={"device_id": self._device_id, "phase": "stage"},
         )
         logger.info(
-            "[TIMING] staged xfer: %.3f GB, %d descriptors "
+            "[TIMING] staged xfer: %.3f GB (%d bytes), %d descriptors "
             "(seg=%d full_pull=%d convert=%d), %d tensors | "
             "wire=%.3fs reconstruct=%.3fs",
             bytes_received / 1e9,
+            bytes_received,
             len(prepared.descriptors),
             len(prepared.plan.segments),
             len(prepared.plan.full_pulls),

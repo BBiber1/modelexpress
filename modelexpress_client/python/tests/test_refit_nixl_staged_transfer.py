@@ -4,6 +4,7 @@
 from contextlib import nullcontext
 import ctypes
 from dataclasses import replace
+import logging
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
@@ -252,9 +253,10 @@ def _manifest(
 @pytest.mark.parametrize("switch_failure", [None, "initialize", "register"])
 @pytest.mark.parametrize("warm_cache", [False, True])
 def test_released_updates_switch_workspaces_without_reusing_stale_plans(
-    monkeypatch, switch_failure, warm_cache
+    monkeypatch, caplog, switch_failure, warm_cache
 ):
     """Switch modes with real plans and byte copies, mocking only CUDA/NIXL."""
+    caplog.set_level(logging.INFO, logger="modelexpress.refit.weight_bytes")
     events = []
     source_tensor = torch.arange(4, dtype=torch.float32)
     real_empty = torch.empty
@@ -449,6 +451,24 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
         expected_registrations = 5 if switch_failure == "register" else 4
         assert events.count("metadata") == expected_registrations
         assert events.count("register") == expected_registrations
+        required_logs = [
+            record for record in caplog.records
+            if record.message.startswith("[MX_REFIT_REQUIRED_BYTES]")
+        ]
+        assert len(required_logs) == 4
+        assert all(
+            "required_weight_bytes=16" in record.message for record in required_logs
+        )
+        if switch_failure is None:
+            changed = TrainerUpdateSource(
+                replace(source.inputs, layout_signature="changed-layout")
+            )
+            prepared = method.prepare(version=None, source=changed)
+            method.release(prepared)
+            assert sum(
+                record.message.startswith("[MX_REFIT_REQUIRED_BYTES]")
+                for record in caplog.records
+            ) == 5
         for i, event in enumerate(events):
             if event == "shutdown" and i and events[i - 1] == "sync":
                 assert events[i + 1] == "initialize"

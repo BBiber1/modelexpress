@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from collections.abc import Callable
 from contextlib import contextmanager
 from time import perf_counter
@@ -16,6 +18,7 @@ from modelexpress.refit.timing import (
     set_refit_cold,
 )
 
+from ... import envs as rl_envs
 from ...train import WeightPayloadFormat
 from ..adapter import NixlGeneratorSource
 from ..nixl_staged_transfer import (
@@ -34,6 +37,8 @@ from ..plan import (
     UpdateMethod,
     WeightSource,
 )
+
+weight_bytes_logger = logging.getLogger("modelexpress.refit.weight_bytes")
 
 
 class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
@@ -55,6 +60,24 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
         self._active_direct: PreparedDirectGroupTensors | None = None
+
+    def _capture_for_logging(self, layouts: list) -> Callable:
+        def capture(manifest):
+            result, layout = self._capture_layout(manifest)
+            layouts.append(layout)
+            return result, layout
+
+        return capture
+
+    def _log_required_bytes(self, inputs, layout) -> None:
+        weight_bytes_logger.info(
+            "[MX_REFIT_REQUIRED_BYTES] rank=%s local_rank=%s "
+            "layout_signature=%s required_weight_bytes=%d",
+            rl_envs.RANK,
+            rl_envs.LOCAL_RANK,
+            inputs.layout_signature,
+            sum(math.prod(shape) * dtype.itemsize for shape, dtype in layout.values()),
+        )
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -83,6 +106,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         set_refit_cold(not reusable)
         manifests = [item.transport.manifest for item in inputs.sources]
         manifest_digests = tuple(item.manifest_digest for item in inputs.sources)
+        layouts = []
         with refit_span(
             "transfer_planning",
             metadata={
@@ -94,9 +118,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             if not reusable:
                 self._active_plan = self._transfer.prepare(
                     manifests=manifests,
-                    capture_layout=self._capture_layout,
+                    capture_layout=self._capture_for_logging(layouts),
                 )
                 self._active_fingerprint = inputs.physical_fingerprint
+        if not reusable and layouts:
+            self._log_required_bytes(inputs, layouts[0])
         if reusable and manifest_digests != self._active_manifest_digests:
             assert self._active_plan is not None
             with refit_span(
@@ -133,10 +159,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._active_plan = None
         self._active_fingerprint = None
         self._active_manifest_digests = ()
+        layouts = []
         try:
             prepared = self._transfer.prepare(
                 manifests=[item.transport.manifest for item in source.inputs.sources],
-                capture_layout=self._capture_layout,
+                capture_layout=self._capture_for_logging(layouts),
                 max_staging_bytes=max_staging_bytes,
                 staging_device=staging_device,
                 staging_buffers=staging_buffers,
@@ -183,6 +210,8 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                     "failed to reset streaming preparation; restart the generator engine"
                 ) from cleanup_error
             raise
+        if layouts:
+            self._log_required_bytes(source.inputs, layouts[0])
         self._active_streamed = streamed
         return selected
 
@@ -198,6 +227,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 )
             self._active_direct = prepared
         yield
+
 
     def release(self, prepared: PreparedArtifact) -> None:
         if self._active_direct is not None and prepared is not self._active_direct:
