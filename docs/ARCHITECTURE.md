@@ -1446,6 +1446,13 @@ graph TD
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
+For staged RL reshard reads, `[TIMING] NIXL READ in-flight` reports one span per
+source batch, from the call to `nixl_agent.transfer(handle)` until NIXL first
+reports that handle complete. It excludes descriptor preparation, handle release,
+and device synchronization. Completion is observed by polling, so the span
+includes up to one polling interval of detection delay. The staged `wire` timing
+covers the broader post-and-wait path across all source batches.
+
 Zero-byte tensors remain in manifests and participate in exact name, size, and
 dtype validation. They count as matched tensors but are omitted from NIXL
 descriptor lists because they have no registered memory range. A manifest made

@@ -109,6 +109,7 @@ class PostedRead:
     total_bytes: int
     num_ranges: int
     posted_at: float = field(default_factory=time.perf_counter)
+    submitted_at: float = field(default_factory=time.perf_counter)
 
 
 class NixlTransferManager:
@@ -639,6 +640,7 @@ class NixlTransferManager:
         handles: list,
         timeout_seconds: float | None,
         label: str,
+        completed_at: dict[int, float] | None = None,
     ) -> None:
         """Poll several NIXL handles until all complete or one fails.
 
@@ -673,6 +675,8 @@ class NixlTransferManager:
             for handle in pending:
                 status = self._agent.check_xfer_state(handle)
                 if status in ("DONE", "SUCCESS"):
+                    if completed_at is not None:
+                        completed_at[id(handle)] = time.perf_counter()
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
                     self._data_plane_error = f"{label} failed with status {status}"
@@ -1148,6 +1152,7 @@ class NixlTransferManager:
                 remote_indices=indices,
                 backends=self._backends,
             )
+            submitted_at = time.perf_counter()
             self._agent.transfer(handle)
         except Exception:
             # Nothing is in flight for this batch, so drop its handle here rather
@@ -1162,6 +1167,7 @@ class NixlTransferManager:
             total_bytes=sum(nbytes for (_r, _l, nbytes, _d) in ranges),
             num_ranges=len(ranges),
             posted_at=posted_at,
+            submitted_at=submitted_at,
         )
 
     def _release_xfer_handle(self, handle: Any) -> None:
@@ -1195,16 +1201,26 @@ class NixlTransferManager:
         if not batches:
             return 0, 0, 0.0
 
+        completed_at: dict[int, float] = {}
         try:
             self._wait_for_xfers(
                 [p.handle for p in batches],
                 timeout_seconds,
                 "NIXL reshard READ batch",
+                completed_at,
             )
         finally:
             for batch in batches:
                 self._release_xfer_handle(batch.handle)
 
+        for batch in batches:
+            logger.info(
+                "[TIMING] NIXL READ in-flight: %.6fs, %.3f GB, %d ranges, peer=%s",
+                completed_at[id(batch.handle)] - batch.submitted_at,
+                batch.total_bytes / 1e9,
+                batch.num_ranges,
+                batch.remote_agent_name,
+            )
         self._accelerator_backend.synchronize(self._device_id)
         return (
             sum(p.total_bytes for p in batches),
