@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -38,6 +39,21 @@ _STAGE_SET = frozenset(REFIT_TIMING_STAGES)
 _current_recorder: contextvars.ContextVar[RefitTimingRecorder | None] = (
     contextvars.ContextVar("mx_refit_timing_recorder", default=None)
 )
+_memory_lock = threading.Lock()
+_memory_sampled = False
+
+
+def _memory_usage() -> dict[str, int]:
+    usage = {}
+    with open("/proc/self/statm", encoding="ascii") as statm:
+        usage["cpu_rss_bytes"] = int(statm.read().split()[1]) * os.sysconf(
+            "SC_PAGE_SIZE"
+        )
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        usage["gpu_allocated_bytes"] = int(torch.cuda.memory_allocated())
+        usage["gpu_reserved_bytes"] = int(torch.cuda.memory_reserved())
+    return usage
 
 
 @dataclass
@@ -273,6 +289,15 @@ class RefitTimingRecorder:
             return self._emitted_payload
         self.finish()
         payload = self.as_dict()
+        global _memory_sampled
+        if self.cold is not False and not _memory_sampled:
+            with _memory_lock:
+                if not _memory_sampled:
+                    _memory_sampled = True
+                    try:
+                        payload["memory"] = _memory_usage()
+                    except Exception:
+                        logger.debug("refit memory sample unavailable", exc_info=True)
         encoded = json.dumps(
             payload,
             separators=(",", ":"),

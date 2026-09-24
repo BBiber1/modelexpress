@@ -1156,7 +1156,8 @@ The destination-map signature includes parameter names, shapes, strides,
 storage identities, data types, devices, and expert mapping. Replacing or
 reshaping a parameter invalidates the map and records the next update as cold.
 `RefitTimingRecorder` emits one stable timing payload for discovery through
-readiness.
+readiness. Its first cold record per process also captures current CPU RSS and,
+when CUDA is already initialized, PyTorch GPU allocated and reserved bytes.
 
 MDL does not discover sources, plan resharding, transfer bytes, or translate
 trainer tensors. Those stages provide the translated tensor stream and use

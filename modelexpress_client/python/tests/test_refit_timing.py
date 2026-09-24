@@ -5,6 +5,7 @@ import json
 import logging
 
 import pytest
+import modelexpress.refit.timing as timing_module
 from modelexpress.refit import (
     MX_REFIT_TIMING_PREFIX,
     REFIT_TIMING_STAGES,
@@ -107,6 +108,38 @@ def test_context_helpers_and_emit_once(caplog):
     assert len(lines) == 1
     assert json.loads(lines[0].split(" ", 1)[1]) == first == second
     assert second["bytes"] == 0
+
+
+def test_memory_is_sampled_only_on_first_cold_refit(monkeypatch):
+    monkeypatch.setattr(timing_module, "_memory_sampled", False)
+    samples = []
+
+    def sample():
+        samples.append(True)
+        return {"cpu_rss_bytes": 123, "gpu_allocated_bytes": 456}
+
+    monkeypatch.setattr(timing_module, "_memory_usage", sample)
+    logger = logging.getLogger("modelexpress.test.refit_memory")
+    warm = RefitTimingRecorder(backend="test", version=1, cold=False).emit(logger)
+    first = RefitTimingRecorder(backend="test", version=2, cold=True).emit(logger)
+    later = RefitTimingRecorder(backend="test", version=3, cold=True).emit(logger)
+
+    assert "memory" not in warm
+    assert first["memory"] == {"cpu_rss_bytes": 123, "gpu_allocated_bytes": 456}
+    assert "memory" not in later
+    assert len(samples) == 1
+
+
+def test_memory_sampling_failure_does_not_fail_refit(monkeypatch):
+    monkeypatch.setattr(timing_module, "_memory_sampled", False)
+
+    def unavailable():
+        raise OSError("statm unavailable")
+
+    monkeypatch.setattr(timing_module, "_memory_usage", unavailable)
+    recorder = RefitTimingRecorder(backend="test", version=1, cold=True)
+
+    assert "memory" not in recorder.emit(logging.getLogger("modelexpress.test.refit"))
 
 
 def test_unknown_stage_and_negative_bytes_rejected():

@@ -203,6 +203,11 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 10. rollout readiness.
 
 Set `MX_REFIT_TIMING_STDOUT=1` when a benchmark harness must collect the normalized `MX_REFIT_TIMING` JSON record from worker stdout. Lower layers add spans only when a recorder is active.
+The first cold refit record per process also includes a `memory` snapshot:
+current CPU RSS bytes and, when PyTorch CUDA is already initialized, GPU
+allocated and reserved bytes. A recorder without a cold/warm classification
+uses its first record. The snapshot reads host-side counters after the timed
+cycle; later refits do not sample memory again.
 
 The reshard planner uses this control:
 
