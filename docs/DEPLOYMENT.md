@@ -587,8 +587,11 @@ Install the Python client's `otel` extra to enable its optional refit telemetry 
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to exact OTLP HTTP
 signal URLs in each refit process. The ModelExpress server uses the traces endpoint for refit
 gRPC spans. The client propagates W3C `traceparent` and `tracestate` on refit RPCs; server spans
-join the caller's trace and carry `role=server` and `rank=0`. Refits continue to emit their
-structured timing records, and the server's Prometheus endpoint remains available.
+join the caller's trace and carry `role=server` and `rank=0`. The client creates its
+refit tracer after each worker fork so every rank has distinct span IDs and an active
+export thread, even when vLLM has already installed a global tracer. Refit spans are
+recorded whenever an OTLP traces endpoint is configured. Refits continue to emit
+their structured timing records, and the server's Prometheus endpoint remains available.
 
 ### Choosing trainer staging for synchronous refits
 

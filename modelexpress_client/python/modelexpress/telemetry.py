@@ -17,6 +17,8 @@ from functools import lru_cache
 from typing import Any
 
 _configured_pid: int | None = None
+_tracer: Any | None = None
+_tracer_provider: Any | None = None
 _refit_attributes: contextvars.ContextVar[Mapping[str, str | int]] = (
     contextvars.ContextVar("mx_refit_attributes", default={})
 )
@@ -24,7 +26,7 @@ _refit_attributes: contextvars.ContextVar[Mapping[str, str | int]] = (
 
 def configure(service_name: str) -> None:
     """Configure this process from standard OTLP HTTP environment variables."""
-    global _configured_pid
+    global _configured_pid, _tracer, _tracer_provider
     if _configured_pid == os.getpid():
         return
     traces = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
@@ -32,7 +34,6 @@ def configure(service_name: str) -> None:
     if not traces and not metrics:
         return
     from opentelemetry import metrics as otel_metrics
-    from opentelemetry import trace
     from opentelemetry.sdk.resources import Resource
 
     resource = Resource.create({"service.name": service_name})
@@ -42,12 +43,15 @@ def configure(service_name: str) -> None:
         )
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
-        provider = TracerProvider(resource=resource)
+        # Create the provider after each worker fork for distinct IDs and export threads.
+        provider = TracerProvider(resource=resource, sampler=ALWAYS_ON)
         provider.add_span_processor(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=traces))
         )
-        trace.set_tracer_provider(provider)
+        _tracer_provider = provider
+        _tracer = provider.get_tracer("modelexpress.refit")
     if metrics:
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
             OTLPMetricExporter,
@@ -77,7 +81,12 @@ def span(name: str, attributes: Mapping[str, Any] | None = None) -> Iterator[Any
         return
     from opentelemetry import trace
 
-    with trace.get_tracer("modelexpress.refit").start_as_current_span(name) as current:
+    tracer = (
+        _tracer
+        if _configured_pid == os.getpid() and _tracer is not None
+        else trace.get_tracer("modelexpress.refit")
+    )
+    with tracer.start_as_current_span(name) as current:
         if current.is_recording():
             current.set_attributes(dict(_refit_attributes.get()))
             if attributes:
@@ -154,7 +163,9 @@ def attribute(name: str, value: float) -> None:
             for key, value in _refit_attributes.get().items()
             if key in ("role", "rank", "experiment", "staging_mode")
         }
-        _value_histogram(name).record(int(value) if isinstance(value, bool) else value, dimensions)
+        _value_histogram(name).record(
+            int(value) if isinstance(value, bool) else value, dimensions
+        )
     if enabled():
         from opentelemetry import trace
 
