@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from modelexpress import telemetry
 from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
@@ -212,39 +213,36 @@ class _VllmInstaller(EngineInstaller):
                 return source
         return selected
 
-    def install(self, prepared: PreparedArtifact) -> dict[str, float]:
-        started = time.perf_counter()
-        metrics = prepared.metrics
-        if isinstance(prepared, PreparedEngineTensors):
-            self.install_tensors(prepared.staged.tensors)
-        elif isinstance(prepared, PreparedStreamingTensors):
-            self.install_streaming(prepared)
-            # install_streaming records into the artifact's own metrics dict;
-            # re-read it so those entries travel with the install timing.
-            metrics = prepared.metrics
-            metrics["streaming_apply_s"] = time.perf_counter() - started
-        elif isinstance(prepared, PreparedDirectGroupTensors):
-            from .direct_copy import install_direct_copy
-            from .direct_glm import _GlmDirectPlan, install_glm_direct
+    def install(self, prepared: PreparedArtifact) -> None:
+        direct = isinstance(
+            prepared, (PreparedStreamingTensors, PreparedDirectGroupTensors)
+        )
+        with telemetry.span(
+            "mx.refit.direct_copy_install" if direct else "mx.refit.install"
+        ):
+            if isinstance(prepared, PreparedEngineTensors):
+                self.install_tensors(prepared.staged.tensors)
+            elif isinstance(prepared, PreparedStreamingTensors):
+                self.install_streaming(prepared)
+            elif isinstance(prepared, PreparedDirectGroupTensors):
+                from .direct_copy import install_direct_copy
+                from .direct_glm import _GlmDirectPlan, install_glm_direct
 
-            if type(prepared.plan) is _GlmDirectPlan:
-                install_glm_direct(prepared, model=self._model)
+                if type(prepared.plan) is _GlmDirectPlan:
+                    install_glm_direct(prepared, model=self._model)
+                else:
+                    install_direct_copy(prepared, model=self._model)
+            elif isinstance(prepared, PreparedRuntimeTensors):
+                self.install_runtime_tensors(prepared.staged.tensors)
+            elif isinstance(prepared, PreparedCheckpointArtifact):
+                checkpoint = prepared.checkpoint
+                if not isinstance(checkpoint, PreparedCheckpoint):
+                    raise TypeError("checkpoint preparation has an invalid value")
+                self.install_checkpoint(checkpoint.path)
             else:
-                install_direct_copy(prepared, model=self._model)
-            metrics = prepared.metrics
-            metrics["streaming_apply_s"] = time.perf_counter() - started
-        elif isinstance(prepared, PreparedRuntimeTensors):
-            self.install_runtime_tensors(prepared.staged.tensors)
-        elif isinstance(prepared, PreparedCheckpointArtifact):
-            checkpoint = prepared.checkpoint
-            if not isinstance(checkpoint, PreparedCheckpoint):
-                raise TypeError("checkpoint preparation has an invalid value")
-            self.install_checkpoint(checkpoint.path)
-        else:
-            raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
-        if not isinstance(prepared, (PreparedStreamingTensors, PreparedDirectGroupTensors)):
-            metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
-        return metrics
+                raise TypeError(
+                    f"unsupported prepared artifact {type(prepared).__name__}"
+                )
 
     @property
     def _is_quantized(self) -> bool:
@@ -443,9 +441,12 @@ class _VllmInstaller(EngineInstaller):
                             "invalid or repeated streaming parameter batch"
                         )
                     commit_started = time.perf_counter()
-                    self._process_and_commit(
-                        tensors, reload=False, installed_parameters=installed_parameters
-                    )
+                    with telemetry.span("mx.refit.install_commit"):
+                        self._process_and_commit(
+                            tensors,
+                            reload=False,
+                            installed_parameters=installed_parameters,
+                        )
                     try:
                         installed_parameters.update(
                             (name, self._model.get_parameter(name)) for name in names
@@ -455,20 +456,22 @@ class _VllmInstaller(EngineInstaller):
                             "installed canonical parameter disappeared"
                         ) from error
                     setup_started = time.perf_counter()
-                    arena_storage = {
-                        tensor.untyped_storage().data_ptr()
-                        for tensor in tensors.values()
-                    }
-                    arena_storages |= arena_storage
+                    with telemetry.span("mx.refit.retention_arena_setup"):
+                        arena_storage = {
+                            tensor.untyped_storage().data_ptr()
+                            for tensor in tensors.values()
+                        }
+                        arena_storages |= arena_storage
                     setup_s += time.perf_counter() - setup_started
                     # Reject retained arena views before refill; a later loader
                     # could read overwritten data before the final scan.
                     scan_started = time.perf_counter()
-                    for module in self._model.modules():
-                        if retains_arena(module, arena_storage):
-                            raise IncompleteRefit(
-                                "engine retained bounded staging storage; restart required"
-                            )
+                    with telemetry.span("mx.refit.retention_batch_scan"):
+                        for module in self._model.modules():
+                            if retains_arena(module, arena_storage):
+                                raise IncompleteRefit(
+                                    "engine retained bounded staging storage; restart required"
+                                )
                     batch_scan_s += time.perf_counter() - scan_started
                     batch_scans += 1
                     installed.update(names)
@@ -491,17 +494,19 @@ class _VllmInstaller(EngineInstaller):
             # Repeat over every arena the install used, so a module the final
             # batch created is still covered.
             scan_started = time.perf_counter()
-            for module in self._model.modules():
-                if retains_arena(module, arena_storages):
-                    raise IncompleteRefit(
-                        "engine retained bounded staging storage; restart required"
-                    )
+            with telemetry.span("mx.refit.retention_final_scan"):
+                for module in self._model.modules():
+                    if retains_arena(module, arena_storages):
+                        raise IncompleteRefit(
+                            "engine retained bounded staging storage; restart required"
+                        )
             final_scan_s += time.perf_counter() - scan_started
             final_scans += 1
             load_s = time.perf_counter() - load_started
 
         reload_started = time.perf_counter()
-        self._reload(load)
+        with telemetry.span("mx.refit.reload"):
+            self._reload(load)
         metrics["reload_s"] = time.perf_counter() - reload_started - load_s
         metrics["install_commit_s"] = commit_s
         # retention_batch_scan_s is inside install_commit_s; retention_final_scan_s
@@ -515,7 +520,7 @@ class _VllmInstaller(EngineInstaller):
         # MLA derived weights are refreshed by vLLM's post-load processing inside
         # the reload above, so only the once-per-install synchronize remains.
         sync_started = time.perf_counter()
-        with refit_span("post_install"):
+        with telemetry.span("mx.refit.post_install_sync"), refit_span("post_install"):
             torch.cuda.synchronize(self._device)
         metrics["post_install_sync_s"] = time.perf_counter() - sync_started
 
@@ -614,7 +619,9 @@ class _VllmInstaller(EngineInstaller):
             matched: set[str] = set()
             canonical: dict[int, str] = {}
             alias_groups: dict[int, list[tuple[str, Module, str]]] = {}
-            for module_name, module in self._model.named_modules(remove_duplicate=False):
+            for module_name, module in self._model.named_modules(
+                remove_duplicate=False
+            ):
                 duplicate_module = module in group_paths
                 group_paths.setdefault(module, module_name)
                 owned = set()
@@ -646,11 +653,7 @@ class _VllmInstaller(EngineInstaller):
                 # batch covering only part of one before any hook runs. Asked
                 # of the live tree, since an earlier hook may have added a
                 # Parameter here since the layout was captured.
-                if (
-                    not reload
-                    and owned & tensors.keys()
-                    and missing
-                ):
+                if not reload and owned & tensors.keys() and missing:
                     raise IncompleteRefit(
                         f"streaming batch splits an owning module {module_name!r}; "
                         f"missing canonical parameters={sorted(missing)}"
@@ -674,7 +677,10 @@ class _VllmInstaller(EngineInstaller):
                 # their hooks run, and an earlier hook may replace a later
                 # owner. Committing into the detached module would leave the
                 # live one without the published bytes.
-                if not reload and self._model.get_submodule(group_paths[layer]) is not layer:
+                if (
+                    not reload
+                    and self._model.get_submodule(group_paths[layer]) is not layer
+                ):
                     raise IncompleteRefit(
                         f"a post-load hook replaced module {group_paths[layer]!r} "
                         "before its parameters were committed"

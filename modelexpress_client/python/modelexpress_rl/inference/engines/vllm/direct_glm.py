@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from modelexpress import telemetry
 
 from ...plan import PreparedDirectGroupTensors, PreparedStreamingTensors
 from .direct_copy import (
@@ -467,17 +468,19 @@ def install_glm_direct(prepared, *, model):
 
     # The framework pause has completed. Drain auxiliary CUDA streams as well
     # before checking SharedExperts outputs and touching live parameters.
-    drain()
-    _, _, signature = _inspect(model, plan.config)
-    _require(signature == plan.signature, "GLM bindings changed after preparation")
+    with telemetry.span("mx.refit.direct_guard"):
+        drain()
+        _, _, signature = _inspect(model, plan.config)
+        _require(signature == plan.signature, "GLM bindings changed after preparation")
     metrics = prepared.source.transfer_metrics
     metrics["direct_guard_s"] = time.perf_counter() - started
 
     def finish():
         refreshed = time.perf_counter()
-        for mla in plan.mla:
-            mla.refresh()
-        drain()
+        with telemetry.span("mx.refit.derived_refresh"):
+            for mla in plan.mla:
+                mla.refresh()
+            drain()
         metrics["derived_refresh_s"] = time.perf_counter() - refreshed
 
     # No model callbacks run between batches. This path never attaches a receive
@@ -495,3 +498,4 @@ def install_glm_direct(prepared, *, model):
         retention_batch_scans=0,
         retention_final_scans=0,
     )
+    telemetry.attribute("glm_direct_install", 1)

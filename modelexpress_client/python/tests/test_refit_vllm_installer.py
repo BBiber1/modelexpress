@@ -180,7 +180,7 @@ def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp
     recorder = RefitTimingRecorder(backend="test", version="version-a")
 
     with use_refit_timing(recorder):
-        metrics = installer.install(prepared)
+        result = installer.install(prepared)
 
     assert events == [
         ("loader", "safetensors"),
@@ -193,9 +193,7 @@ def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp
     assert model_config.revision == "main"
     assert vllm_config.load_config.load_format == "modelexpress"
     assert synchronized == [torch.device("cpu")]
-    assert metrics["bytes_received"] == 7.0
-    assert metrics["perf/mx_receive_install_time"] >= 0
-    assert "streaming_apply_s" not in metrics
+    assert result is None
     assert recorder.as_dict()["stages"]["post_install"]["count"] == 1
 
 
@@ -211,9 +209,7 @@ def test_bounded_install_reports_transfer_and_apply_without_install_only_metric(
         transfer_metrics.update(wire_s=0.25, bytes_received=16.0)
         yield {"weight": values}
 
-    source = PreparedStreamingTensors(
-        batches, frozenset({"weight"}), transfer_metrics
-    )
+    source = PreparedStreamingTensors(batches, frozenset({"weight"}), transfer_metrics)
     if direct:
         prepared = direct_copy.prepare_direct_copy(
             model,
@@ -233,13 +229,12 @@ def test_bounded_install_reports_transfer_and_apply_without_install_only_metric(
         device=torch.device("cpu"),
     )
 
-    metrics = installer.install(prepared)
+    result = installer.install(prepared)
 
     assert torch.equal(model.weight, values)
-    assert metrics["wire_s"] == 0.25
-    assert metrics["bytes_received"] == 16.0
-    assert metrics["streaming_apply_s"] >= 0
-    assert "perf/mx_receive_install_time" not in metrics
+    assert result is None
+    assert transfer_metrics["wire_s"] == 0.25
+    assert transfer_metrics["bytes_received"] == 16.0
 
 
 def test_installer_includes_prepared_engine_tensor_metrics(monkeypatch):
@@ -252,11 +247,9 @@ def test_installer_includes_prepared_engine_tensor_metrics(monkeypatch):
     monkeypatch.setattr(installer, "install_tensors", lambda _tensors: None)
     staged = SimpleNamespace(tensors={}, metrics={"bytes_received": 7.0})
 
-    metrics = installer.install(PreparedEngineTensors(staged=staged))
+    result = installer.install(PreparedEngineTensors(staged=staged))
 
-    assert metrics["bytes_received"] == 7.0
-    assert metrics["perf/mx_receive_install_time"] >= 0
-    assert "streaming_apply_s" not in metrics
+    assert result is None
 
 
 def test_installer_restores_runtime_buffer_created_after_reload_metadata(monkeypatch):
@@ -313,14 +306,14 @@ def test_installer_accepts_runtime_tensors_written_directly_in_place():
     )
     staged = type("Staged", (), {"tensors": live, "metrics": {"bytes_received": 0}})()
 
-    metrics = installer.install(PreparedRuntimeTensors(staged=staged))
+    result = installer.install(PreparedRuntimeTensors(staged=staged))
 
     assert torch.equal(live["weight"], torch.tensor([7.0, 8.0]))
     assert torch.equal(live["runtime_buffer"], torch.tensor([9.0]))
     assert {
         name: tensor.data_ptr() for name, tensor in live.items()
     } == original_pointers
-    assert metrics["bytes_received"] == 0
+    assert result is None
 
 
 def test_installer_rejects_a_runtime_staging_copy():
@@ -392,9 +385,7 @@ def test_runtime_refit_refreshes_host_scales_and_invalidates_warm_caches(
             getattr(attn, f"_{key}_scale").copy_(
                 torch.tensor([factor * value / 2, factor * value])
             )
-        received = {
-            name: tensor.clone() for name, tensor in attn.named_buffers()
-        }
+        received = {name: tensor.clone() for name, tensor in attn.named_buffers()}
         installer.install(prepared)
 
         assert attn._q_scale_float == factor * 0.25
@@ -428,7 +419,10 @@ def test_runtime_refit_refreshes_host_scales_and_invalidates_warm_caches(
     ],
 )
 def test_runtime_refit_rejects_invalid_scale_state(
-    warm_runtime_install, attribute, value, message,
+    warm_runtime_install,
+    attribute,
+    value,
+    message,
 ):
     installer, attn, prepared = warm_runtime_install
     if attribute in attn._buffers:
@@ -468,12 +462,23 @@ def test_warm_host_scale_refresh_requires_eager_execution(warm_runtime_install):
 
 @pytest.mark.parametrize("install_path", ["tensors", "checkpoint"])
 @pytest.mark.parametrize("quantized", [False, True])
-@pytest.mark.parametrize("version", [
-    "0.19.0", "0.10.1.1", "0.6.3.post1", "0.19.0.post1",
-    "0.19.1rc1.dev12+g1a2b3c", "dev",
-])
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.19.0",
+        "0.10.1.1",
+        "0.6.3.post1",
+        "0.19.0.post1",
+        "0.19.1rc1.dev12+g1a2b3c",
+        "dev",
+    ],
+)
 def test_installer_preserves_vllm_mla_refresh(
-    monkeypatch, tmp_path, install_path, quantized, version,
+    monkeypatch,
+    tmp_path,
+    install_path,
+    quantized,
+    version,
 ):
     model = nn.Module()
     mla = nn.Module()
@@ -1007,7 +1012,10 @@ def test_alias_restoration_rejects_detached_owners(owner, mutation):
     model.alias_owner.bias = model.gate.bias
     original = model.gate.bias
     installer = _VllmInstaller(
-        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
     )
     aliases = installer._parameter_aliases(model)
     detached = getattr(model, owner)
@@ -1033,7 +1041,10 @@ def test_alias_restoration_tracks_each_path_to_a_shared_module(replace_alias_own
     model.b = model.a
     original = model.a.weight
     installer = _VllmInstaller(
-        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
     )
     aliases = installer._parameter_aliases(model)
     if replace_alias_owner:
@@ -1324,6 +1335,7 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
         installer.capture(manifest)
         assert model.capture_calls == 4
 
+
 class _Parent(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1332,7 +1344,9 @@ class _Parent(nn.Module):
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(monkeypatch, packed):
+def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(
+    monkeypatch, packed
+):
     """A parent's post-load hook may replace its own submodule.
 
     Unpacked, the child is its own batch and is resolved against the live tree
@@ -1356,11 +1370,17 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(monkeypatc
         for layer in (target.layer, target.layer.child):
             layerwise.LAYERWISE_INFO[layer] = Info(layer)
             for name, parameter in list(layer.named_parameters(recurse=False)):
-                setattr(layer, name, nn.Parameter(torch.empty_like(parameter, device="meta")))
+                setattr(
+                    layer,
+                    name,
+                    nn.Parameter(torch.empty_like(parameter, device="meta")),
+                )
 
     _install_fake_vllm(monkeypatch, initialize)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
-    quant_base = sys.modules["vllm.model_executor.layers.quantization.base_config"].QuantizeMethodBase
+    quant_base = sys.modules[
+        "vllm.model_executor.layers.quantization.base_config"
+    ].QuantizeMethodBase
 
     def commit(layer, info):
         for name, original in info.kernel_tensors[0].items():
@@ -1386,7 +1406,10 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(monkeypatc
             yield child
 
     installer = _VllmInstaller(
-        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
     )
     try:
         installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
@@ -1397,7 +1420,9 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(monkeypatc
     )
 
 
-def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(monkeypatch):
+def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
+    monkeypatch,
+):
     """install_streaming abandons the transfer with close(), not throw().
 
     The generator therefore sees GeneratorExit even while an install error is
@@ -1451,7 +1476,9 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(monk
             for d in posted:
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
-    prepared = transfer_module._PreparedBoundedTransfer(planned, {"w": source}, Transport())
+    prepared = transfer_module._PreparedBoundedTransfer(
+        planned, {"w": source}, Transport()
+    )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
     transfer._closed = False
     transfer._active = prepared
@@ -1469,9 +1496,14 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(monk
     model.b = Owner(torch.float32)
     names = frozenset(dict(model.named_parameters()))
     installer = _VllmInstaller(
-        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
     )
     with pytest.raises(IncompleteRefit, match="no compatible live storage"):
         installer.install_streaming(
-            PreparedStreamingTensors(lambda: transfer.iter_bounded(prepared, {}), names, {})
+            PreparedStreamingTensors(
+                lambda: transfer.iter_bounded(prepared, {}), names, {}
+            )
         )

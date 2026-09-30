@@ -100,10 +100,11 @@ def test_selected_glm_path_copies_then_refreshes_without_reload(monkeypatch):
             **{k: v for k, v in arguments.items() if k != "version_id"},
         )
         assert not events
-        metrics = installer.install(selected)
+        result = installer.install(selected)
         assert events == ["read:weight", "read:bias", "close", "refresh"]
-        assert metrics["glm_direct_install"] == 1
-        assert metrics["retention_batch_scans"] == 0
+        assert result is None
+        assert selected.source.transfer_metrics["glm_direct_install"] == 1
+        assert selected.source.transfer_metrics["retention_batch_scans"] == 0
         assert selected.ownership.iterator is None
         assert {
             n: (id(p), p.data_ptr()) for n, p in model.named_parameters()

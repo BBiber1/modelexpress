@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 
 import torch
+from modelexpress import telemetry
 from torch import nn
 from torch.nn.modules import module as module_runtime
 from torch.overrides import _get_current_function_mode_stack
@@ -459,33 +460,34 @@ def _install_copy_batches(prepared, *, plan, validate_batch, finish=None) -> Non
                 tensors = next_batch()
                 _require(tensors is not sentinel, "missing received batch")
                 commit_started = time.perf_counter()
-                validate_batch()
-                _require(
-                    type(tensors) is dict
-                    and all(type(key) is str for key in tensors)
-                    and frozenset(tensors) == names,
-                    "received batch differs from admitted group plan",
-                )
-                for name, tensor in tensors.items():
-                    geometry = _geometry(tensor, destination=False)
-                    target = destinations[name].geometry
+                with telemetry.span("mx.refit.install_commit"):
+                    validate_batch()
                     _require(
-                        geometry[1] == target[1] and geometry[3:5] == target[3:5],
-                        "received tensor geometry differs",
+                        type(tensors) is dict
+                        and all(type(key) is str for key in tensors)
+                        and frozenset(tensors) == names,
+                        "received batch differs from admitted group plan",
                     )
-                    _require(
-                        all(
-                            geometry[4] != device
-                            or geometry[8] + geometry[9] <= start
-                            or geometry[8] >= end
-                            for device, start, end in ranges
-                        ),
-                        "receive tensor aliases live storage",
-                    )
-                for name, tensor in tensors.items():
-                    _COPY(destinations[name].tensor, tensor)
-                    copied += 1
-                drain()
+                    for name, tensor in tensors.items():
+                        geometry = _geometry(tensor, destination=False)
+                        target = destinations[name].geometry
+                        _require(
+                            geometry[1] == target[1] and geometry[3:5] == target[3:5],
+                            "received tensor geometry differs",
+                        )
+                        _require(
+                            all(
+                                geometry[4] != device
+                                or geometry[8] + geometry[9] <= start
+                                or geometry[8] >= end
+                                for device, start, end in ranges
+                            ),
+                            "receive tensor aliases live storage",
+                        )
+                    for name, tensor in tensors.items():
+                        _COPY(destinations[name].tensor, tensor)
+                        copied += 1
+                    drain()
                 commit_s += time.perf_counter() - commit_started
                 del tensors
             _require(next_batch() is sentinel, "extra received batch")

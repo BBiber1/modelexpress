@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import threading
 import math
+import threading
 import time
 from collections.abc import Callable, Iterator
 from copy import deepcopy
@@ -22,8 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import torch
-
-from modelexpress import envs, p2p_pb2
+from modelexpress import envs, p2p_pb2, telemetry
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -237,51 +236,58 @@ class _BoundedPlanCache:
         key = None
         if enabled:
             started = time.perf_counter()
-            if any(not isinstance(blob, bytes) for blob in manifests):
-                raise TypeError("cached plan manifests must be immutable bytes")
-            capture_key = (capture, tuple(parameter_layout.items()))
-            if not copy_key_on_miss:
-                capture_key = deepcopy(capture_key)
-                metrics["plan_cache_key_copies"] = 1
-            key = (
-                tuple(manifests),
-                tuple(
-                    (name, _source_structure(source))
-                    for name, source in resolved.sources.items()
-                ),
-                tuple(resolved.session_to_agent.items()),
-                tuple(resolved.session_to_device.items()),
-                tuple(resolved.agent_metadata.items()),
-                capture_key,
-                max_staging_bytes,
-                pack,
-                reuse_complete,
-                envs.MX_RESHARD_PUBLISH_DIGEST,
-                envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY,
-                staging_device,
-                staging_buffers,
-                total_staging_bytes,
-            )
-            hit = entry is not None and entry[0] == key
-            if not hit and copy_key_on_miss:
-                key = (*key[:5], deepcopy(capture_key), *key[6:])
-                metrics["plan_cache_key_copies"] = 1
+            with telemetry.span("mx.refit.plan_cache_lookup"):
+                if any(not isinstance(blob, bytes) for blob in manifests):
+                    raise TypeError("cached plan manifests must be immutable bytes")
+                capture_key = (capture, tuple(parameter_layout.items()))
+                if not copy_key_on_miss:
+                    capture_key = deepcopy(capture_key)
+                    metrics["plan_cache_key_copies"] = 1
+                key = (
+                    tuple(manifests),
+                    tuple(
+                        (name, _source_structure(source))
+                        for name, source in resolved.sources.items()
+                    ),
+                    tuple(resolved.session_to_agent.items()),
+                    tuple(resolved.session_to_device.items()),
+                    tuple(resolved.agent_metadata.items()),
+                    capture_key,
+                    max_staging_bytes,
+                    pack,
+                    reuse_complete,
+                    envs.MX_RESHARD_PUBLISH_DIGEST,
+                    envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY,
+                    staging_device,
+                    staging_buffers,
+                    total_staging_bytes,
+                )
+                hit = entry is not None and entry[0] == key
+                if not hit and copy_key_on_miss:
+                    key = (*key[:5], deepcopy(capture_key), *key[6:])
+                    metrics["plan_cache_key_copies"] = 1
             metrics["plan_cache_lookup_s"] = time.perf_counter() - started
             metrics["plan_cache_hits"] = int(hit)
             metrics["plan_cache_misses"] = int(not hit)
+            telemetry.attribute("plan_cache_hits", int(hit))
             if hit:
                 assert entry is not None
                 compiled = entry[1]
                 started = time.perf_counter()
-                _NixlStagedTransfer._validate_complete(
-                    capture, parameter_layout, compiled.plan
-                )
+                with (
+                    telemetry.span("mx.refit.plan_cache_validate"),
+                    telemetry.span("mx.refit.bounded_whole_validation"),
+                ):
+                    _NixlStagedTransfer._validate_complete(
+                        capture, parameter_layout, compiled.plan
+                    )
                 metrics["bounded_whole_validation_s"] = time.perf_counter() - started
                 owner_started = time.perf_counter()
-                for batch in compiled.module_batches:
-                    _NixlStagedTransfer._validate_complete(
-                        batch.capture, batch.layouts[0], batch.plan
-                    )
+                with telemetry.span("mx.refit.owner_validation"):
+                    for batch in compiled.module_batches:
+                        _NixlStagedTransfer._validate_complete(
+                            batch.capture, batch.layouts[0], batch.plan
+                        )
                 metrics["owner_validation_s"] = time.perf_counter() - owner_started
                 metrics["plan_cache_validate_s"] = time.perf_counter() - started
                 self._entry = entry
@@ -352,7 +358,8 @@ def _bounded_batches(
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
     started = time.perf_counter()
-    _NixlStagedTransfer._validate_complete(capture, parameter_layout, complete)
+    with telemetry.span("mx.refit.bounded_whole_validation"):
+        _NixlStagedTransfer._validate_complete(capture, parameter_layout, complete)
     metrics["bounded_whole_validation_s"] = time.perf_counter() - started
     if {copy.param_name for copy in capture.copies} - parameter_layout.keys():
         raise IncompleteRefit("bounded capture references unknown engine parameters")
@@ -372,7 +379,8 @@ def _bounded_batches(
         metrics["owner_plan_s"] += time.perf_counter() - started
         metrics["owner_plan_builds"] += 1
         started = time.perf_counter()
-        _NixlStagedTransfer._validate_complete(subset, recv, plan)
+        with telemetry.span("mx.refit.owner_validation"):
+            _NixlStagedTransfer._validate_complete(subset, recv, plan)
         metrics["owner_validation_s"] += time.perf_counter() - started
         convert = {
             c.param_name: (tuple(c.dest_shape), c.src_dtype) for c in plan.converts
@@ -467,19 +475,22 @@ def _resolve_sources(manifests: list[bytes], *, metrics=None) -> _ResolvedSource
     if metrics is None:
         metrics = {}
     started = time.perf_counter()
-    payloads = [unwrap_rendezvous_blob(manifest) for manifest in manifests]
+    with telemetry.span("mx.refit.source_decode"):
+        payloads = [unwrap_rendezvous_blob(manifest) for manifest in manifests]
     agents = [payload.agent_name for payload in payloads]
     if len(set(agents)) != len(agents):
         raise ValueError("source manifests contain duplicate NIXL agents")
     metrics["source_decode_s"] = time.perf_counter() - started
     started = time.perf_counter()
-    merged = merge_shard_tables([payload.tensors for payload in payloads])
+    with telemetry.span("mx.refit.source_merge"):
+        merged = merge_shard_tables([payload.tensors for payload in payloads])
     metrics["source_merge_s"] = time.perf_counter() - started
     started = time.perf_counter()
     session_to_memory = {}
-    sources, session_to_agent, session_to_device = build_sources(
-        merged, session_to_memory=session_to_memory
-    )
+    with telemetry.span("mx.refit.source_build"):
+        sources, session_to_agent, session_to_device = build_sources(
+            merged, session_to_memory=session_to_memory
+        )
     metrics["source_build_s"] = time.perf_counter() - started
     return _ResolvedSources(
         sources=sources,
@@ -519,12 +530,14 @@ class _SourceResolutionCache:
             self.clear()
             return _resolve_sources(manifests, metrics=metrics)
         started = time.perf_counter()
-        key = tuple(manifests)
-        entry = self._entry
-        hit = entry is not None and entry[0] == key
+        with telemetry.span("mx.refit.source_cache_lookup"):
+            key = tuple(manifests)
+            entry = self._entry
+            hit = entry is not None and entry[0] == key
         metrics["source_cache_lookup_s"] = time.perf_counter() - started
         metrics["source_cache_hits"] = int(hit)
         metrics["source_cache_misses"] = int(not hit)
+        telemetry.attribute("source_cache_hits", int(hit))
         if hit:
             assert entry is not None
             return entry[1]
@@ -874,16 +887,18 @@ class _NixlStagedTransfer:
             raise ValueError("staging_buffers must be a positive integer")
         phase_started = time.perf_counter()
         metrics = {}
-        resolved = self._source_cache.resolve(
-            manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
-        )
+        with telemetry.span("mx.refit.source_metadata"):
+            resolved = self._source_cache.resolve(
+                manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
+            )
         manifest = [
             (name, source.dtype, tuple(source.global_shape))
             for name, source in resolved.sources.items()
         ]
         metrics["source_metadata_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
-        capture, parameter_layout = capture_layout(manifest)
+        with telemetry.span("mx.refit.layout_capture"):
+            capture, parameter_layout = capture_layout(manifest)
         metrics["layout_capture_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         batches = None
@@ -901,18 +916,19 @@ class _NixlStagedTransfer:
                 raise ValueError(
                     "max_staging_bytes must cover at least one byte per staging buffer"
                 )
-            compiled = self._plan_cache.compile(
-                manifests=manifests,
-                resolved=resolved,
-                capture=capture,
-                parameter_layout=parameter_layout,
-                max_staging_bytes=buffer_budget,
-                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-                metrics=metrics,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=max_staging_bytes,
-            )
+            with telemetry.span("mx.refit.transfer_planning"):
+                compiled = self._plan_cache.compile(
+                    manifests=manifests,
+                    resolved=resolved,
+                    capture=capture,
+                    parameter_layout=parameter_layout,
+                    max_staging_bytes=buffer_budget,
+                    enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
+                    metrics=metrics,
+                    staging_device=staging_device,
+                    staging_buffers=staging_buffers,
+                    total_staging_bytes=max_staging_bytes,
+                )
             plan, batches = compiled.plan, compiled.batches
         else:
             self._plan_cache.clear()
@@ -947,7 +963,8 @@ class _NixlStagedTransfer:
                 "NIXL metadata changed for an already connected source agent: "
                 f"{conflicting[:10]}"
             )
-        _load_agent_metadata(self._manager, changed)
+        with telemetry.span("mx.refit.connection_registration"):
+            _load_agent_metadata(self._manager, changed)
         self._loaded_agent_metadata.update(changed)
         host_staging = batches is not None and staging_device == "cpu"
         transport = NixlReshardTransport(
@@ -1024,6 +1041,8 @@ class _NixlStagedTransfer:
         metrics["staging_peak_bytes"] = sum(a.numel() for a in arenas)
         metrics["staging_buffers"] = len(arenas)
         metrics["batches"] = len(prepared.batches)
+        for name in ("staging_peak_bytes", "staging_buffers", "batches"):
+            telemetry.attribute(name, metrics[name])
         batches = prepared.batches
 
         def carve(
@@ -1063,7 +1082,8 @@ class _NixlStagedTransfer:
                 prepared.transport,
             )
             started = time.perf_counter()
-            posted = prepared.transport.post_reads(list(chunk.descriptors))
+            with telemetry.span("mx.refit.wire_post"):
+                posted = prepared.transport.post_reads(list(chunk.descriptors))
             return chunk, (recv, convert, full), posted, started
 
         pending = None
@@ -1087,6 +1107,9 @@ class _NixlStagedTransfer:
                 torch.cuda.synchronize(self._device)
                 if len(arenas) == 1 and index + 1 < len(batches):
                     pending = post(index + 1)
+            for name in ("bytes_received", "segments", "full_pull_sources", "converts"):
+                if name in metrics:
+                    telemetry.attribute(name, metrics[name])
         except GeneratorExit:
             # Deliberate abandonment, not a failure, so a drain error below has
             # nothing to mask and must still be reported.
@@ -1284,7 +1307,8 @@ class _NixlStagedTransfer:
         if prepared is not self._active:
             raise RuntimeError("NIXL transfer plan is no longer active")
         started = time.perf_counter()
-        posted = prepared.transport.post_reads(list(prepared.descriptors))
+        with telemetry.span("mx.refit.wire_post"):
+            posted = prepared.transport.post_reads(list(prepared.descriptors))
         return self._complete_stage(prepared, posted, started)
 
     @torch.no_grad()
@@ -1293,37 +1317,39 @@ class _NixlStagedTransfer:
     ) -> _StagedNixlWeights:
         """Wait for posted READs, then reconstruct, convert, and verify."""
         wait_started = time.perf_counter()
-        prepared.transport.await_reads(posted)
+        with telemetry.span("mx.refit.wire_wait"):
+            prepared.transport.await_reads(posted)
         wire_wait_seconds = time.perf_counter() - wait_started
         wire_seconds = time.perf_counter() - started
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.plan.full_pulls:
-            source = self._full_buffers[full.src_name]
-            for copy in full.copies:
-                destination = self._recv_buffers[copy.param_name].as_strided(
+        with telemetry.span("mx.refit.reconstruct"):
+            for full in prepared.plan.full_pulls:
+                source = self._full_buffers[full.src_name]
+                for copy in full.copies:
+                    destination = self._recv_buffers[copy.param_name].as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        self._recv_buffers[copy.param_name].storage_offset()
+                        + copy.dest_offset,
+                    )
+                    destination.copy_(_replay_ops(source, copy.op_chain))
+            converted = {convert.param_name for convert in prepared.plan.converts}
+            conversion_copies = {
+                copy.param_name: copy
+                for copy in prepared.capture.copies
+                if copy.param_name in converted
+            }
+            for convert in prepared.plan.converts:
+                copy = conversion_copies[convert.param_name]
+                target = self._recv_buffers[convert.param_name]
+                destination = target.as_strided(
                     copy.dest_shape,
                     copy.dest_stride,
-                    self._recv_buffers[copy.param_name].storage_offset()
-                    + copy.dest_offset,
+                    target.storage_offset() + copy.dest_offset,
                 )
-                destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.plan.converts}
-        conversion_copies = {
-            copy.param_name: copy
-            for copy in prepared.capture.copies
-            if copy.param_name in converted
-        }
-        for convert in prepared.plan.converts:
-            copy = conversion_copies[convert.param_name]
-            target = self._recv_buffers[convert.param_name]
-            destination = target.as_strided(
-                copy.dest_shape,
-                copy.dest_stride,
-                target.storage_offset() + copy.dest_offset,
-            )
-            destination.copy_(self._convert_buffers[convert.param_name])
-        torch.cuda.synchronize(self._device)
+                destination.copy_(self._convert_buffers[convert.param_name])
+            torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
