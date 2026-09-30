@@ -2609,6 +2609,7 @@ dependencies = [
  "prometheus-client",
  "prost 0.13.5",
  "redis",
+ "rustls",
  "schemars 0.8.22",
  "secrecy",
  "serde",

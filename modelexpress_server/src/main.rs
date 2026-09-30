@@ -41,6 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let trace_provider = match std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
         Ok(endpoint) => {
+            // OTLP's HTTP client uses rustls before model providers initialize it.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let exporter = SpanExporter::builder()
                 .with_http()
                 .with_endpoint(endpoint)

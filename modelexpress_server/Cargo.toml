@@ -64,6 +64,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+rustls = { workspace = true, features = ["ring"] }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
