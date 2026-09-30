@@ -62,8 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let otel_layer = trace_provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer().with_tracer(provider.tracer("modelexpress-server"))
     });
+    let mut filter = EnvFilter::from_default_env().add_directive(log_level.into());
+    if trace_provider.is_some() {
+        filter = filter
+            .add_directive("modelexpress_server::telemetry=info".parse()?)
+            .add_directive("modelexpress_server::refit::service=info".parse()?);
+    }
     let subscriber = tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env().add_directive(log_level.into()))
+        .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .with(otel_layer);
     tracing::subscriber::set_global_default(subscriber)?;

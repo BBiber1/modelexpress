@@ -150,6 +150,9 @@ class RefitTimingRecorder:
             extra = {**(metadata or {}), **discovered}
             if duration_key is not None:
                 extra[duration_key] = elapsed
+            for name, value in extra.items():
+                if isinstance(value, (int, float)) and not name.endswith("_s"):
+                    telemetry.attribute(name, value)
             self.add_duration(
                 stage,
                 elapsed,
@@ -158,19 +161,26 @@ class RefitTimingRecorder:
                 accumulate_metadata=accumulate_metadata,
             )
 
+        span_name = duration_key.removesuffix("_s") if duration_key else stage
         with telemetry.span(
-            f"mx.refit.{stage}", self._trace_attributes()
+            f"mx.refit.{span_name}", self._trace_attributes()
         ) as trace_span:
             try:
                 yield discovered
             except BaseException:
                 if trace_span.is_recording():
                     trace_span.set_attribute("status", "error")
+                    for name, value in {**(metadata or {}), **discovered}.items():
+                        if isinstance(value, (str, bool, int, float)):
+                            trace_span.set_attribute(name, value)
                 record("error")
                 raise
             else:
                 if trace_span.is_recording():
                     trace_span.set_attribute("status", status)
+                    for name, value in {**(metadata or {}), **discovered}.items():
+                        if isinstance(value, (str, bool, int, float)):
+                            trace_span.set_attribute(name, value)
                 record(status)
 
     def add_duration(
@@ -224,6 +234,8 @@ class RefitTimingRecorder:
         self._validate_stage(stage)
         item = self._stages[stage]
         for name, value in metadata.items():
+            if isinstance(value, (int, float)) and not name.endswith("_s"):
+                telemetry.attribute(name, value)
             if (
                 accumulate
                 and isinstance(value, (int, float))
@@ -372,7 +384,8 @@ def use_refit_timing(recorder: RefitTimingRecorder) -> Iterator[RefitTimingRecor
     telemetry.configure("modelexpress-rl")
     token = _current_recorder.set(recorder)
     try:
-        yield recorder
+        with telemetry.refit_attributes(recorder._trace_attributes()):
+            yield recorder
     finally:
         _current_recorder.reset(token)
 

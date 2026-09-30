@@ -126,6 +126,16 @@ def duration(name: str, seconds: float, attributes: Mapping[str, Any]) -> None:
         _histogram(name).record(seconds, dict(attributes))
 
 
+@lru_cache(maxsize=32)
+def _value_histogram(name: str) -> Any:
+    from opentelemetry import metrics
+
+    unit = "By" if name.endswith("bytes") else "1"
+    return metrics.get_meter("modelexpress.refit").create_histogram(
+        f"mx_refit_{name}", unit=unit
+    )
+
+
 @contextlib.contextmanager
 def refit_attributes(attributes: Mapping[str, str | int]) -> Iterator[None]:
     """Apply role and rank to nested refit spans in the current context."""
@@ -137,7 +147,14 @@ def refit_attributes(attributes: Mapping[str, str | int]) -> Iterator[None]:
 
 
 def attribute(name: str, value: float) -> None:
-    """Attach a numeric value to the active span when it is recording."""
+    """Record a numeric refit fact on its span and as an OTLP metric."""
+    if os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
+        dimensions = {
+            key: value
+            for key, value in _refit_attributes.get().items()
+            if key in ("role", "rank", "experiment", "staging_mode")
+        }
+        _value_histogram(name).record(int(value) if isinstance(value, bool) else value, dimensions)
     if enabled():
         from opentelemetry import trace
 

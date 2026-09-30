@@ -401,8 +401,10 @@ class ModelExpressGeneratorClient:
             assert self._runtime is not None
             with telemetry.span("mx.refit.streaming_total"):
                 with telemetry.span("mx.refit.streaming_prepare"):
+                    with telemetry.span("mx.refit.streaming_selection"):
+                        ready = self._get_ready_version(version.version_id)
                     update = self._runtime.session.prepare_streaming(
-                        self._get_ready_version(version.version_id),
+                        ready,
                         max_staging_bytes=max_staging_bytes,
                         staging_device=staging_device,
                         staging_buffers=staging_buffers,

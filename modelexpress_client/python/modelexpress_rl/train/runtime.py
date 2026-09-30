@@ -11,6 +11,7 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
+from modelexpress import telemetry
 
 from .. import envs as rl_envs
 from .. import timing
@@ -253,17 +254,25 @@ class TrainerRuntime:
             rank=rl_envs.LOCAL_RANK,
             backend="rl_trainer",
         )
-        try:
-            with timing.active(recorder):
-                staged = method.stage(
-                    version=version,
-                    tensors=self._bound_tensors,
-                )
-                method.publish(version=version, staged=staged)
-        finally:
-            payload = timing.emit(recorder, logger)
-            if payload is not None:
-                self._last_full_tensor_metrics = _flatten_timing(payload)
+        with telemetry.span(
+            "mx.refit.trainer_refit_e2e",
+            {
+                "role": "trainer",
+                "rank": rl_envs.LOCAL_RANK,
+                "version_uid": version.version_id,
+            },
+        ):
+            try:
+                with timing.active(recorder):
+                    staged = method.stage(
+                        version=version,
+                        tensors=self._bound_tensors,
+                    )
+                    method.publish(version=version, staged=staged)
+            finally:
+                payload = timing.emit(recorder, logger)
+                if payload is not None:
+                    self._last_full_tensor_metrics = _flatten_timing(payload)
 
     def release(self, *, version: WeightVersionRef) -> None:
         if isinstance(self.method, FullTensorNixlPublicationMethod):

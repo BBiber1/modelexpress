@@ -179,6 +179,11 @@ impl RefitServiceImpl {
 
 #[tonic::async_trait]
 impl RefitService for RefitServiceImpl {
+    #[tracing::instrument(
+        name = "mx.refit.register_worker",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequest>,
@@ -206,6 +211,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.create_weight_version",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn create_weight_version(
         &self,
         request: Request<CreateWeightVersionRequest>,
@@ -241,6 +251,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.get_weight_version",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn get_weight_version(
         &self,
         request: Request<GetWeightVersionRequest>,
@@ -257,6 +272,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.update_weight_version_state",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn update_weight_version_state(
         &self,
         request: Request<UpdateWeightVersionStateRequest>,
@@ -278,6 +298,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.delete_weight_version",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn delete_weight_version(
         &self,
         request: Request<DeleteWeightVersionRequest>,
@@ -294,6 +319,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.create_weight_version_shard",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn create_weight_version_shard(
         &self,
         request: Request<CreateWeightVersionShardRequest>,
@@ -319,6 +349,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.list_weight_version_shards",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn list_weight_version_shards(
         &self,
         request: Request<ListWeightVersionShardsRequest>,
@@ -332,6 +367,11 @@ impl RefitService for RefitServiceImpl {
             .map_err(backend_status)
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.delete_weight_version_shard",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn delete_weight_version_shard(
         &self,
         request: Request<DeleteWeightVersionShardRequest>,
@@ -347,6 +387,11 @@ impl RefitService for RefitServiceImpl {
             .map_err(backend_status)
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.register_version_lease",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn register_version_lease(
         &self,
         request: Request<RegisterVersionLeaseRequest>,
@@ -365,6 +410,11 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    #[tracing::instrument(
+        name = "mx.refit.delete_version_lease",
+        skip(self, request),
+        fields(role = "server", rank = 0)
+    )]
     async fn delete_version_lease(
         &self,
         request: Request<DeleteVersionLeaseRequest>,

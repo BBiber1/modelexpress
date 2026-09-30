@@ -85,7 +85,7 @@ where
             let staging_mode = std::env::var("MX_REFIT_STAGING_MODE").unwrap_or_default();
             let span = tracing::info_span!(
                 "mx.refit.grpc",
-                role = "control",
+                role = "server",
                 rank = 0,
                 experiment = experiment,
                 staging_mode = staging_mode,

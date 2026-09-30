@@ -8,16 +8,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from time import perf_counter
 from typing import Any
 
+from modelexpress import envs, telemetry
 from vllm.distributed.weight_transfer import WeightTransferEngine
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
 )
 
-from modelexpress import envs
 from modelexpress_rl.inference.client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -136,17 +135,14 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 storage_type = ObjectStorageType(init_info.object_storage_type)
             except ValueError as error:
                 raise ValueError(
-                    f"unsupported object_storage_type="
-                    f"{init_info.object_storage_type!r}"
+                    f"unsupported object_storage_type={init_info.object_storage_type!r}"
                 ) from error
             object_storage = ObjectStorageGeneratorConfig(
                 storage_type=storage_type,
                 initial_base_version_id=init_info.initial_base_version_id,
                 seed_checkpoint_path=init_info.seed_checkpoint_path,
                 refit_checkpoint_dir=init_info.refit_checkpoint_dir,
-                refit_checkpoint_max_size_gb=(
-                    init_info.refit_checkpoint_max_size_gb
-                ),
+                refit_checkpoint_max_size_gb=(init_info.refit_checkpoint_max_size_gb),
                 endpoint_url=init_info.object_storage_endpoint_url,
                 region_name=init_info.object_storage_region_name,
             )
@@ -209,19 +205,12 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 "ModelExpress weight update receiving version=%s",
                 update_info.version_id,
             )
-            stage_started = perf_counter()
-            staged = client.stage_weight(
-                version=WeightVersionRef(update_info.version_id)
-            )
-            stage_weight_time = perf_counter() - stage_started
-            metrics = staged.metrics
-            apply_metrics = client.apply_weight(staged)
-            if isinstance(apply_metrics, dict):
-                metrics.update(apply_metrics)
-            metrics["perf/mx_receive_stage_weight_time"] = stage_weight_time
-            for key, value in sorted(metrics.items()):
-                if key.startswith("perf/") and isinstance(value, (int, float)):
-                    logger.info("ModelExpress receiver metric %s=%s", key, value)
+            with telemetry.span("mx.refit.stage_weight"):
+                staged = client.stage_weight(
+                    version=WeightVersionRef(update_info.version_id)
+                )
+            with telemetry.span("mx.refit.apply_weight"):
+                client.apply_weight(staged)
             self._staged = staged
             self._active_version_id = update_info.version_id
             logger.info(
