@@ -1,6 +1,7 @@
 import importlib.util
 import multiprocessing
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,7 @@ class ForkStateIdGenerator(IdGenerator):
 
 def child(module, carrier, queue):
     module.configure("mx-fork-test")
+    random.seed(1234)  # vLLM seeds every worker identically after fork.
     with (
         module.extracted(carrier),
         module.span("mx.refit", {"role": "generator", "rank": os.getpid()}) as span,

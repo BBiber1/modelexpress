@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
+import secrets
 from collections.abc import Iterator, Mapping, MutableMapping
 from functools import lru_cache
 from typing import Any
@@ -43,10 +44,22 @@ def configure(service_name: str) -> None:
         )
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
         from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
-        # Create the provider after each worker fork for distinct IDs and export threads.
-        provider = TracerProvider(resource=resource, sampler=ALWAYS_ON)
+        class _ProcessIndependentIdGenerator(RandomIdGenerator):
+            def generate_span_id(self) -> int:
+                return secrets.randbits(64) or self.generate_span_id()
+
+            def generate_trace_id(self) -> int:
+                return secrets.randbits(128) or self.generate_trace_id()
+
+        # vLLM seeds global random identically in its forked workers.
+        provider = TracerProvider(
+            resource=resource,
+            sampler=ALWAYS_ON,
+            id_generator=_ProcessIndependentIdGenerator(),
+        )
         provider.add_span_processor(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=traces))
         )
