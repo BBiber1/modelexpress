@@ -590,7 +590,13 @@ gRPC spans. The client propagates W3C `traceparent` and `tracestate` on refit RP
 join the caller's trace and carry `role=server` and `rank=0`. The client creates its
 refit tracer after each worker fork so every rank has distinct span IDs and an active
 export thread, even when vLLM has already installed a global tracer. Refit spans are
-recorded whenever an OTLP traces endpoint is configured. Refits continue to emit
+recorded whenever an OTLP traces endpoint is configured. The telemetry facade's
+`RefitCycle` starts a native `mx.refit.cycle` root independently of the current
+context. Its `inject` method propagates the root through W3C context, and `finish`
+ends it on completion or failure. It stays open across offer and completion hooks;
+it does not leave a span attached between hooks. Trace-only work is guarded by
+`is_recording`. PrimeRL uses this facade without adding OpenTelemetry dependencies.
+Refits continue to emit
 their structured timing records, and the server's Prometheus endpoint remains available.
 
 ### Choosing trainer staging for synchronous refits

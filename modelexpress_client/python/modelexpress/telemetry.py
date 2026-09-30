@@ -87,18 +87,69 @@ def enabled() -> bool:
     return bool(os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
 
 
+def _process_tracer() -> Any:
+    from opentelemetry import trace
+
+    return (
+        _tracer
+        if _configured_pid == os.getpid() and _tracer is not None
+        else trace.get_tracer("modelexpress.refit")
+    )
+
+
+class RefitCycle:
+    """A native refit root whose lifetime spans offer and completion hooks."""
+
+    def __init__(self, attributes: Mapping[str, Any]) -> None:
+        self._span: Any | None = None
+        if not enabled():
+            return
+        from opentelemetry import context
+
+        self._span = _process_tracer().start_span(
+            "mx.refit.cycle", context=context.Context()
+        )
+        if self.is_recording():
+            self._span.set_attributes(dict(attributes))
+
+    def is_recording(self) -> bool:
+        return self._span is not None and self._span.is_recording()
+
+    def inject(self, carrier: MutableMapping[str, str]) -> None:
+        """Propagate the cycle itself, keeping offers and role spans siblings."""
+        if not self.is_recording():
+            return
+        from opentelemetry import trace
+        from opentelemetry.trace.propagation.tracecontext import (
+            TraceContextTextMapPropagator,
+        )
+
+        TraceContextTextMapPropagator().inject(
+            carrier, context=trace.set_span_in_context(self._span)
+        )
+
+    def finish(self, error: BaseException | None = None) -> None:
+        if self._span is None:
+            return
+        if self.is_recording():
+            self._span.set_attribute(
+                "status", "failed" if error is not None else "complete"
+            )
+            if error is not None:
+                from opentelemetry.trace import StatusCode
+
+                self._span.record_exception(error)
+                self._span.set_status(StatusCode.ERROR, str(error))
+        self._span.end()
+        self._span = None
+
+
 @contextlib.contextmanager
 def span(name: str, attributes: Mapping[str, Any] | None = None) -> Iterator[Any]:
     if not enabled():
         yield _NoopSpan()
         return
-    from opentelemetry import trace
-
-    tracer = (
-        _tracer
-        if _configured_pid == os.getpid() and _tracer is not None
-        else trace.get_tracer("modelexpress.refit")
-    )
+    tracer = _process_tracer()
     with tracer.start_as_current_span(name) as current:
         if current.is_recording():
             current.set_attributes(dict(_refit_attributes.get()))
