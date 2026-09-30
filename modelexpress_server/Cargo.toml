@@ -60,6 +60,10 @@ http = { workspace = true }
 moka = { workspace = true }
 secrecy = { workspace = true }
 prometheus-client = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }

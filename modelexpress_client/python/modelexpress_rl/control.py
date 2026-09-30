@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+
 import grpc
-from modelexpress import auth
+from modelexpress import auth, telemetry
 from modelexpress.client import _get_server_url
 
 from . import refit_pb2, refit_pb2_grpc
@@ -132,7 +133,9 @@ class ModelExpressControlClient:
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
         if self._channel is None:
-            self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
+            self._channel = telemetry.refit_channel(
+                auth.with_auth(grpc.insecure_channel(self.server_url))
+            )
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
         assert self._stub is not None
         return self._stub

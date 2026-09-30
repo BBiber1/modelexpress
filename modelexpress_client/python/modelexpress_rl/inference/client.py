@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any
 
 import grpc
-from modelexpress import auth, envs
+from modelexpress import auth, envs, telemetry
 from modelexpress.client import _get_server_url
 from modelexpress.refit.timing import RefitTimingRecorder, refit_span
 
@@ -399,36 +399,33 @@ class ModelExpressGeneratorClient:
             if self._active_handle is not None:
                 raise RuntimeError("another generator update is still active")
             assert self._runtime is not None
-            started = time.perf_counter()
-            update = self._runtime.session.prepare_streaming(
-                self._get_ready_version(version.version_id),
-                max_staging_bytes=max_staging_bytes,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-            )
-            prepare_s = time.perf_counter() - started
-            staged = StagedWeightHandle(
-                client=self, version_id=version.version_id, update=update
-            )
-            self._active_handle = staged
-            try:
-                result = self.apply_weight(staged)
-                metrics = {**(result or {}), **staged.metrics}
-            except BaseException:
-                try:
-                    self._release_staged(staged)
-                except Exception:
-                    logger.exception(
-                        "failed to release streaming update after installation error"
+            with telemetry.span("mx.refit.streaming_total"):
+                with telemetry.span("mx.refit.streaming_prepare"):
+                    update = self._runtime.session.prepare_streaming(
+                        self._get_ready_version(version.version_id),
+                        max_staging_bytes=max_staging_bytes,
+                        staging_device=staging_device,
+                        staging_buffers=staging_buffers,
                     )
-                raise
-            else:
-                release_started = time.perf_counter()
-                self._release_staged(staged)
-                metrics["streaming_prepare_s"] = prepare_s
-                metrics["streaming_release_s"] = time.perf_counter() - release_started
-                metrics["streaming_total_s"] = time.perf_counter() - started
-                return metrics
+                staged = StagedWeightHandle(
+                    client=self, version_id=version.version_id, update=update
+                )
+                self._active_handle = staged
+                try:
+                    with telemetry.span("mx.refit.streaming_apply"):
+                        self.apply_weight(staged)
+                except BaseException:
+                    try:
+                        with telemetry.span("mx.refit.streaming_release"):
+                            self._release_staged(staged)
+                    except Exception:
+                        logger.exception(
+                            "failed to release streaming update after installation error"
+                        )
+                    raise
+                else:
+                    with telemetry.span("mx.refit.streaming_release"):
+                        self._release_staged(staged)
 
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
         """Install a verified local staged version at the caller's safe point."""
@@ -508,7 +505,9 @@ class ModelExpressGeneratorClient:
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
         if self._channel is None:
-            self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
+            self._channel = telemetry.refit_channel(
+                auth.with_auth(grpc.insecure_channel(self.server_url))
+            )
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
         if self._stub is None:
             raise RuntimeError("generator refit service is not initialized")

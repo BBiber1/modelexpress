@@ -581,6 +581,15 @@ sum their actual sizes. Existing receiver dtype conversion remains available,
 but casting a rounded BF16 value back to FP32 cannot recover source precision.
 Verify installed parameters and generation separately from transfer completion.
 
+### Refit OpenTelemetry export
+
+Install the Python client's `otel` extra to enable its optional refit telemetry facade. Set
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to exact OTLP HTTP
+signal URLs in each refit process. The ModelExpress server uses the traces endpoint for refit
+gRPC spans. The client propagates W3C `traceparent` and `tracestate` on refit RPCs; server spans
+join the caller's trace and carry `role=control` and `rank=0`. Refits continue to emit their
+structured timing records, and the server's Prometheus endpoint remains available.
+
 ### Choosing trainer staging for synchronous refits
 
 Choose an existing `TrainerStagingMode` explicitly for the integration:

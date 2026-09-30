@@ -4,8 +4,9 @@
 import json
 import logging
 
-import pytest
 import modelexpress.refit.timing as timing_module
+import pytest
+from modelexpress import telemetry
 from modelexpress.refit import (
     MX_REFIT_TIMING_PREFIX,
     REFIT_TIMING_STAGES,
@@ -19,6 +20,8 @@ from modelexpress.refit import (
 from modelexpress.refit_timing import (
     RefitTimingRecorder as CompatibilityRefitTimingRecorder,
 )
+from opentelemetry import context, trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 
 class _Clock:
@@ -30,6 +33,32 @@ class _Clock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+def test_refit_w3c_context_round_trip(monkeypatch):
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
+    )
+    parent = SpanContext(
+        trace_id=0x12345678901234567890123456789012,
+        span_id=0x1234567890123456,
+        is_remote=False,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        trace_state=TraceState(),
+    )
+    token = context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        carrier = {}
+        telemetry.inject(carrier)
+    finally:
+        context.detach(token)
+
+    assert carrier["traceparent"].startswith("00-12345678901234567890123456789012-")
+    with telemetry.extracted(carrier):
+        extracted = trace.get_current_span().get_span_context()
+        assert extracted.trace_id == parent.trace_id
+        assert extracted.span_id == parent.span_id
+        assert extracted.is_remote
 
 
 def test_legacy_refit_timing_import_is_compatible():

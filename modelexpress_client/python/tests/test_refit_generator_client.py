@@ -3,10 +3,9 @@
 
 import hashlib
 import logging
-from types import SimpleNamespace
-import threading
 from concurrent import futures
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import grpc
 import modelexpress_rl.inference.client as client_module
@@ -1701,10 +1700,10 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 )
             assert installed == ["a.weight"]
         else:
-            metrics = generator.apply_weight_streaming(
+            result = generator.apply_weight_streaming(
                 version=WeightVersionRef("version-a"), max_staging_bytes=512
             )
-            assert metrics["staging_peak_bytes"] == 512
+            assert result is None
             assert installed == ["a.weight", "b.weight"]
             assert generator._serving_version_id == "version-a"
         assert not service.active_leases
