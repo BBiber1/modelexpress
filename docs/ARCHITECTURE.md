@@ -1455,12 +1455,6 @@ and device synchronization. Completion is observed by polling, so the span
 includes up to one polling interval of detection delay. The staged `wire` timing
 covers the broader post-and-wait path across all source batches.
 
-For trainer-to-generator plan creation, `[MX_REFIT_REQUIRED_BYTES]` logs the
-rank, layout signature, and destination parameter bytes. Bounded staging creates
-a plan per version, so it logs this count per version. `[TIMING] staged xfer`
-reports exact NIXL read bytes for each full transfer or bounded batch; bounded
-update metrics sum those bytes across batches.
-
 Zero-byte tensors remain in manifests and participate in exact name, size, and
 dtype validation. They count as matched tensors but are omitted from NIXL
 descriptor lists because they have no registered memory range. A manifest made
