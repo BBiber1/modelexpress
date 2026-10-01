@@ -1507,3 +1507,88 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
                 lambda: transfer.iter_bounded(prepared, {}), names, {}
             )
         )
+
+
+@pytest.mark.parametrize("recording", [True, False])
+def test_streaming_load_iteration_spans_preserve_context_and_weights(monkeypatch, recording):
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.sdk.trace.sampling import ALWAYS_OFF, ALWAYS_ON
+    from modelexpress import telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(sampler=ALWAYS_ON if recording else ALWAYS_OFF)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry, "enabled", lambda: True)
+    monkeypatch.setattr(telemetry, "_process_tracer", lambda: provider.get_tracer("test"))
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False))
+
+    def batches():
+        yield {"0.weight": torch.full((2, 2), 7.0)}
+        yield {"1.weight": torch.full((2, 2), 8.0)}
+
+    installer = _VllmInstaller(model=model, vllm_config=object(), model_config=object(),
+                               device=torch.device("cpu"))
+    token = telemetry._refit_attributes.set({"role": "generator", "rank": 3, "step": 7})
+    try:
+        with telemetry.span("mx.refit"):
+            installer.install_streaming(PreparedStreamingTensors(
+                batches, frozenset(dict(model.named_parameters())), {}))
+    finally:
+        telemetry._refit_attributes.reset(token)
+    assert torch.equal(model[0].weight, torch.full((2, 2), 7.0))
+    assert torch.equal(model[1].weight, torch.full((2, 2), 8.0))
+    spans = exporter.get_finished_spans()
+    if not recording:
+        assert spans == ()
+        return
+    indexed = {span.context.span_id: span for span in spans}
+    streaming = next(span for span in spans if span.name == "mx.refit.vllm_streaming_load")
+    batches_spans = [span for span in spans if span.name == "mx.refit.vllm_load_batch"]
+    assert [span.attributes["batch.index"] for span in batches_spans] == [0, 1]
+    assert all(span.parent.span_id == streaming.context.span_id for span in batches_spans)
+    loads = [span for span in spans if span.name == "mx.refit.vllm_load"]
+    assert len(loads) == 2
+    modules = [span for span in spans if span.name == "mx.refit.vllm_load_module"]
+    layers = [span for span in spans if span.name == "mx.refit.vllm_load_layer"]
+    assert len(modules) == 6
+    assert [span.attributes["module.name"] for span in layers] == ["0", "1"]
+    for span in modules + layers:
+        assert indexed[span.parent.span_id].name == "mx.refit.vllm_load"
+        assert span.attributes["role"] == "generator"
+        assert span.attributes["rank"] == 3
+        assert span.attributes["step"] == 7
+    assert len({span.context.trace_id for span in spans}) == 1
+
+
+def test_streaming_load_failure_marks_batch_and_load_spans(monkeypatch):
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+    from modelexpress import telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry, "enabled", lambda: True)
+    monkeypatch.setattr(telemetry, "_process_tracer", lambda: provider.get_tracer("test"))
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    model = nn.Linear(2, 2, bias=False)
+    installer = _VllmInstaller(model=model, vllm_config=object(), model_config=object(),
+                               device=torch.device("cpu"))
+
+    def batches():
+        yield {}
+
+    with pytest.raises(IncompleteRefit, match="invalid or repeated"):
+        installer.install_streaming(PreparedStreamingTensors(batches, frozenset({"weight"}), {}))
+    failures = {span.name: span for span in exporter.get_finished_spans()}
+    for name in ("mx.refit.vllm_streaming_load", "mx.refit.vllm_load_batch"):
+        assert failures[name].status.status_code == StatusCode.ERROR
+        assert failures[name].events[0].name == "exception"

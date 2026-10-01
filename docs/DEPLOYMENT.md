@@ -1483,6 +1483,16 @@ overlap the previous batch's installation, so wire and installation times must
 not be added as disjoint intervals. GPU validation is required for each target
 model and topology before performance qualification.
 
+The vLLM installer traces the complete streaming load callback as
+`mx.refit.vllm_streaming_load`, with one `mx.refit.vllm_load_batch` child per batch.
+Each batch's post-load callback is `mx.refit.vllm_load`, containing
+`mx.refit.vllm_load_module` spans for live module discovery and
+`mx.refit.vllm_load_layer` spans for per-layer processing and commit. Batch index,
+module name/type and parameter count identify each iteration; role, rank and
+refit context are inherited. Iteration attributes are collected only when the
+span is recording. These spans are nested intervals, not additional elapsed
+time to sum into the refit total.
+
 Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
 `streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
 `source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and

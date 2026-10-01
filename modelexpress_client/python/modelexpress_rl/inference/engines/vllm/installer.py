@@ -418,6 +418,7 @@ class _VllmInstaller(EngineInstaller):
                 for v in values
             )
 
+        @telemetry.span("mx.refit.vllm_streaming_load")
         def load():
             nonlocal load_s, commit_s
             nonlocal setup_s, batch_scan_s, final_scan_s, batch_scans, final_scans
@@ -434,49 +435,53 @@ class _VllmInstaller(EngineInstaller):
             arena_storages: set[int] = set()
             batches = prepared.batches()
             try:
-                for tensors in batches:
-                    names = set(tensors)
-                    if not names or names - expected or names & installed:
-                        raise IncompleteRefit(
-                            "invalid or repeated streaming parameter batch"
-                        )
-                    commit_started = time.perf_counter()
-                    with telemetry.span("mx.refit.install_commit"):
-                        self._process_and_commit(
-                            tensors,
-                            reload=False,
-                            installed_parameters=installed_parameters,
-                        )
-                    try:
-                        installed_parameters.update(
-                            (name, self._model.get_parameter(name)) for name in names
-                        )
-                    except AttributeError as error:
-                        raise IncompleteRefit(
-                            "installed canonical parameter disappeared"
-                        ) from error
-                    setup_started = time.perf_counter()
-                    with telemetry.span("mx.refit.retention_arena_setup"):
-                        arena_storage = {
-                            tensor.untyped_storage().data_ptr()
-                            for tensor in tensors.values()
-                        }
-                        arena_storages |= arena_storage
-                    setup_s += time.perf_counter() - setup_started
-                    # Reject retained arena views before refill; a later loader
-                    # could read overwritten data before the final scan.
-                    scan_started = time.perf_counter()
-                    with telemetry.span("mx.refit.retention_batch_scan"):
-                        for module in self._model.modules():
-                            if retains_arena(module, arena_storage):
-                                raise IncompleteRefit(
-                                    "engine retained bounded staging storage; restart required"
-                                )
-                    batch_scan_s += time.perf_counter() - scan_started
-                    batch_scans += 1
-                    installed.update(names)
-                    torch.cuda.synchronize(self._device)
-                    commit_s += time.perf_counter() - commit_started
+                for batch_index, tensors in enumerate(batches):
+                    with telemetry.span("mx.refit.vllm_load_batch") as current:
+                        if current.is_recording():
+                            current.set_attribute("batch.index", batch_index)
+                            current.set_attribute("parameter.count", len(tensors))
+                        names = set(tensors)
+                        if not names or names - expected or names & installed:
+                            raise IncompleteRefit(
+                                "invalid or repeated streaming parameter batch"
+                            )
+                        commit_started = time.perf_counter()
+                        with telemetry.span("mx.refit.install_commit"):
+                            self._process_and_commit(
+                                tensors,
+                                reload=False,
+                                installed_parameters=installed_parameters,
+                            )
+                        try:
+                            installed_parameters.update(
+                                (name, self._model.get_parameter(name)) for name in names
+                            )
+                        except AttributeError as error:
+                            raise IncompleteRefit(
+                                "installed canonical parameter disappeared"
+                            ) from error
+                        setup_started = time.perf_counter()
+                        with telemetry.span("mx.refit.retention_arena_setup"):
+                            arena_storage = {
+                                tensor.untyped_storage().data_ptr()
+                                for tensor in tensors.values()
+                            }
+                            arena_storages |= arena_storage
+                        setup_s += time.perf_counter() - setup_started
+                        # Reject retained arena views before refill; a later loader
+                        # could read overwritten data before the final scan.
+                        scan_started = time.perf_counter()
+                        with telemetry.span("mx.refit.retention_batch_scan"):
+                            for module in self._model.modules():
+                                if retains_arena(module, arena_storage):
+                                    raise IncompleteRefit(
+                                        "engine retained bounded staging storage; restart required"
+                                    )
+                        batch_scan_s += time.perf_counter() - scan_started
+                        batch_scans += 1
+                        installed.update(names)
+                        torch.cuda.synchronize(self._device)
+                        commit_s += time.perf_counter() - commit_started
             except BaseException:
                 # close() reaches the transfer as GeneratorExit, which it cannot
                 # tell apart from a clean abandonment. Report this install error;
@@ -608,6 +613,7 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
+        @telemetry.span("mx.refit.vllm_load")
         def load() -> None:
             # Quantized models expose kernel-packed parameters before layerwise
             # reload and load-time parameters after it. Resolve the captured
@@ -622,42 +628,47 @@ class _VllmInstaller(EngineInstaller):
             for module_name, module in self._model.named_modules(
                 remove_duplicate=False
             ):
-                duplicate_module = module in group_paths
-                group_paths.setdefault(module, module_name)
-                owned = set()
-                missing = set()
-                for leaf, parameter in module._parameters.items():
-                    if parameter is None:
-                        continue
-                    full_name = f"{module_name}.{leaf}" if module_name else leaf
-                    alias_groups.setdefault(id(parameter), []).append(
-                        (module_name, module, leaf)
-                    )
-                    # Keep every alias path, but process each owning module once.
-                    if duplicate_module:
-                        continue
-                    canonical_name = canonical.setdefault(id(parameter), full_name)
-                    owned.add(full_name)
-                    if canonical_name not in tensors:
-                        previously_installed_alias = (
-                            canonical_name != full_name
-                            and installed_parameters is not None
-                            and installed_parameters.get(canonical_name) is parameter
+                with telemetry.span("mx.refit.vllm_load_module") as current:
+                    if current.is_recording():
+                        current.set_attribute("module.name", module_name)
+                        current.set_attribute("module.type", type(module).__name__)
+                        current.set_attribute("parameter.count", len(module._parameters))
+                    duplicate_module = module in group_paths
+                    group_paths.setdefault(module, module_name)
+                    owned = set()
+                    missing = set()
+                    for leaf, parameter in module._parameters.items():
+                        if parameter is None:
+                            continue
+                        full_name = f"{module_name}.{leaf}" if module_name else leaf
+                        alias_groups.setdefault(id(parameter), []).append(
+                            (module_name, module, leaf)
                         )
-                        if not previously_installed_alias:
-                            missing.add(canonical_name)
-                    if full_name in tensors:
-                        groups.setdefault(module, []).append((full_name, leaf))
-                        matched.add(full_name)
-                # Streaming installs an owning module at a time, so reject a
-                # batch covering only part of one before any hook runs. Asked
-                # of the live tree, since an earlier hook may have added a
-                # Parameter here since the layout was captured.
-                if not reload and owned & tensors.keys() and missing:
-                    raise IncompleteRefit(
-                        f"streaming batch splits an owning module {module_name!r}; "
-                        f"missing canonical parameters={sorted(missing)}"
-                    )
+                        # Keep every alias path, but process each owning module once.
+                        if duplicate_module:
+                            continue
+                        canonical_name = canonical.setdefault(id(parameter), full_name)
+                        owned.add(full_name)
+                        if canonical_name not in tensors:
+                            previously_installed_alias = (
+                                canonical_name != full_name
+                                and installed_parameters is not None
+                                and installed_parameters.get(canonical_name) is parameter
+                            )
+                            if not previously_installed_alias:
+                                missing.add(canonical_name)
+                        if full_name in tensors:
+                            groups.setdefault(module, []).append((full_name, leaf))
+                            matched.add(full_name)
+                    # Streaming installs an owning module at a time, so reject a
+                    # batch covering only part of one before any hook runs. Asked
+                    # of the live tree, since an earlier hook may have added a
+                    # Parameter here since the layout was captured.
+                    if not reload and owned & tensors.keys() and missing:
+                        raise IncompleteRefit(
+                            f"streaming batch splits an owning module {module_name!r}; "
+                            f"missing canonical parameters={sorted(missing)}"
+                        )
             unmatched = sorted(set(tensors) - matched)
             if unmatched:
                 raise IncompleteRefit(
@@ -673,51 +684,56 @@ class _VllmInstaller(EngineInstaller):
             # back is bandwidth into storage the CUDA graphs already point at.
             # Charged together they cannot be acted on.
             for layer, parameters in groups.items():
-                # A packed batch resolves several owning modules before any of
-                # their hooks run, and an earlier hook may replace a later
-                # owner. Committing into the detached module would leave the
-                # live one without the published bytes.
-                if (
-                    not reload
-                    and self._model.get_submodule(group_paths[layer]) is not layer
-                ):
-                    raise IncompleteRefit(
-                        f"a post-load hook replaced module {group_paths[layer]!r} "
-                        "before its parameters were committed"
-                    )
-                info = LAYERWISE_INFO.get(layer)
-                if not reload and (info is None or info.kernel_tensors is None):
+                with telemetry.span("mx.refit.vllm_load_layer") as current:
+                    if current.is_recording():
+                        current.set_attribute("module.name", group_paths[layer])
+                        current.set_attribute("module.type", type(layer).__name__)
+                        current.set_attribute("parameter.count", len(parameters))
+                    # A packed batch resolves several owning modules before any of
+                    # their hooks run, and an earlier hook may replace a later
+                    # owner. Committing into the detached module would leave the
+                    # live one without the published bytes.
+                    if (
+                        not reload
+                        and self._model.get_submodule(group_paths[layer]) is not layer
+                    ):
+                        raise IncompleteRefit(
+                            f"a post-load hook replaced module {group_paths[layer]!r} "
+                            "before its parameters were committed"
+                        )
+                    info = LAYERWISE_INFO.get(layer)
+                    if not reload and (info is None or info.kernel_tensors is None):
+                        for full_name, leaf in parameters:
+                            target = getattr(layer, leaf)
+                            source = tensors[full_name]
+                            if (
+                                target.device.type == "meta"
+                                or target.shape != source.shape
+                                or target.dtype != source.dtype
+                            ):
+                                raise IncompleteRefit(
+                                    "unmanaged streaming parameter has no compatible live storage"
+                                )
+                            target.copy_(source)
+                        continue
                     for full_name, leaf in parameters:
-                        target = getattr(layer, leaf)
-                        source = tensors[full_name]
-                        if (
-                            target.device.type == "meta"
-                            or target.shape != source.shape
-                            or target.dtype != source.dtype
-                        ):
-                            raise IncompleteRefit(
-                                "unmanaged streaming parameter has no compatible live storage"
-                            )
-                        target.copy_(source)
-                    continue
-                for full_name, leaf in parameters:
-                    setattr(
-                        layer,
-                        leaf,
-                        nn.Parameter(tensors[full_name], requires_grad=False),
-                    )
-                quant_method = getattr(layer, "quant_method", None)
-                if isinstance(quant_method, QuantizeMethodBase):
-                    if hasattr(layer, "_already_called_process_weights_after_loading"):
-                        delattr(layer, "_already_called_process_weights_after_loading")
-                    with refit_span("transformation"):
-                        quant_method.process_weights_after_loading(layer)
-                if info is not None and info.kernel_tensors is not None:
-                    with refit_span("installation"):
-                        _copy_and_restore_kernel_tensors(layer, info)
-                if info is not None:
-                    info.reset()
-                self._restore_parameter_aliases(aliases)
+                        setattr(
+                            layer,
+                            leaf,
+                            nn.Parameter(tensors[full_name], requires_grad=False),
+                        )
+                    quant_method = getattr(layer, "quant_method", None)
+                    if isinstance(quant_method, QuantizeMethodBase):
+                        if hasattr(layer, "_already_called_process_weights_after_loading"):
+                            delattr(layer, "_already_called_process_weights_after_loading")
+                        with refit_span("transformation"):
+                            quant_method.process_weights_after_loading(layer)
+                    if info is not None and info.kernel_tensors is not None:
+                        with refit_span("installation"):
+                            _copy_and_restore_kernel_tensors(layer, info)
+                    if info is not None:
+                        info.reset()
+                    self._restore_parameter_aliases(aliases)
 
         if reload:
             self._reload(load)
