@@ -67,17 +67,14 @@ def test_execute_read_batch_forwards_local_mem_type(monkeypatch):
     assert seen["local"] == NIXL_DRAM_MEM_TYPE
 
 
-def test_nixl_read_span_excludes_descriptor_prep_and_sync(monkeypatch, caplog):
+def test_nixl_read_public_duration_still_includes_prep_and_sync(monkeypatch):
     mgr = _manager()
     mgr._agent.check_xfer_state = lambda handle: "DONE"
     mgr._agent.release_xfer_handle = lambda handle: None
     mgr._accelerator_backend.synchronize = lambda device_id: None
-    ticks = iter([1.0, 4.0, 5.0, 8.0, 20.0])
+    ticks = iter([1.0, 4.0, 5.0, 20.0])
     monkeypatch.setattr(nixl_transfer.time, "perf_counter", lambda: next(ticks))
 
-    with caplog.at_level("INFO", logger="modelexpress.nixl_transfer"):
-        posted = mgr.post_read_batch("trainer", [(0x1000, 0x2000, 64, 7)])
-        assert posted is not None
-        mgr.await_read_batches([posted])
-
-    assert "NIXL READ in-flight: 4.000000s" in caplog.text
+    posted = mgr.post_read_batch("trainer", [(0x1000, 0x2000, 64, 7)])
+    assert posted is not None
+    assert mgr.await_read_batches([posted]) == (64, 1, 19.0)

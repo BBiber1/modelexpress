@@ -1556,3 +1556,28 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+### Native NIXL refit telemetry
+
+With MX OpenTelemetry tracing enabled, NIXL agents enable native telemetry capture.
+Each posted group has an `mx.refit.nixl_batch` span from the first request posting
+until the final request completion, with `mx.refit.nixl_transfer` children.
+Telemetry is read at each successful completion before the handle is released.
+Serial and concurrent reshard reads, prefetched reads, and direct reads use the
+same instrumentation. Span attributes carry experiment, step, role, and rank.
+
+Request attributes include `nixl.total_bytes`, `nixl.desc_count`,
+`nixl.start_time_us`, `nixl.post_duration_s`, and `nixl.xfer_duration_s`.
+Native start times use a monotonic clock and are not Unix timestamps. The batch
+records summed bytes, descriptors, posting durations, and min/median/max/p95
+request transfer durations (linear interpolation), plus completion and telemetry
+coverage counts. `nixl.payload_gbps` uses the batch elapsed interval, never the
+sum of concurrent request durations. These are logical payload rates, not NIC
+link counters. Native durations include NIXL completion observation latency.
+Unavailable telemetry does not fail a transfer; incomplete coverage is explicit.
+
+No native exporter configuration is needed for NIXL 0.10.1: capture works with
+`NIXL_TELEMETRY_EXPORTER` and `NIXL_TELEMETRY_DIR` unset. MX exports through the
+existing OTLP trace and metrics endpoints, with request and batch span exemplars.
+Tracing work is skipped when spans are not recording. Public transfer return
+values, device synchronization, timeout, health, and cleanup behavior are retained.

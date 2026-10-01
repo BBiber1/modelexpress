@@ -283,11 +283,21 @@ class _BoundedPlanCache:
                     )
                 metrics["bounded_whole_validation_s"] = time.perf_counter() - started
                 owner_started = time.perf_counter()
-                with telemetry.span("mx.refit.owner_validation"):
-                    for batch in compiled.module_batches:
-                        _NixlStagedTransfer._validate_complete(
-                            batch.capture, batch.layouts[0], batch.plan
+                with telemetry.span("mx.refit.owner_validations") as validations:
+                    if validations.is_recording():
+                        validations.set_attribute(
+                            "mx.refit.owner_count", len(compiled.module_batches)
                         )
+                    for batch in compiled.module_batches:
+                        with telemetry.span("mx.refit.owner_validation") as validation:
+                            if validation.is_recording():
+                                validation.set_attribute(
+                                    "mx.refit.owner",
+                                    next(iter(batch.layouts[0])).rpartition(".")[0],
+                                )
+                            _NixlStagedTransfer._validate_complete(
+                                batch.capture, batch.layouts[0], batch.plan
+                            )
                 metrics["owner_validation_s"] = time.perf_counter() - owner_started
                 metrics["plan_cache_validate_s"] = time.perf_counter() - started
                 self._entry = entry
@@ -370,45 +380,52 @@ def _bounded_batches(
     metrics["owner_plan_s"] = 0.0
     metrics["owner_validation_s"] = 0.0
     metrics["owner_plan_builds"] = 0
-    for module, recv in groups.items():
-        subset = CaptureResult(
-            copies=[c for c in capture.copies if c.param_name in recv]
-        )
-        started = time.perf_counter()
-        plan = _plan_staged_transfer(subset, sources)
-        metrics["owner_plan_s"] += time.perf_counter() - started
-        metrics["owner_plan_builds"] += 1
-        started = time.perf_counter()
-        with telemetry.span("mx.refit.owner_validation"):
-            _NixlStagedTransfer._validate_complete(subset, recv, plan)
-        metrics["owner_validation_s"] += time.perf_counter() - started
-        convert = {
-            c.param_name: (tuple(c.dest_shape), c.src_dtype) for c in plan.converts
-        }
-        full = {f.src_name: (tuple(f.global_shape), f.dtype) for f in plan.full_pulls}
-        layouts = _StagingLayouts(recv, convert, full)
-        # Each typed view begins at a 256-byte boundary in one registered arena.
-        nbytes = sum(
-            ((math.prod(shape) * dtype.itemsize + 255) // 256) * 256
-            for layout in layouts
-            for shape, dtype in layout.values()
-        )
-        if nbytes > max_staging_bytes:
-            if total_staging_bytes is not None and staging_buffers > 1:
-                budget = (
-                    f"max_staging_bytes={total_staging_bytes} split across "
-                    f"staging_buffers={staging_buffers} gives {max_staging_bytes} "
-                    "bytes per arena"
-                )
-                remedy = "lower staging_buffers or raise max_staging_bytes"
-            else:
-                budget = f"max_staging_bytes={max_staging_bytes}"
-                remedy = "raise max_staging_bytes"
-            raise IncompleteRefit(
-                f"module {module!r} requires {nbytes} staging bytes, exceeds "
-                f"{budget}; {remedy} (there is no CPU fallback)"
+    with telemetry.span("mx.refit.owner_validations") as validations:
+        if validations.is_recording():
+            validations.set_attribute("mx.refit.owner_count", len(groups))
+        for module, recv in groups.items():
+            subset = CaptureResult(
+                copies=[c for c in capture.copies if c.param_name in recv]
             )
-        batches.append(_BoundedBatch(subset, plan, layouts, nbytes))
+            started = time.perf_counter()
+            plan = _plan_staged_transfer(subset, sources)
+            metrics["owner_plan_s"] += time.perf_counter() - started
+            metrics["owner_plan_builds"] += 1
+            started = time.perf_counter()
+            with telemetry.span("mx.refit.owner_validation") as validation:
+                if validation.is_recording():
+                    validation.set_attribute("mx.refit.owner", module)
+                _NixlStagedTransfer._validate_complete(subset, recv, plan)
+            metrics["owner_validation_s"] += time.perf_counter() - started
+            convert = {
+                c.param_name: (tuple(c.dest_shape), c.src_dtype) for c in plan.converts
+            }
+            full = {
+                f.src_name: (tuple(f.global_shape), f.dtype) for f in plan.full_pulls
+            }
+            layouts = _StagingLayouts(recv, convert, full)
+            # Each typed view begins at a 256-byte boundary in one registered arena.
+            nbytes = sum(
+                ((math.prod(shape) * dtype.itemsize + 255) // 256) * 256
+                for layout in layouts
+                for shape, dtype in layout.values()
+            )
+            if nbytes > max_staging_bytes:
+                if total_staging_bytes is not None and staging_buffers > 1:
+                    budget = (
+                        f"max_staging_bytes={total_staging_bytes} split across "
+                        f"staging_buffers={staging_buffers} gives {max_staging_bytes} "
+                        "bytes per arena"
+                    )
+                    remedy = "lower staging_buffers or raise max_staging_bytes"
+                else:
+                    budget = f"max_staging_bytes={max_staging_bytes}"
+                    remedy = "raise max_staging_bytes"
+                raise IncompleteRefit(
+                    f"module {module!r} requires {nbytes} staging bytes, exceeds "
+                    f"{budget}; {remedy} (there is no CPU fallback)"
+                )
+            batches.append(_BoundedBatch(subset, plan, layouts, nbytes))
     if not batches:
         raise IncompleteRefit("bounded refit has no engine parameters")
     return tuple(batches)
@@ -641,6 +658,7 @@ def _merge_plan(target: TransferPlan, source: TransferPlan) -> None:
     target.exact_bytes += source.exact_bytes
 
 
+@telemetry.span("mx.refit.plan_staged_transfer")
 def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TransferPlan:
     """Plan reads for each source.
 

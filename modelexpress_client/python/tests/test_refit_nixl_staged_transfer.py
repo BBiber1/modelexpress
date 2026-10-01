@@ -1392,3 +1392,101 @@ def test_bounded_batch_layouts_are_named_however_they_are_built():
     swapped = replace(built, layouts=(recv, convert, {}))
     assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
     assert swapped.layouts.full == {}
+
+
+def test_owner_validation_spans_share_parent_on_cache_miss_and_hit(monkeypatch):
+    import os
+
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from modelexpress import telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", raising=False)
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setenv("MX_REFIT_REUSE_COMPLETE_PLAN", "1")
+    monkeypatch.setattr(telemetry, "_configured_pid", os.getpid())
+    monkeypatch.setattr(
+        telemetry, "_tracer", provider.get_tracer("owner-validation-test")
+    )
+    manifests = [
+        _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
+        _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
+    ]
+    resolved = _resolve_sources(manifests)
+    copies = [
+        RecordedCopy(
+            src_name="weight",
+            op_chain=(),
+            param_name=name,
+            dest_offset=0,
+            dest_shape=(4,),
+            dest_stride=(1,),
+            dest_dtype=torch.float32,
+        )
+        for name in ("layer0.weight", "layer1.weight")
+    ]
+    capture = CaptureResult(copies=copies)
+    layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
+    cache = transfer_module._BoundedPlanCache()
+    try:
+        for hit in (False, True):
+            metrics = {}
+            with (
+                telemetry.refit_attributes({"role": "generator", "rank": 3}),
+                telemetry.span("mx.refit"),
+            ):
+                cache.compile(
+                    manifests=manifests,
+                    resolved=resolved,
+                    capture=capture,
+                    parameter_layout=layout,
+                    max_staging_bytes=512,
+                    enabled=True,
+                    metrics=metrics,
+                    staging_device="cuda",
+                    staging_buffers=1,
+                    total_staging_bytes=512,
+                )
+            assert metrics["plan_cache_hits"] == int(hit)
+            spans = exporter.get_finished_spans()
+            parents = [s for s in spans if s.name == "mx.refit.owner_validations"]
+            children = [s for s in spans if s.name == "mx.refit.owner_validation"]
+            assert len(parents) == 1
+            assert len(children) == 2
+            parent = parents[0]
+            plans = [s for s in spans if s.name == "mx.refit.plan_staged_transfer"]
+            assert len(plans) == (0 if hit else 3)
+            if not hit:
+                owner_plans = [
+                    s for s in plans if s.parent.span_id == parent.context.span_id
+                ]
+                assert len(owner_plans) == 2
+                assert all(
+                    parent.start_time <= s.start_time <= s.end_time <= parent.end_time
+                    for s in owner_plans
+                )
+            assert parent.attributes["mx.refit.owner_count"] == 2
+            assert {s.attributes["mx.refit.owner"] for s in children} == {
+                "layer0",
+                "layer1",
+            }
+            assert all(s.parent.span_id == parent.context.span_id for s in children)
+            assert all(
+                parent.start_time <= s.start_time <= s.end_time <= parent.end_time
+                for s in children
+            )
+            assert all(
+                s.attributes["role"] == "generator" and s.attributes["rank"] == 3
+                for s in [parent, *children]
+            )
+            exporter.clear()
+    finally:
+        provider.shutdown()
