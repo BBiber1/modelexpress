@@ -1087,51 +1087,43 @@ class _VllmInstaller(EngineInstaller):
             for module_name, module in self._model.named_modules(
                 remove_duplicate=False
             ):
-                with telemetry.span("mx.refit.vllm_load_module") as current:
-                    if current.is_recording():
-                        current.set_attribute("module.name", module_name)
-                        current.set_attribute("module.type", type(module).__name__)
-                        current.set_attribute(
-                            "parameter.count", len(module._parameters)
+                module_paths[module_name] = module
+                duplicate_module = module in group_paths
+                group_paths.setdefault(module, module_name)
+                owned = set()
+                missing = set()
+                for leaf, parameter in module._parameters.items():
+                    if parameter is None:
+                        continue
+                    full_name = f"{module_name}.{leaf}" if module_name else leaf
+                    alias_groups.setdefault(id(parameter), []).append(
+                        (module_name, module, leaf)
+                    )
+                    # Keep every alias path, but process each owning module once.
+                    if duplicate_module:
+                        continue
+                    canonical_name = canonical.setdefault(id(parameter), full_name)
+                    owned.add(full_name)
+                    if canonical_name not in tensors:
+                        previously_installed_alias = (
+                            canonical_name != full_name
+                            and installed_parameters is not None
+                            and installed_parameters.get(canonical_name) is parameter
                         )
-                    module_paths[module_name] = module
-                    duplicate_module = module in group_paths
-                    group_paths.setdefault(module, module_name)
-                    owned = set()
-                    missing = set()
-                    for leaf, parameter in module._parameters.items():
-                        if parameter is None:
-                            continue
-                        full_name = f"{module_name}.{leaf}" if module_name else leaf
-                        alias_groups.setdefault(id(parameter), []).append(
-                            (module_name, module, leaf)
-                        )
-                        # Keep every alias path, but process each owning module once.
-                        if duplicate_module:
-                            continue
-                        canonical_name = canonical.setdefault(id(parameter), full_name)
-                        owned.add(full_name)
-                        if canonical_name not in tensors:
-                            previously_installed_alias = (
-                                canonical_name != full_name
-                                and installed_parameters is not None
-                                and installed_parameters.get(canonical_name)
-                                is parameter
-                            )
-                            if not previously_installed_alias:
-                                missing.add(canonical_name)
-                        if full_name in tensors:
-                            groups.setdefault(module, []).append((full_name, leaf))
-                            matched.add(full_name)
-                    # Each included owner needs complete canonical coverage. Check
-                    # the live tree before hooks run: earlier batches may have added
-                    # parameters since the layout was captured.
-                    if owned & tensors.keys() and missing:
-                        kind = "staged" if reload else "streaming"
-                        raise IncompleteRefit(
-                            f"{kind} batch splits an owning module {module_name!r}; "
-                            f"missing canonical parameters={sorted(missing)}"
-                        )
+                        if not previously_installed_alias:
+                            missing.add(canonical_name)
+                    if full_name in tensors:
+                        groups.setdefault(module, []).append((full_name, leaf))
+                        matched.add(full_name)
+                # Each included owner needs complete canonical coverage. Check
+                # the live tree before hooks run: earlier batches may have added
+                # parameters since the layout was captured.
+                if owned & tensors.keys() and missing:
+                    kind = "staged" if reload else "streaming"
+                    raise IncompleteRefit(
+                        f"{kind} batch splits an owning module {module_name!r}; "
+                        f"missing canonical parameters={sorted(missing)}"
+                    )
             unmatched = sorted(set(tensors) - matched)
             if unmatched:
                 raise IncompleteRefit(
