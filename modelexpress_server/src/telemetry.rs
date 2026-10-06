@@ -107,6 +107,7 @@ where
                     "refit.step",
                     "refit.phase",
                     "mx.experiment.run_id",
+                    "refit.aggregate",
                 ] {
                     if let Some(value) = parent.baggage().get(key) {
                         if matches!(key, "step" | "refit.step") {

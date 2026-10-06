@@ -62,6 +62,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             payload_format=request.payload_format,
             state=request.state,
             created_at_unix_ms=1234,
+            trace_context=request.trace_context,
         )
         if request.HasField("base_version_id"):
             self.version.base_version_id = request.base_version_id
@@ -103,7 +104,7 @@ def test_weight_version_required_fields_precede_optional_fields():
 
     optional_seen = False
     for field in fields(control_module.WeightVersion):
-        if field.default is MISSING:
+        if field.default is MISSING and field.default_factory is MISSING:
             assert not optional_seen
         else:
             optional_seen = True
@@ -209,7 +210,9 @@ def test_control_client_owns_global_weight_version_lifecycle():
 
     try:
         control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+        context = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01", "baggage": "step=4"}
         created = control.create_weight_version(
+            trace_context=context,
             model_name="test/model",
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.FULL_TENSOR,
@@ -226,6 +229,8 @@ def test_control_client_owns_global_weight_version_lifecycle():
             control.close()
         server.stop(grace=None).wait()
 
+    assert created.trace_context == context
+    assert fetched.trace_context == context
     assert created.ref.version_id == "version-a"
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
     assert created.trainer_mesh_id == "mesh-a"

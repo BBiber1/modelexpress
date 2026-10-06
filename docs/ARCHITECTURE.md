@@ -1796,6 +1796,14 @@ Refit telemetry propagates shared version, step, experiment, and staging attribu
 in W3C baggage across HTTP, worker RPC, and gRPC boundaries. Role and rank remain
 local to each process. Native `mx.refit.trainer`, `mx.refit.generator`, and
 `mx.refit.orchestrator` envelopes cover their children's exact time bounds;
-`mx.refit.trainers` and `mx.refit.generators` aggregate reported worker intervals
-under `mx.refit.cycle`. Remote intervals are carried in network acknowledgments
-and trainer collectives.
+`mx.refit.trainers` and `mx.refit.generators` group the native worker spans
+under `mx.refit.cycle`. The external Jaeger archive computes their exact bounds
+from exported children.
+
+Refit cycle context is stored in the weight version's `trace_context` map and
+returned by the existing lifecycle RPCs. Trainer ranks carry the cycle context
+alongside the version identity in their existing broadcast. Roles that begin
+before discovering their parent retain their native spans and export
+`refit.parent` on the role envelope. The Jaeger archive attaches that subtree
+to its discovered parent and computes cycle and role envelopes from their
+exported children. Telemetry adds no application synchronization or ports.
