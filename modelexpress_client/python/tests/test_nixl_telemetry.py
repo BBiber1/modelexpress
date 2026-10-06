@@ -255,3 +255,22 @@ def test_native_metric_units_and_request_span_exemplars(recording, monkeypatch):
         provider.shutdown()
         telemetry._value_histogram.cache_clear()
         telemetry._histogram.cache_clear()
+
+
+def test_completed_wait_preserves_timestamp_parent_and_worker_identity(recording):
+    with (
+        telemetry.refit_attributes({"role": "generator", "rank": 7}),
+        telemetry.span("mx.refit", start_time=1_000_000) as refit,
+    ):
+        with telemetry.refit_attributes({"role": "generator", "rank": 0, "step": 2}):
+            telemetry.completed_span(
+                "mx.refit.wait_version_marker", 2_000_000, 3_000_000
+            )
+            with telemetry.span("mx.refit.nested_phase"):
+                pass
+    spans = recording.get_finished_spans()
+    wait = next(s for s in spans if s.name == "mx.refit.wait_version_marker")
+    assert (wait.start_time, wait.end_time) == (2_000_000, 3_000_000)
+    assert wait.parent.span_id == refit.get_span_context().span_id
+    assert all(s.attributes["rank"] == 7 for s in spans)
+    assert next(s for s in spans if s.name == "mx.refit").start_time == 1_000_000

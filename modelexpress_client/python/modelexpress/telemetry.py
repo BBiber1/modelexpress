@@ -77,7 +77,9 @@ def configure(service_name: str) -> None:
         from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 
         _meter_provider = MeterProvider(
-            metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=metrics))],
+            metric_readers=[
+                PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=metrics))
+            ],
             resource=resource,
         )
         _histogram.cache_clear()
@@ -152,18 +154,41 @@ class RefitCycle:
 
 
 @contextlib.contextmanager
-def span(name: str, attributes: Mapping[str, Any] | None = None) -> Iterator[Any]:
+def span(
+    name: str,
+    attributes: Mapping[str, Any] | None = None,
+    *,
+    start_time: int | None = None,
+) -> Iterator[Any]:
     if not enabled():
         yield _NoopSpan()
         return
     configure("modelexpress-rl")
     tracer = _process_tracer()
-    with tracer.start_as_current_span(name) as current:
+    with tracer.start_as_current_span(name, start_time=start_time) as current:
         if current.is_recording():
             current.set_attributes(dict(_refit_attributes.get()))
             if attributes:
                 current.set_attributes(dict(attributes))
         yield current
+
+
+def completed_span(
+    name: str,
+    start_time: int,
+    end_time: int,
+    attributes: Mapping[str, Any] | None = None,
+) -> None:
+    """Record a completed interval once its propagated parent is available."""
+    if not enabled():
+        return
+    configure("modelexpress-rl")
+    current = _process_tracer().start_span(
+        name,
+        start_time=start_time,
+        attributes={**_refit_attributes.get(), **(attributes or {})},
+    )
+    current.end(end_time=end_time)
 
 
 def inject(carrier: MutableMapping[str, str]) -> None:
@@ -209,7 +234,11 @@ def set_carrier_in_context(carrier: MutableMapping[str, str]) -> None:
 def _histogram(name: str) -> Any:
     from opentelemetry import metrics
 
-    meter = _meter_provider.get_meter("modelexpress.refit") if _meter_provider is not None else metrics.get_meter("modelexpress.refit")
+    meter = (
+        _meter_provider.get_meter("modelexpress.refit")
+        if _meter_provider is not None
+        else metrics.get_meter("modelexpress.refit")
+    )
     return meter.create_histogram(name, unit="s")
 
 
@@ -223,16 +252,24 @@ def _value_histogram(name: str) -> Any:
     from opentelemetry import metrics
 
     unit = "By" if name.endswith("bytes") else "1"
-    meter = _meter_provider.get_meter("modelexpress.refit") if _meter_provider is not None else metrics.get_meter("modelexpress.refit")
-    return meter.create_histogram(
-        f"mx_refit_{name}", unit=unit
+    meter = (
+        _meter_provider.get_meter("modelexpress.refit")
+        if _meter_provider is not None
+        else metrics.get_meter("modelexpress.refit")
     )
+    return meter.create_histogram(f"mx_refit_{name}", unit=unit)
 
 
 @contextlib.contextmanager
 def refit_attributes(attributes: Mapping[str, str | int]) -> Iterator[None]:
     """Apply role and rank to nested refit spans in the current context."""
-    token = _refit_attributes.set(attributes)
+    inherited = _refit_attributes.get()
+    token = _refit_attributes.set(
+        {
+            **attributes,
+            **{key: inherited[key] for key in ("role", "rank") if key in inherited},
+        }
+    )
     try:
         yield
     finally:
