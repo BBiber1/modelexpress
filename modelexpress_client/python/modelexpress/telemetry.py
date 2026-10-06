@@ -194,6 +194,16 @@ def extracted(carrier: Mapping[str, str]) -> Iterator[None]:
     finally:
         context.detach(token)
 
+def set_carrier_in_context(carrier: MutableMapping[str, str]) -> None:
+    """Make an incoming W3C parent current for the enclosed work."""
+    if not enabled():
+        return
+    from opentelemetry import context
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
+
+    _token = context.attach(TraceContextTextMapPropagator().extract(carrier))
 
 @lru_cache(maxsize=16)
 def _histogram(name: str) -> Any:
