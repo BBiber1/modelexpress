@@ -21,6 +21,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from modelexpress import telemetry
+
 MX_REFIT_TIMING_PREFIX = "MX_REFIT_TIMING"
 REFIT_TIMING_STAGES = (
     "control_discovery",
@@ -79,6 +81,28 @@ class RefitTimingRecorder:
         self._stages = {name: _Stage() for name in REFIT_TIMING_STAGES}
         self._emitted_payload: dict[str, Any] | None = None
 
+    def _trace_attributes(self) -> dict[str, str | int]:
+        attributes: dict[str, str | int] = {
+            "role": "trainer" if "trainer" in self.backend else "generator",
+            "rank": self.rank if self.rank is not None else 0,
+            "backend": self.backend,
+            "version_uid": str(self.version),
+        }
+        for attribute, variable in (
+            ("experiment", "MX_REFIT_EXPERIMENT"),
+            ("staging_mode", "MX_REFIT_STAGING_MODE"),
+        ):
+            if value := os.environ.get(variable):
+                attributes[attribute] = value
+        return attributes
+
+    def _metric_attributes(self) -> dict[str, str | int]:
+        return {
+            key: value
+            for key, value in self._trace_attributes().items()
+            if key != "version_uid"
+        }
+
     @contextlib.contextmanager
     def span(
         self,
@@ -110,6 +134,9 @@ class RefitTimingRecorder:
             extra = {**(metadata or {}), **discovered}
             if duration_key is not None:
                 extra[duration_key] = elapsed
+            for name, value in extra.items():
+                if isinstance(value, (int, float)) and not name.endswith("_s"):
+                    telemetry.attribute(name, value)
             self.add_duration(
                 stage,
                 elapsed,
@@ -118,13 +145,27 @@ class RefitTimingRecorder:
                 accumulate_metadata=accumulate_metadata,
             )
 
-        try:
-            yield discovered
-        except BaseException:
-            record("error")
-            raise
-        else:
-            record(status)
+        span_name = duration_key.removesuffix("_s") if duration_key else stage
+        with telemetry.span(
+            f"mx.refit.{span_name}", self._trace_attributes()
+        ) as trace_span:
+            try:
+                yield discovered
+            except BaseException:
+                if trace_span.is_recording():
+                    trace_span.set_attribute("status", "error")
+                    for name, value in {**(metadata or {}), **discovered}.items():
+                        if isinstance(value, (str, bool, int, float)):
+                            trace_span.set_attribute(name, value)
+                record("error")
+                raise
+            else:
+                if trace_span.is_recording():
+                    trace_span.set_attribute("status", status)
+                    for name, value in {**(metadata or {}), **discovered}.items():
+                        if isinstance(value, (str, bool, int, float)):
+                            trace_span.set_attribute(name, value)
+                record(status)
 
     def add_duration(
         self,
@@ -142,6 +183,11 @@ class RefitTimingRecorder:
         item = self._stages[stage]
         item.duration_s += float(duration_s)
         item.count += 1
+        telemetry.duration(
+            "mx_refit_stage_duration_seconds",
+            duration_s,
+            {**self._metric_attributes(), "stage": stage, "status": status},
+        )
         if status not in item.statuses:
             item.statuses.append(status)
         if metadata:
@@ -172,6 +218,8 @@ class RefitTimingRecorder:
         self._validate_stage(stage)
         item = self._stages[stage]
         for name, value in metadata.items():
+            if isinstance(value, (int, float)) and not name.endswith("_s"):
+                telemetry.attribute(name, value)
             if (
                 accumulate
                 and isinstance(value, (int, float))
@@ -273,6 +321,14 @@ class RefitTimingRecorder:
             return self._emitted_payload
         self.finish()
         payload = self.as_dict()
+        telemetry.duration(
+            "mx_refit_total_duration_seconds",
+            payload["e2e_ms"] / 1000.0,
+            self._metric_attributes(),
+        )
+        if telemetry.enabled():
+            self._emitted_payload = payload
+            return payload
         encoded = json.dumps(
             payload,
             separators=(",", ":"),
@@ -303,9 +359,11 @@ def current_refit_timing() -> RefitTimingRecorder | None:
 @contextlib.contextmanager
 def use_refit_timing(recorder: RefitTimingRecorder) -> Iterator[RefitTimingRecorder]:
     """Make ``recorder`` visible to nested ModelExpress layers."""
+    telemetry.configure("modelexpress-rl")
     token = _current_recorder.set(recorder)
     try:
-        yield recorder
+        with telemetry.refit_attributes(recorder._trace_attributes()):
+            yield recorder
     finally:
         _current_recorder.reset(token)
 

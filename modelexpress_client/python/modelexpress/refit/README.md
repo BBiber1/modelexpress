@@ -204,6 +204,7 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 
 Set `MX_REFIT_TIMING_STDOUT=1` when a benchmark harness must collect the normalized `MX_REFIT_TIMING` JSON record from worker stdout. Lower layers add spans only when a recorder is active.
 
+
 The reshard planner uses this control:
 
 | Variable | Default | Purpose |

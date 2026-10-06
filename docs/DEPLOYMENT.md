@@ -588,6 +588,24 @@ sum their actual sizes. Existing receiver dtype conversion remains available,
 but casting a rounded BF16 value back to FP32 cannot recover source precision.
 Verify installed parameters and generation separately from transfer completion.
 
+### Refit OpenTelemetry export
+
+Install the Python client's `otel` extra to enable its optional refit telemetry facade. Set
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to exact OTLP HTTP
+signal URLs in each refit process. The ModelExpress server uses the traces endpoint for refit
+gRPC spans. The client propagates W3C `traceparent` and `tracestate` on refit RPCs; server spans
+join the caller's trace and carry `role=server` and `rank=0`. The client creates its
+refit tracer after each worker fork so every rank has distinct span IDs and an active
+export thread, even when vLLM has already installed a global tracer. Refit spans are
+recorded whenever an OTLP traces endpoint is configured. The telemetry facade's
+`RefitCycle` starts a native `mx.refit.cycle` root independently of the current
+context. Its `inject` method propagates the root through W3C context, and `finish`
+ends it on completion or failure. It stays open across offer and completion hooks;
+it does not leave a span attached between hooks. Trace-only work is guarded by
+`is_recording`. PrimeRL uses this facade without adding OpenTelemetry dependencies.
+Refits continue to emit
+their structured timing records, and the server's Prometheus endpoint remains available.
+
 ### Choosing trainer staging for synchronous refits
 
 Choose an existing `TrainerStagingMode` explicitly for the integration:
@@ -1482,6 +1500,16 @@ overlap the previous batch's installation, so wire and installation times must
 not be added as disjoint intervals. GPU validation is required for each target
 model and topology before performance qualification.
 
+The vLLM installer traces the complete streaming load callback as
+`mx.refit.vllm_streaming_load`, with one `mx.refit.vllm_load_batch` child per batch.
+Each batch's post-load callback is `mx.refit.vllm_load`, containing
+`mx.refit.vllm_load_module` spans for live module discovery and
+`mx.refit.vllm_load_layer` spans for per-layer processing and commit. Batch index,
+module name/type and parameter count identify each iteration; role, rank and
+refit context are inherited. Iteration attributes are collected only when the
+span is recording. These spans are nested intervals, not additional elapsed
+time to sum into the refit total.
+
 Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
 `streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
 `source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
@@ -1551,3 +1579,28 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+### Native NIXL refit telemetry
+
+With MX OpenTelemetry tracing enabled, NIXL agents enable native telemetry capture.
+Each posted group has an `mx.refit.nixl_batch` span from the first request posting
+until the final request completion, with `mx.refit.nixl_transfer` children.
+Telemetry is read at each successful completion before the handle is released.
+Serial and concurrent reshard reads, prefetched reads, and direct reads use the
+same instrumentation. Span attributes carry experiment, step, role, and rank.
+
+Request attributes include `nixl.total_bytes`, `nixl.desc_count`,
+`nixl.start_time_us`, `nixl.post_duration_s`, and `nixl.xfer_duration_s`.
+Native start times use a monotonic clock and are not Unix timestamps. The batch
+records summed bytes, descriptors, posting durations, and min/median/max/p95
+request transfer durations (linear interpolation), plus completion and telemetry
+coverage counts. `nixl.payload_gbps` uses the batch elapsed interval, never the
+sum of concurrent request durations. These are logical payload rates, not NIC
+link counters. Native durations include NIXL completion observation latency.
+Unavailable telemetry does not fail a transfer; incomplete coverage is explicit.
+
+No native exporter configuration is needed for NIXL 0.10.1: capture works with
+`NIXL_TELEMETRY_EXPORTER` and `NIXL_TELEMETRY_DIR` unset. MX exports through the
+existing OTLP trace and metrics endpoints, with request and batch span exemplars.
+Tracing work is skipped when spans are not recording. Public transfer return
+values, device synchronization, timeout, health, and cleanup behavior are retained.
