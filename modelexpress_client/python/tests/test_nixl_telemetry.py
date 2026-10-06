@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("opentelemetry.sdk")
 from modelexpress import telemetry
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -64,7 +65,14 @@ def test_batch_encloses_distinct_completions_and_aggregates(
         events.append(batch._requests[first]["end_ns"])
         batch.complete(second, agent, 128)
         batch._finish()
+        timing = RefitTimingRecorder(backend="rl_generator", version="v7", rank=0)
+        with use_refit_timing(timing), timing.span("control_discovery"):
+            pass
     spans = recording.get_finished_spans()
+    phase = next(s for s in spans if s.name == "mx.refit.control_discovery")
+    assert phase.attributes["rank"] == 3
+    assert phase.attributes["step"] == 7
+    assert phase.attributes["version_uid"] == "v7"
     parent = next(s for s in spans if s.name == "mx.refit.nixl_batch")
     children = [s for s in spans if s.name == "mx.refit.nixl_transfer"]
     assert parent.parent.span_id == refit.get_span_context().span_id
@@ -163,7 +171,7 @@ def test_disabled_or_nonrecording_skips_request_work(recording, monkeypatch):
     cycle = telemetry.RefitCycle()
     carrier = {}
     cycle.inject(carrier)
-    assert carrier["traceparent"].endswith("-00")
+    assert not int(carrier["traceparent"].rsplit("-", 1)[1], 16) & 1
     with cycle.active():
         with telemetry.span("mx.refit.publish"):
             assert not telemetry.recording()

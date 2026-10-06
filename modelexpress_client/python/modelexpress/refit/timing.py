@@ -153,7 +153,9 @@ class RefitTimingRecorder:
         span_name = duration_key.removesuffix("_s") if duration_key else stage
         with telemetry.span(
             f"mx.refit.{span_name}",
-            self._trace_attributes() if telemetry.recording() else None,
+            self._trace_attributes()
+            if current_refit_timing() is not self and telemetry.recording()
+            else None,
         ) as trace_span:
             try:
                 yield discovered
