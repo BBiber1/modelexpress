@@ -15,9 +15,11 @@ import contextvars
 import logging
 import os
 import secrets
+import threading
 import time
 from collections.abc import Iterator, Mapping, MutableMapping
 from functools import lru_cache
+from types import MappingProxyType
 from typing import Any
 
 _configured_pid: int | None = None
@@ -25,8 +27,89 @@ _tracer: Any | None = None
 _tracer_provider: Any | None = None
 _meter_provider: Any | None = None
 _refit_attributes: contextvars.ContextVar[Mapping[str, str | int]] = (
-    contextvars.ContextVar("mx_refit_attributes", default={})
+    contextvars.ContextVar("mx_refit_attributes", default=MappingProxyType({}))
 )
+_SHARED_ATTRIBUTES = frozenset(
+    {
+        "experiment",
+        "step",
+        "version_uid",
+        "staging_mode",
+        "refit.id",
+        "refit.step",
+        "refit.phase",
+        "mx.experiment.run_id",
+    }
+)
+_ROLE_SPANS = frozenset(
+    {
+        "mx.refit.cycle",
+        "mx.refit.trainers",
+        "mx.refit.generators",
+        "mx.refit.trainer",
+        "mx.refit.generator",
+        "mx.refit.orchestrator",
+    }
+)
+_bounds: dict[tuple[int, int], list[int | None]] = {}
+_bounds_lock = threading.RLock()
+
+
+class RefitSpanProcessor:
+    """Finalize role envelopes from local children and reported remote bounds."""
+
+    def __init__(self, processor: Any) -> None:
+        self.processor = processor
+
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        if span.name in _ROLE_SPANS:
+            ctx = span.get_span_context()
+            with _bounds_lock:
+                _bounds[(ctx.trace_id, ctx.span_id)] = [None, None]
+        self.processor.on_start(span, parent_context)
+
+    def _on_ending(self, span: Any) -> None:
+        self.processor._on_ending(span)
+
+    def on_end(self, span: Any) -> None:
+        from opentelemetry.sdk.trace import ReadableSpan
+
+        with _bounds_lock:
+            interval = _bounds.pop((span.context.trace_id, span.context.span_id), None)
+            if interval is not None and interval[0] is not None:
+                span = ReadableSpan(
+                    name=span.name,
+                    context=span.context,
+                    parent=span.parent,
+                    resource=span.resource,
+                    attributes=span.attributes,
+                    events=span.events,
+                    links=span.links,
+                    kind=span.kind,
+                    status=span.status,
+                    start_time=interval[0],
+                    end_time=interval[1],
+                    instrumentation_scope=span.instrumentation_scope,
+                )
+            if span.parent is not None:
+                parent = _bounds.get((span.context.trace_id, span.parent.span_id))
+                if parent is not None:
+                    _include_bounds(parent, [span.start_time, span.end_time])
+        self.processor.on_end(span)
+
+    def shutdown(self) -> None:
+        self.processor.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self.processor.force_flush(timeout_millis)
+
+
+def _include_bounds(target: list, interval: list | tuple) -> None:
+    start, end = interval
+    if start is None or end is None or start > end:
+        raise ValueError("Invalid refit interval")
+    target[0] = min(target[0], start) if target[0] is not None else start
+    target[1] = max(target[1], end) if target[1] is not None else end
 
 
 def configure(service_name: str) -> None:
@@ -64,7 +147,7 @@ def configure(service_name: str) -> None:
             id_generator=_ProcessIndependentIdGenerator(),
         )
         provider.add_span_processor(
-            BatchSpanProcessor(OTLPSpanExporter(endpoint=traces))
+            RefitSpanProcessor(BatchSpanProcessor(OTLPSpanExporter(endpoint=traces)))
         )
         _tracer_provider = provider
         atexit.register(provider.shutdown)
@@ -103,25 +186,67 @@ def _process_tracer() -> Any:
 
 
 class RefitCycle:
-    """A native refit root whose lifetime spans offer and completion hooks."""
+    """A native cycle or role envelope with an explicitly propagated parent."""
 
-    def __init__(self, attributes: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        attributes: Mapping[str, Any] | None = None,
+        *,
+        name: str = "mx.refit.cycle",
+        parent: Mapping[str, str] | None = None,
+    ) -> None:
         self._span: Any | None = None
+        self._attributes = {**_refit_attributes.get(), **(attributes or {})}
+        self._interval: list[int | None] = [None, None]
         if not enabled():
             return
         from opentelemetry import context
 
-        self._span = _process_tracer().start_span(
-            "mx.refit.cycle", context=context.Context()
+        configure("modelexpress-rl")
+        from opentelemetry.trace.propagation.tracecontext import (
+            TraceContextTextMapPropagator,
         )
+
+        ctx = (
+            TraceContextTextMapPropagator().extract(parent)
+            if parent is not None
+            else (
+                context.Context() if name == "mx.refit.cycle" else context.get_current()
+            )
+        )
+        self._span = _process_tracer().start_span(name, context=ctx)
         if self.is_recording():
-            self._span.set_attributes(dict(attributes))
+            self._span.set_attributes(self._attributes)
+            span_ctx = self._span.get_span_context()
+            with _bounds_lock:
+                self._interval = _bounds.get(
+                    (span_ctx.trace_id, span_ctx.span_id), self._interval
+                )
+
+    @property
+    def interval(self) -> list[int] | None:
+        return list(self._interval) if self._interval[0] is not None else None
+
+    def include(self, interval: list[int] | None) -> None:
+        if self.is_recording() and interval is not None:
+            with _bounds_lock:
+                _include_bounds(self._interval, interval)
+
+    @contextlib.contextmanager
+    def active(self) -> Iterator[RefitCycle]:
+        if not self.is_recording():
+            yield self
+            return
+        from opentelemetry import trace
+
+        with trace.use_span(self._span, end_on_exit=False):
+            yield self
 
     def is_recording(self) -> bool:
         return self._span is not None and self._span.is_recording()
 
     def inject(self, carrier: MutableMapping[str, str]) -> None:
-        """Propagate the cycle itself, keeping offers and role spans siblings."""
+        """Propagate this parent and its shared refit attributes."""
         if not self.is_recording():
             return
         from opentelemetry import trace
@@ -132,8 +257,10 @@ class RefitCycle:
         TraceContextTextMapPropagator().inject(
             carrier, context=trace.set_span_in_context(self._span)
         )
+        _inject_attributes(carrier, self._attributes)
 
     def set_attributes(self, attributes: Mapping[str, Any]) -> None:
+        self._attributes.update(attributes)
         if self.is_recording():
             self._span.set_attributes(dict(attributes))
 
@@ -151,6 +278,24 @@ class RefitCycle:
                 self._span.set_status(StatusCode.ERROR, str(error))
         self._span.end()
         self._span = None
+
+
+@contextlib.contextmanager
+def refit_span(
+    name: str,
+    attributes: Mapping[str, Any] | None = None,
+    *,
+    parent: Mapping[str, str] | None = None,
+) -> Iterator[RefitCycle]:
+    cycle = RefitCycle(attributes, name=name, parent=parent)
+    try:
+        with cycle.active():
+            yield cycle
+    except BaseException as error:
+        cycle.finish(error)
+        raise
+    else:
+        cycle.finish()
 
 
 @contextlib.contextmanager
@@ -200,6 +345,17 @@ def inject(carrier: MutableMapping[str, str]) -> None:
     )
 
     TraceContextTextMapPropagator().inject(carrier)
+    _inject_attributes(carrier, _refit_attributes.get())
+
+
+def _inject_attributes(carrier: MutableMapping[str, str], attributes: Mapping) -> None:
+    from opentelemetry import baggage, context
+    from opentelemetry.baggage.propagation import W3CBaggagePropagator
+
+    ctx = context.Context()
+    for key in _SHARED_ATTRIBUTES & attributes.keys():
+        ctx = baggage.set_baggage(key, str(attributes[key]), context=ctx)
+    W3CBaggagePropagator().inject(carrier, context=ctx)
 
 
 @contextlib.contextmanager
@@ -208,16 +364,26 @@ def extracted(carrier: Mapping[str, str]) -> Iterator[None]:
     if not enabled():
         yield
         return
-    from opentelemetry import context
+    from opentelemetry import baggage, context
+    from opentelemetry.baggage.propagation import W3CBaggagePropagator
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
     )
 
+    shared = {
+        key: int(value) if key in ("step", "refit.step") else value
+        for key, value in baggage.get_all(
+            W3CBaggagePropagator().extract(carrier)
+        ).items()
+        if key in _SHARED_ATTRIBUTES
+    }
     token = context.attach(TraceContextTextMapPropagator().extract(carrier))
     try:
-        yield
+        with refit_attributes(shared):
+            yield
     finally:
         context.detach(token)
+
 
 def set_carrier_in_context(carrier: MutableMapping[str, str]) -> None:
     """Make an incoming W3C parent current for the enclosed work."""
@@ -229,6 +395,7 @@ def set_carrier_in_context(carrier: MutableMapping[str, str]) -> None:
     )
 
     _token = context.attach(TraceContextTextMapPropagator().extract(carrier))
+
 
 @lru_cache(maxsize=16)
 def _histogram(name: str) -> Any:
@@ -261,13 +428,21 @@ def _value_histogram(name: str) -> Any:
 
 
 @contextlib.contextmanager
-def refit_attributes(attributes: Mapping[str, str | int]) -> Iterator[None]:
+def refit_attributes(
+    attributes: Mapping[str, str | int] | None = None,
+    *,
+    role: str | None = None,
+    rank: int | None = None,
+) -> Iterator[None]:
     """Apply role and rank to nested refit spans in the current context."""
     inherited = _refit_attributes.get()
     token = _refit_attributes.set(
         {
-            **attributes,
+            **inherited,
+            **(attributes or {}),
             **{key: inherited[key] for key in ("role", "rank") if key in inherited},
+            **({"role": role} if role is not None else {}),
+            **({"rank": rank} if rank is not None else {}),
         }
     )
     try:
