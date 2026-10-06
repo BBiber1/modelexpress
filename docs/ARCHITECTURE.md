@@ -1105,6 +1105,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
+| `telemetry.py` | Optional OpenTelemetry facade for refit spans, duration metrics, and W3C context propagation |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
@@ -1530,6 +1531,13 @@ graph TD
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
+For staged RL reshard reads, `[TIMING] NIXL READ in-flight` reports one span per
+source batch, from the call to `nixl_agent.transfer(handle)` until NIXL first
+reports that handle complete. It excludes descriptor preparation, handle release,
+and device synchronization. Completion is observed by polling, so the span
+includes up to one polling interval of detection delay. The staged `wire` timing
+covers the broader post-and-wait path across all source batches.
+
 Zero-byte tensors remain in manifests and participate in exact name, size, and
 dtype validation. They count as matched tensors but are omitted from NIXL
 descriptor lists because they have no registered memory range. A manifest made
@@ -1747,3 +1755,39 @@ be qualified with changing weights, shared parameters, graph-bound addresses,
 post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
+
+### Native NIXL refit telemetry
+
+With MX OpenTelemetry tracing enabled, NIXL agents enable native telemetry capture.
+Each posted group has an `mx.refit.nixl_batch` span from the first request posting
+until the final request completion, with `mx.refit.nixl_transfer` children.
+Telemetry is read at each successful completion before the handle is released.
+Serial and concurrent reshard reads, prefetched reads, and direct reads use the
+same instrumentation. Span attributes carry experiment, step, role, and rank.
+
+Request attributes include `nixl.total_bytes`, `nixl.desc_count`,
+`nixl.start_time_us`, `nixl.post_duration_s`, and `nixl.xfer_duration_s`.
+Native start times use a monotonic clock and are not Unix timestamps. The batch
+records summed bytes, descriptors, posting durations, and min/median/max/p95
+request transfer durations (linear interpolation), plus completion and telemetry
+coverage counts. `nixl.payload_gbps` uses the batch elapsed interval, never the
+sum of concurrent request durations. These are logical payload rates, not NIC
+link counters. Native durations include NIXL completion observation latency.
+Unavailable telemetry does not fail a transfer; incomplete coverage is explicit.
+
+No native exporter configuration is needed for NIXL 0.10.1: capture works with
+`NIXL_TELEMETRY_EXPORTER` and `NIXL_TELEMETRY_DIR` unset. MX exports through the
+existing OTLP trace and metrics endpoints, with request and batch span exemplars.
+Tracing work is skipped when spans are not recording. Public transfer return
+values, device synchronization, timeout, health, and cleanup behavior are retained.
+
+Bounded plan compilation and cache-hit revalidation group all per-owner
+`mx.refit.owner_validation` spans under one `mx.refit.owner_validations` parent
+per generator rank. The parent covers the complete owner loop, including work
+between validations, and records `mx.refit.owner_count`; children identify their
+owning module using `mx.refit.owner`. These attributes are only computed when
+the corresponding span is recording.
+
+Every `_plan_staged_transfer` invocation has an
+`mx.refit.plan_staged_transfer` span, covering both regular and digest-enabled
+planning. Per-owner planning spans are children of `mx.refit.owner_validations`.

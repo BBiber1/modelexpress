@@ -24,14 +24,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from . import envs
-from . import ucx_utils
-from .metrics import metrics as transfer_metrics
+from . import envs, telemetry, ucx_utils
 from ._nixl import load_nixl_api
 from .accelerators import (
     AcceleratorBackend,
     CudaAcceleratorBackend,
 )
+from .metrics import metrics as transfer_metrics
 from .types import ManifestMismatchError, TensorDescriptor
 
 if TYPE_CHECKING:
@@ -109,6 +108,7 @@ class PostedRead:
     total_bytes: int
     num_ranges: int
     posted_at: float = field(default_factory=time.perf_counter)
+    submitted_at: float = field(default_factory=time.perf_counter)
 
 
 class NixlTransferManager:
@@ -142,6 +142,7 @@ class NixlTransferManager:
         self._backends = [self._backend]
 
         self._agent: Any = None
+        self._transfer_traces: dict[int, tuple[Any, Any]] = {}
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
@@ -272,10 +273,13 @@ class NixlTransferManager:
                     backends=self._backends,
                     enable_listen_thread=True,
                     listen_port=self._listen_port,
+                    capture_telemetry=telemetry.enabled(),
                 )
                 logger.info(f"NIXL listen thread enabled on port {self._listen_port}")
             elif nixl_agent_config:
-                config = nixl_agent_config(backends=self._backends)
+                config = nixl_agent_config(
+                    backends=self._backends, capture_telemetry=telemetry.enabled()
+                )
             else:
                 config = None
             self._agent = NixlAgent(self._agent_name, config)
@@ -634,11 +638,34 @@ class NixlTransferManager:
 
         return sorted(seen.items())
 
+    def _trace_post(self, handle: Any, peer: str) -> None:
+        if not telemetry.enabled():
+            return
+        batch = telemetry._nixl_batch.get() or telemetry._NixlBatch()
+        request = batch.post(peer)
+        if request is not None:
+            if not hasattr(self, "_transfer_traces"):
+                self._transfer_traces = {}
+            self._transfer_traces[id(handle)] = (batch, request)
+
+    def _trace_complete(self, handle: Any) -> None:
+        entry = getattr(self, "_transfer_traces", {}).pop(id(handle), None)
+        if entry is not None:
+            batch, request = entry
+            batch.complete(request, self._agent, handle)
+
+    def _trace_fail(self, handle: Any, error: BaseException) -> None:
+        entry = getattr(self, "_transfer_traces", {}).pop(id(handle), None)
+        if entry is not None:
+            batch, request = entry
+            batch.fail(request, error)
+
     def _wait_for_xfers(
         self,
         handles: list,
         timeout_seconds: float | None,
         label: str,
+        completed_at: dict[int, float] | None = None,
     ) -> None:
         """Poll several NIXL handles until all complete or one fails.
 
@@ -673,6 +700,9 @@ class NixlTransferManager:
             for handle in pending:
                 status = self._agent.check_xfer_state(handle)
                 if status in ("DONE", "SUCCESS"):
+                    self._trace_complete(handle)
+                    if completed_at is not None:
+                        completed_at[id(handle)] = time.perf_counter()
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
                     self._data_plane_error = f"{label} failed with status {status}"
@@ -718,6 +748,7 @@ class NixlTransferManager:
                 raise TimeoutError(f"{label} timed out")
             status = self._agent.check_xfer_state(handle)
             if status in ("DONE", "SUCCESS"):
+                self._trace_complete(handle)
                 # A completed transfer is direct proof the data plane works, so it
                 # clears any earlier failure. Without this the flag would latch for
                 # the life of the process and a worker demoted for one transient
@@ -1018,8 +1049,12 @@ class NixlTransferManager:
         try:
             if on_transfer_start is not None:
                 on_transfer_start()
+            self._trace_post(handle, remote_agent_name)
             self._agent.transfer(handle)
             self._wait_for_xfer(handle, timeout_seconds, "Transfer")
+        except BaseException as error:
+            self._trace_fail(handle, error)
+            raise
         finally:
             self._agent.release_xfer_handle(handle)
 
@@ -1149,8 +1184,12 @@ class NixlTransferManager:
                 remote_indices=indices,
                 backends=self._backends,
             )
+            submitted_at = time.perf_counter()
+            self._trace_post(handle, remote_agent_name)
             self._agent.transfer(handle)
-        except Exception:
+        except Exception as error:
+            if handle is not None:
+                self._trace_fail(handle, error)
             # Nothing is in flight for this batch, so drop its handle here rather
             # than handing a dead batch to await_read_batches.
             if handle is not None:
@@ -1163,6 +1202,7 @@ class NixlTransferManager:
             total_bytes=sum(nbytes for (_r, _l, nbytes, _d) in ranges),
             num_ranges=len(ranges),
             posted_at=posted_at,
+            submitted_at=submitted_at,
         )
 
     def _release_xfer_handle(self, handle: Any) -> None:
@@ -1202,6 +1242,10 @@ class NixlTransferManager:
                 timeout_seconds,
                 "NIXL reshard READ batch",
             )
+        except BaseException as error:
+            for batch in batches:
+                self._trace_fail(batch.handle, error)
+            raise
         finally:
             for batch in batches:
                 self._release_xfer_handle(batch.handle)
@@ -1295,6 +1339,7 @@ class NixlTransferManager:
                 remote_indices=[0],
                 backends=self._backends,
             )
+            self._trace_post(handle, remote_agent_name)
             self._agent.transfer(handle)
 
             self._wait_for_xfer(
@@ -1309,6 +1354,10 @@ class NixlTransferManager:
                 duration,
             )
             return duration
+        except BaseException as error:
+            if handle is not None:
+                self._trace_fail(handle, error)
+            raise
         finally:
             if handle is not None:
                 self._agent.release_xfer_handle(handle)

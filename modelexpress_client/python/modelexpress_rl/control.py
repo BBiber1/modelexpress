@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+
 import grpc
-from modelexpress import auth
+from modelexpress import auth, telemetry
 from modelexpress.client import _get_server_url
 
 from . import refit_pb2, refit_pb2_grpc
@@ -96,7 +97,9 @@ def _mesh_workers(
             raise TypeError("workers values must be TrainerTensorsMetadata")
         encoded[_required(worker_id, "worker_id")] = refit_pb2.TrainerTensorsMetadata(
             logical_shard_id=_required(metadata.logical_shard_id, "logical_shard_id"),
-            metadata_endpoint=_required(metadata.metadata_endpoint, "metadata_endpoint"),
+            metadata_endpoint=_required(
+                metadata.metadata_endpoint, "metadata_endpoint"
+            ),
         )
     return encoded
 
@@ -150,7 +153,9 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
         trainer_mesh_id=(
             version.trainer_mesh_id if version.HasField("trainer_mesh_id") else None
         ),
-        version_number=version.version_number if version.HasField("version_number") else None,
+        version_number=version.version_number
+        if version.HasField("version_number")
+        else None,
     )
 
 
@@ -185,7 +190,9 @@ class ModelExpressControlClient:
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
         if self._channel is None:
-            self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
+            self._channel = telemetry.refit_channel(
+                auth.with_auth(grpc.insecure_channel(self.server_url))
+            )
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
         assert self._stub is not None
         return self._stub
@@ -335,12 +342,19 @@ class ModelExpressControlClient:
         return _response_version(response, "UpdateWeightVersionState")
 
     def list_weight_versions(
-        self, *, model_name: str, trainer_mesh_id: str | None = None,
+        self,
+        *,
+        model_name: str,
+        trainer_mesh_id: str | None = None,
     ) -> list[WeightVersion]:
-        request = refit_pb2.ListWeightVersionsRequest(model_name=_required(model_name, "model_name"))
+        request = refit_pb2.ListWeightVersionsRequest(
+            model_name=_required(model_name, "model_name")
+        )
         if trainer_mesh_id is not None:
             request.trainer_mesh_id = _required(trainer_mesh_id, "trainer_mesh_id")
-        response = self._service.ListWeightVersions(request, timeout=self._rpc_timeout_seconds)
+        response = self._service.ListWeightVersions(
+            request, timeout=self._rpc_timeout_seconds
+        )
         return [_weight_version(version) for version in response.versions]
 
     def delete_weight_version(self, version_id: str) -> WeightVersion:
