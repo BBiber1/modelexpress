@@ -64,7 +64,9 @@ def start_cycle(
         # A caller driving its own cycle wins. Nesting a second recorder would
         # split one refit across two records and leave both looking incomplete.
         return None
-    return RefitTimingRecorder(backend=backend, version=version_id, rank=rank)
+    return RefitTimingRecorder(
+        backend=backend, version=version_id, rank=rank, log_enabled=envs.MX_REFIT_TIMING
+    )
 
 
 @contextlib.contextmanager

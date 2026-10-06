@@ -639,7 +639,7 @@ class NixlTransferManager:
         return sorted(seen.items())
 
     def _trace_post(self, handle: Any, peer: str) -> None:
-        if not telemetry.enabled():
+        if not telemetry.recording():
             return
         batch = telemetry._nixl_batch.get() or telemetry._NixlBatch()
         request = batch.post(peer)
@@ -649,10 +649,19 @@ class NixlTransferManager:
             self._transfer_traces[id(handle)] = (batch, request)
 
     def _trace_complete(self, handle: Any) -> None:
-        entry = getattr(self, "_transfer_traces", {}).pop(id(handle), None)
+        entry = getattr(self, "_transfer_traces", {}).get(id(handle))
         if entry is not None:
             batch, request = entry
             batch.complete(request, self._agent, handle)
+
+    def _trace_finish(self, handles: list) -> None:
+        batches = set()
+        for handle in handles:
+            entry = getattr(self, "_transfer_traces", {}).pop(id(handle), None)
+            if entry is not None:
+                batches.add(entry[0])
+        for batch in batches:
+            batch._finish()
 
     def _trace_fail(self, handle: Any, error: BaseException) -> None:
         entry = getattr(self, "_transfer_traces", {}).pop(id(handle), None)
@@ -712,6 +721,7 @@ class NixlTransferManager:
             if len(still_pending) == len(pending):
                 time.sleep(0.001)
             pending = still_pending
+        self._trace_finish(handles)
         # Only once the whole set has completed, and only if there was a set. Nothing
         # is proven by waiting on no handles, and clearing per handle would let a
         # batch that failed on its last one report healthy. Health must not latch
@@ -749,6 +759,7 @@ class NixlTransferManager:
             status = self._agent.check_xfer_state(handle)
             if status in ("DONE", "SUCCESS"):
                 self._trace_complete(handle)
+                self._trace_finish([handle])
                 # A completed transfer is direct proof the data plane works, so it
                 # clears any earlier failure. Without this the flag would latch for
                 # the life of the process and a worker demoted for one transient

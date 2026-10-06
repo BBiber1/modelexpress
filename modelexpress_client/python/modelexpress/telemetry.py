@@ -22,6 +22,7 @@ from functools import lru_cache
 from types import MappingProxyType
 from typing import Any
 
+_suppressed = contextvars.ContextVar("mx_telemetry_suppressed", default=False)
 _configured_pid: int | None = None
 _tracer: Any | None = None
 _tracer_provider: Any | None = None
@@ -132,7 +133,6 @@ def configure(service_name: str) -> None:
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
         from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
-        from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
         class _ProcessIndependentIdGenerator(RandomIdGenerator):
             def generate_span_id(self) -> int:
@@ -144,7 +144,6 @@ def configure(service_name: str) -> None:
         # vLLM seeds global random identically in its forked workers.
         provider = TracerProvider(
             resource=resource,
-            sampler=ALWAYS_ON,
             id_generator=_ProcessIndependentIdGenerator(),
         )
         provider.add_span_processor(
@@ -174,6 +173,48 @@ def configure(service_name: str) -> None:
 
 def enabled() -> bool:
     return bool(os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+
+
+@contextlib.contextmanager
+def untraced() -> Iterator[None]:
+    """Suppress bootstrap instrumentation until the existing RPC supplies a parent."""
+    token = _suppressed.set(True)
+    try:
+        yield
+    finally:
+        _suppressed.reset(token)
+
+
+def recording() -> bool:
+    if not enabled() or _suppressed.get():
+        return False
+    from opentelemetry import trace
+
+    current = trace.get_current_span()
+    ctx = current.get_span_context()
+    return not ctx.is_valid or bool(ctx.trace_flags.sampled)
+
+
+def detailed() -> bool:
+    from modelexpress import envs
+
+    return envs.MX_REFIT_TRACE_DETAIL
+
+
+_DETAIL_SPANS = frozenset(
+    "mx.refit." + name
+    for name in (
+        "owner_validation",
+        "vllm_load_layer",
+        "vllm_load_batch",
+        "install_commit",
+        "materialization",
+        "receive_copy",
+        "post_load_processing",
+        "transformation",
+        "installation",
+    )
+)
 
 
 def _process_tracer() -> Any:
@@ -235,7 +276,7 @@ class RefitCycle:
 
     @contextlib.contextmanager
     def active(self) -> Iterator[RefitCycle]:
-        if not self.is_recording():
+        if self._span is None:
             yield self
             return
         from opentelemetry import trace
@@ -248,7 +289,7 @@ class RefitCycle:
 
     def inject(self, carrier: MutableMapping[str, str]) -> None:
         """Propagate this parent and its shared refit attributes."""
-        if not self.is_recording():
+        if self._span is None:
             return
         from opentelemetry import trace
         from opentelemetry.trace.propagation.tracecontext import (
@@ -306,7 +347,7 @@ def span(
     *,
     start_time: int | None = None,
 ) -> Iterator[Any]:
-    if not enabled():
+    if not recording() or (name in _DETAIL_SPANS and not detailed()):
         yield _NoopSpan()
         return
     configure("modelexpress-rl")
@@ -326,7 +367,7 @@ def completed_span(
     attributes: Mapping[str, Any] | None = None,
 ) -> None:
     """Record a completed interval once its propagated parent is available."""
-    if not enabled():
+    if not recording():
         return
     configure("modelexpress-rl")
     current = _process_tracer().start_span(
@@ -339,7 +380,7 @@ def completed_span(
 
 def inject(carrier: MutableMapping[str, str]) -> None:
     """Write W3C traceparent and tracestate to an HTTP or gRPC carrier."""
-    if not enabled():
+    if not enabled() or _suppressed.get():
         return
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
@@ -544,8 +585,8 @@ class _NixlBatch:
     def post(self, peer: str) -> Any | None:
         if not enabled():
             return None
-        from opentelemetry import trace
-
+        if not recording():
+            return None
         if self._span is None:
             self._start_ns = time.time_ns()
             self._span = _process_tracer().start_span(
@@ -556,62 +597,39 @@ class _NixlBatch:
                 self._span.set_attributes(self._attributes)
         if not self._span.is_recording():
             return None
-        request = _process_tracer().start_span(
-            "mx.refit.nixl_transfer",
-            context=trace.set_span_in_context(self._span),
-        )
-        if not request.is_recording():
-            request.end()
-            return None
-        request.set_attributes(
-            {
-                **_refit_attributes.get(),
-                "nixl.operation": "READ",
-                "nixl.remote_agent": peer,
-            }
-        )
-        self._requests[request] = {"end_ns": None, "complete": False, "native": None}
+        request = object()
+        self._requests[request] = {
+            "start_ns": time.time_ns(),
+            "peer": peer,
+            "end_ns": None,
+            "complete": False,
+            "native": None,
+            "error": None,
+        }
         return request
 
     def complete(self, request: Any, agent: Any, handle: Any) -> None:
-        if not request.is_recording():
-            return
-        from opentelemetry import trace
-
-        end_ns = time.time_ns()
-        native = None
+        item = self._requests[request]
+        item["end_ns"] = time.time_ns()
+        item["complete"] = True
         try:
             sample = agent.get_xfer_telemetry(handle)
-            native = {
+            item["native"] = {
                 "total_bytes": int(sample.totalBytes),
                 "desc_count": int(sample.descCount),
                 "start_time_us": int(sample.startTime),
                 "post_duration_s": int(sample.postDuration) / 1e6,
                 "xfer_duration_s": int(sample.xferDuration) / 1e6,
             }
-            request.set_attributes({"nixl." + k: v for k, v in native.items()})
-            with trace.use_span(request, end_on_exit=False):
-                self._metrics(native, "request")
-        except Exception as error:
-            request.set_attribute("nixl.telemetry.error", str(error))
-        request.set_attribute("nixl.telemetry.available", native is not None)
-        request.set_attribute("nixl.complete", True)
-        self._requests[request] = {"end_ns": end_ns, "complete": True, "native": native}
-        request.end(end_time=end_ns)
-        self._finish()
+        except Exception as error:  # noqa: BLE001 - native telemetry is optional
+            item["telemetry_error"] = str(error)
 
     def fail(self, request: Any, error: BaseException) -> None:
         self._error = error
-        if self._requests[request]["end_ns"] is not None:
-            return
-        from opentelemetry.trace import StatusCode
-
-        end_ns = time.time_ns()
-        request.set_status(StatusCode.ERROR, str(error))
-        request.record_exception(error)
-        request.set_attribute("nixl.complete", False)
-        self._requests[request]["end_ns"] = end_ns
-        request.end(end_time=end_ns)
+        item = self._requests[request]
+        if item["end_ns"] is None:
+            item["end_ns"] = time.time_ns()
+            item["error"] = error
         self._finish()
 
     def _metrics(self, values: Mapping[str, Any], kind: str) -> None:
@@ -656,6 +674,35 @@ class _NixlBatch:
             return
         from opentelemetry import trace
         from opentelemetry.trace import StatusCode
+
+        if detailed():
+            for item in self._requests.values():
+                request = _process_tracer().start_span(
+                    "mx.refit.nixl_transfer",
+                    context=trace.set_span_in_context(self._span),
+                    start_time=item["start_ns"],
+                    attributes={
+                        **self._attributes,
+                        "nixl.operation": "READ",
+                        "nixl.remote_agent": item["peer"],
+                        "nixl.complete": item["complete"],
+                        "nixl.telemetry.available": item["native"] is not None,
+                    },
+                )
+                if item["native"] is not None:
+                    request.set_attributes(
+                        {"nixl." + k: v for k, v in item["native"].items()}
+                    )
+                    with trace.use_span(request, end_on_exit=False):
+                        self._metrics(item["native"], "request")
+                if "telemetry_error" in item:
+                    request.set_attribute(
+                        "nixl.telemetry.error", item["telemetry_error"]
+                    )
+                if item["error"] is not None:
+                    request.set_status(StatusCode.ERROR, str(item["error"]))
+                    request.record_exception(item["error"])
+                request.end(end_time=item["end_ns"])
 
         samples = [
             r["native"] for r in self._requests.values() if r["native"] is not None
