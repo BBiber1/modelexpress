@@ -1786,3 +1786,11 @@ the corresponding span is recording.
 Every `_plan_staged_transfer` invocation has an
 `mx.refit.plan_staged_transfer` span, covering both regular and digest-enabled
 planning. Per-owner planning spans are children of `mx.refit.owner_validations`.
+
+Refit telemetry propagates shared version, step, experiment, and staging attributes
+in W3C baggage across HTTP, worker RPC, and gRPC boundaries. Role and rank remain
+local to each process. Native `mx.refit.trainer`, `mx.refit.generator`, and
+`mx.refit.orchestrator` envelopes cover their children's exact time bounds;
+`mx.refit.trainers` and `mx.refit.generators` aggregate reported worker intervals
+under `mx.refit.cycle`. Remote intervals are carried in network acknowledgments
+and trainer collectives.

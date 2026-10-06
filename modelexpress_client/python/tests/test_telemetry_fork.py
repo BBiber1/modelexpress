@@ -103,7 +103,7 @@ def test_native_cycle_lifetime_and_error(failed, monkeypatch):
     spec.loader.exec_module(module)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    provider.add_span_processor(module.RefitSpanProcessor(SimpleSpanProcessor(exporter)))
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
     module._configured_pid = os.getpid()
     module._tracer = provider.get_tracer("cycle-test")
@@ -207,3 +207,44 @@ def test_otlp_http_exports_correlated_success_and_failure(monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_role_envelopes_and_shared_attributes(monkeypatch):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    path = Path(__file__).resolve().parents[1] / "modelexpress/telemetry.py"
+    spec = importlib.util.spec_from_file_location("mx_envelope_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(module.RefitSpanProcessor(SimpleSpanProcessor(exporter)))
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
+    module._configured_pid = os.getpid()
+    module._tracer = provider.get_tracer("envelope-test")
+    root = module.RefitCycle({"step": 3, "experiment": "test", "version_uid": "v3"})
+    carrier = {}
+    root.inject(carrier)
+    with module.extracted(carrier), module.refit_attributes(role="trainer", rank=7):
+        with module.refit_span("mx.refit.trainers") as group:
+            with module.refit_span("mx.refit.trainer") as trainer:
+                module.completed_span("publish", 100, 200)
+                module.completed_span("release", 180, 300)
+            group.include([50, 400])
+    root.finish()
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert trainer.interval == [100, 300]
+    assert group.interval == root.interval == [50, 400]
+    assert (spans["mx.refit.trainer"].start_time, spans["mx.refit.trainer"].end_time) == (100, 300)
+    assert (spans["mx.refit.cycle"].start_time, spans["mx.refit.cycle"].end_time) == (50, 400)
+    assert spans["publish"].attributes["rank"] == 7
+    assert spans["publish"].attributes["version_uid"] == "v3"
+    with module.extracted(carrier), module.refit_attributes(role="generator", rank=5):
+        with module.refit_attributes({"role": "trainer", "rank": 0}), module.span("nested") as nested:
+            assert nested.attributes["role"] == "generator" and nested.attributes["rank"] == 5
+    assert not module._refit_attributes.get()
+    with module.span("ambient") as ambient:
+        with pytest.raises(ValueError), module.extracted({"baggage": "step=bad"}):
+            pass
+        assert trace.get_current_span() is ambient
+    provider.shutdown()

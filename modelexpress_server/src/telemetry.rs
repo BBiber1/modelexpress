@@ -8,9 +8,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use opentelemetry::KeyValue;
+use opentelemetry::baggage::BaggageExt;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use tower::{Layer, Service};
 use tracing::{Instrument, field};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -63,7 +65,7 @@ where
             .path()
             .starts_with("/model_express.refit.RefitService/");
         let method = crate::metrics::grpc::method_label(request.uri().path());
-        let carrier: HashMap<String, String> = ["traceparent", "tracestate"]
+        let carrier: HashMap<String, String> = ["traceparent", "tracestate", "baggage"]
             .into_iter()
             .filter_map(|key| {
                 request
@@ -94,7 +96,32 @@ where
             );
             if carrier.contains_key("traceparent") {
                 let parent = TraceContextPropagator::new().extract(&carrier);
-                let _ = span.set_parent(parent);
+                let parent = BaggagePropagator::new().extract_with_context(&parent, &carrier);
+                let _ = span.set_parent(parent.clone());
+                for key in [
+                    "experiment",
+                    "step",
+                    "version_uid",
+                    "staging_mode",
+                    "refit.id",
+                    "refit.step",
+                    "refit.phase",
+                    "mx.experiment.run_id",
+                ] {
+                    if let Some(value) = parent.baggage().get(key) {
+                        if matches!(key, "step" | "refit.step") {
+                            if let Ok(number) = value.as_str().parse::<i64>() {
+                                span.context()
+                                    .span()
+                                    .set_attribute(KeyValue::new(key, number));
+                            }
+                        } else {
+                            span.context()
+                                .span()
+                                .set_attribute(KeyValue::new(key, value.to_string()));
+                        }
+                    }
+                }
             }
             let result = inner.call(request).instrument(span.clone()).await;
             if span.context().span().is_recording() {
