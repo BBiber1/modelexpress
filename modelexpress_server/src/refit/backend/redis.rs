@@ -139,6 +139,14 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
             "" => None,
             value => Some(value.to_string()),
         },
+        trace_context: fields
+            .get("trace_context")
+            .map(|value| serde_json::from_str(value))
+            .transpose()
+            .map_err(|error| {
+                RefitBackendError::Internal(format!("invalid trace_context: {error}"))
+            })?
+            .unwrap_or_default(),
         layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
         state: parse_hash_field(&fields, "state")?,
         created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
@@ -324,6 +332,11 @@ impl RedisRefitBackend {
                 .version_number
                 .map(|number| number.to_string())
                 .unwrap_or_default(),
+        );
+        invocation.arg(
+            serde_json::to_string(&request.trace_context).map_err(|error| {
+                RefitBackendError::Internal(format!("invalid trace_context: {error}"))
+            })?,
         );
         let mut redis = self.redis.clone();
         invocation

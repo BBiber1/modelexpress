@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import grpc
@@ -50,6 +50,7 @@ class WeightVersion:
     object_storage: ObjectStorageSource | None = None
     trainer_mesh_id: str | None = None
     version_number: int | None = None
+    trace_context: dict[str, str] = field(default_factory=dict)
 
     @property
     def ref(self) -> WeightVersionRef:
@@ -156,6 +157,7 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
         version_number=version.version_number
         if version.HasField("version_number")
         else None,
+        trace_context=dict(version.trace_context),
     )
 
 
@@ -258,6 +260,7 @@ class ModelExpressControlClient:
         base_version_id: str | None = None,
         object_storage: ObjectStorageSource | None = None,
         state: WeightVersionState = WeightVersionState.STAGING,
+        trace_context: dict[str, str] | None = None,
     ) -> WeightVersion:
         """Create one global version with its initial lifecycle state."""
         _required(model_name, "model_name")
@@ -291,6 +294,8 @@ class ModelExpressControlClient:
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
             }[state],
         )
+        if trace_context:
+            request.trace_context.update(trace_context)
         if uid is not None:
             request.uid = _required(uid, "uid")
         if trainer_mesh_id is not None:

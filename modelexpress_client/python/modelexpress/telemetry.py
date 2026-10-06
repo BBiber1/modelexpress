@@ -39,6 +39,7 @@ _SHARED_ATTRIBUTES = frozenset(
         "refit.step",
         "refit.phase",
         "mx.experiment.run_id",
+        "refit.aggregate",
     }
 )
 _ROLE_SPANS = frozenset(

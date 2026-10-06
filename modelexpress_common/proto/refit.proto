@@ -153,6 +153,8 @@ message WeightVersion {
   // Required for worker publication; absent for object-storage versions.
   optional string trainer_mesh_id = 11;
   optional int64 version_number = 12;
+  // W3C context of the refit cycle, retained across lifecycle reads.
+  map<string, string> trace_context = 13;
 }
 
 message CreateWeightVersionRequest {
@@ -172,6 +174,7 @@ message CreateWeightVersionRequest {
   // Required for worker publication; absent for object-storage versions.
   optional string trainer_mesh_id = 9;
   optional int64 version_number = 10;
+  map<string, string> trace_context = 11;
 }
 
 message ListWeightVersionsRequest {
