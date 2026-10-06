@@ -64,6 +64,7 @@ class RefitTimingRecorder:
         ep_rank: int | None = None,
         ep_size: int | None = None,
         cold: bool | None = None,
+        log_enabled: bool = True,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.backend = backend
@@ -74,6 +75,7 @@ class RefitTimingRecorder:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.cold = cold
+        self._log_enabled = log_enabled
         self.bytes = 0
         self._clock = clock
         self._started_at = clock()
@@ -134,9 +136,12 @@ class RefitTimingRecorder:
             extra = {**(metadata or {}), **discovered}
             if duration_key is not None:
                 extra[duration_key] = elapsed
-            for name, value in extra.items():
-                if isinstance(value, (int, float)) and not name.endswith("_s"):
-                    telemetry.attribute(name, value)
+            if telemetry.recording() or os.environ.get(
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+            ):
+                for name, value in extra.items():
+                    if isinstance(value, (int, float)) and not name.endswith("_s"):
+                        telemetry.attribute(name, value)
             self.add_duration(
                 stage,
                 elapsed,
@@ -147,7 +152,8 @@ class RefitTimingRecorder:
 
         span_name = duration_key.removesuffix("_s") if duration_key else stage
         with telemetry.span(
-            f"mx.refit.{span_name}", self._trace_attributes()
+            f"mx.refit.{span_name}",
+            self._trace_attributes() if telemetry.recording() else None,
         ) as trace_span:
             try:
                 yield discovered
@@ -183,11 +189,12 @@ class RefitTimingRecorder:
         item = self._stages[stage]
         item.duration_s += float(duration_s)
         item.count += 1
-        telemetry.duration(
-            "mx_refit_stage_duration_seconds",
-            duration_s,
-            {**self._metric_attributes(), "stage": stage, "status": status},
-        )
+        if os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
+            telemetry.duration(
+                "mx_refit_stage_duration_seconds",
+                duration_s,
+                {**self._metric_attributes(), "stage": stage, "status": status},
+            )
         if status not in item.statuses:
             item.statuses.append(status)
         if metadata:
@@ -321,12 +328,13 @@ class RefitTimingRecorder:
             return self._emitted_payload
         self.finish()
         payload = self.as_dict()
-        telemetry.duration(
-            "mx_refit_total_duration_seconds",
-            payload["e2e_ms"] / 1000.0,
-            self._metric_attributes(),
-        )
-        if telemetry.enabled():
+        if os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
+            telemetry.duration(
+                "mx_refit_total_duration_seconds",
+                payload["e2e_ms"] / 1000.0,
+                self._metric_attributes(),
+            )
+        if not self._log_enabled:
             self._emitted_payload = payload
             return payload
         encoded = json.dumps(

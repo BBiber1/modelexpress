@@ -17,6 +17,7 @@ from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 
 @pytest.fixture
 def recording(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_TRACE_DETAIL", "1")
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -38,7 +39,11 @@ def sample(size=64, duration=2000000):
     )
 
 
-def test_batch_encloses_distinct_completions_and_aggregates(recording):
+@pytest.mark.parametrize("detail", [False, True])
+def test_batch_encloses_distinct_completions_and_aggregates(
+    recording, monkeypatch, detail
+):
+    monkeypatch.setenv("MX_REFIT_TRACE_DETAIL", str(int(detail)))
     events = []
     agent = SimpleNamespace(
         get_xfer_telemetry=lambda handle: sample(handle, handle * 10000)
@@ -55,18 +60,24 @@ def test_batch_encloses_distinct_completions_and_aggregates(recording):
             assert trace.get_current_span() is refit
         batch.complete(first, agent, 64)
         finished = recording.get_finished_spans()
-        assert [s.name for s in finished] == ["mx.refit.nixl_transfer"]
-        events.append(finished[0].end_time)
+        assert not finished
+        events.append(batch._requests[first]["end_ns"])
         batch.complete(second, agent, 128)
+        batch._finish()
     spans = recording.get_finished_spans()
     parent = next(s for s in spans if s.name == "mx.refit.nixl_batch")
     children = [s for s in spans if s.name == "mx.refit.nixl_transfer"]
     assert parent.parent.span_id == refit.get_span_context().span_id
     assert all(s.parent.span_id == parent.context.span_id for s in children)
-    assert (
-        parent.start_time <= children[0].start_time <= events[0] <= children[1].end_time
-    )
-    assert parent.end_time == children[1].end_time
+    assert len(children) == (2 if detail else 0)
+    if detail:
+        assert (
+            parent.start_time
+            <= children[0].start_time
+            <= events[0]
+            <= children[1].end_time
+        )
+        assert parent.end_time == children[1].end_time
     assert all(
         s.attributes["rank"] == 3 and s.attributes["step"] == 7
         for s in [parent, *children]
@@ -98,6 +109,7 @@ def test_incomplete_native_coverage_and_failure(recording, failure):
         batch.complete(
             second, SimpleNamespace(get_xfer_telemetry=unavailable), object()
         )
+    batch._finish()
     parent = next(
         s for s in recording.get_finished_spans() if s.name == "mx.refit.nixl_batch"
     )
@@ -147,6 +159,15 @@ def test_disabled_or_nonrecording_skips_request_work(recording, monkeypatch):
     batch = telemetry._NixlBatch()
     assert batch.post("peer") is None
     assert not batch._requests
+    assert not recording.get_finished_spans()
+    cycle = telemetry.RefitCycle()
+    carrier = {}
+    cycle.inject(carrier)
+    assert carrier["traceparent"].endswith("-00")
+    with cycle.active():
+        with telemetry.span("mx.refit.publish"):
+            assert not telemetry.recording()
+    cycle.finish()
     assert not recording.get_finished_spans()
     provider.shutdown()
 
@@ -217,6 +238,7 @@ def test_native_metric_units_and_request_span_exemplars(recording, monkeypatch):
         batch.complete(
             request, SimpleNamespace(get_xfer_telemetry=lambda h: sample()), object()
         )
+        batch._finish()
         exported = [
             m
             for r in reader.get_metrics_data().resource_metrics
