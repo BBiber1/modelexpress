@@ -1800,6 +1800,13 @@ local to each process. Native `mx.refit.trainer`, `mx.refit.generator`, and
 under `mx.refit.cycle`. The external Jaeger archive computes their exact bounds
 from exported children.
 
+`telemetry.completed_span(..., error=exception)` records the original interval
+and marks a deferred phase as failed, or cancelled for `asyncio.CancelledError`.
+It records exception information without changing application exception handling.
+Like ordinary completed spans, failed intervals contribute to the exact role
+envelope bounds. The optional argument preserves existing callers and disabled
+telemetry remains inert.
+
 Refit cycle context is stored in the weight version's `trace_context` map and
 returned by the existing lifecycle RPCs. Trainer ranks carry the cycle context
 alongside the version identity in their existing broadcast. Roles that begin
