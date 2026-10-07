@@ -1582,6 +1582,13 @@ cannot retain bytes from a previous batch or version.
 
 ### Native NIXL refit telemetry
 
+The native `mx.refit.cycle` parent is exported with `service.name=root` so trace
+viewers can show it separately from trainer spans. Trainer, generator, server
+and orchestrator spans keep their configured service names. The existing span
+processor changes only the cycle's exported resource service name; other resource
+attributes, schema, trace/parent IDs and envelope bounds are preserved. It reuses
+the existing batch exporter without adding a provider, export thread or barrier.
+
 With MX OpenTelemetry tracing enabled, NIXL agents enable native telemetry capture.
 Each posted group has an `mx.refit.nixl_batch` span from the first request posting
 until the final request completion, with `mx.refit.nixl_transfer` children.
