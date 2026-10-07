@@ -9,6 +9,7 @@ Callers use this module without importing OpenTelemetry directly. Installing the
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import contextlib
 import contextvars
@@ -365,6 +366,8 @@ def completed_span(
     start_time: int,
     end_time: int,
     attributes: Mapping[str, Any] | None = None,
+    *,
+    error: BaseException | None = None,
 ) -> None:
     """Record a completed interval once its propagated parent is available."""
     if not recording():
@@ -375,6 +378,12 @@ def completed_span(
         start_time=start_time,
         attributes={**_refit_attributes.get(), **(attributes or {})},
     )
+    if error is not None:
+        from opentelemetry.trace import StatusCode
+
+        current.record_exception(error)
+        current.set_status(StatusCode.ERROR, str(error))
+        current.set_attribute("status", "cancelled" if isinstance(error, asyncio.CancelledError) else "failed")
     current.end(end_time=end_time)
 
 
