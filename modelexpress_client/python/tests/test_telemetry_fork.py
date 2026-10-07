@@ -14,6 +14,7 @@ pytest.importorskip("opentelemetry.sdk")
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http import trace_exporter
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.id_generator import IdGenerator
@@ -95,7 +96,8 @@ def test_forked_span_ids():
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_native_cycle_lifetime_and_error(failed, monkeypatch):
+@pytest.mark.parametrize("with_children", [False, True])
+def test_native_cycle_lifetime_and_error(failed, with_children, monkeypatch):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
     path = Path(__file__).resolve().parents[1] / "modelexpress/telemetry.py"
@@ -103,7 +105,10 @@ def test_native_cycle_lifetime_and_error(failed, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     exporter = InMemorySpanExporter()
-    provider = TracerProvider()
+    provider = TracerProvider(resource=Resource(
+        {"service.name": "prime-rl-trainer", "mx.experiment.run_id": "test-run", "host.name": "trainer-0"},
+        schema_url="https://opentelemetry.io/schemas/1.26.0",
+    ))
     provider.add_span_processor(module.RefitSpanProcessor(SimpleSpanProcessor(exporter)))
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
     module._configured_pid = os.getpid()
@@ -113,21 +118,25 @@ def test_native_cycle_lifetime_and_error(failed, monkeypatch):
         carrier = {}
         cycle.inject(carrier)
         assert trace.get_current_span() is ambient
-        with module.extracted(carrier):
-            with module.span("mx.refit.offer"):
-                pass
-            for role in ("trainer", "control", "generator", "server"):
-                with module.span("mx.refit", {"role": role, "rank": 0}):
+        if with_children:
+            with module.extracted(carrier):
+                with module.span("mx.refit.offer"):
                     pass
+                for role in ("trainer", "control", "generator", "server"):
+                    with module.span("mx.refit", {"role": role, "rank": 0}):
+                        pass
         assert cycle.is_recording()
         cycle.finish(RuntimeError("refit failed") if failed else None)
         cycle.finish()  # Completion is idempotent.
     recorded = exporter.get_finished_spans()
     root = next(s for s in recorded if s.name == "mx.refit.cycle")
+    assert root.resource.attributes == {**provider.resource.attributes, "service.name": "root"}
+    assert root.resource.schema_url == provider.resource.schema_url
+    assert all(s.resource is provider.resource for s in recorded if s.name != "mx.refit.cycle")
     assert root.parent is None
     assert root.context.trace_id != ambient.get_span_context().trace_id
     children = [s for s in recorded if s.name not in ("mx.refit.cycle", "ambient")]
-    assert len(children) == 5
+    assert len(children) == (5 if with_children else 0)
     assert all(s.parent.span_id == root.context.span_id for s in children)
     assert all(
         root.start_time <= s.start_time <= s.end_time <= root.end_time for s in children
@@ -201,6 +210,11 @@ def test_otlp_http_exports_correlated_success_and_failure(monkeypatch):
         cycle.finish(error)
         assert telemetry._tracer_provider.force_flush(timeout_millis=5000)
         spans = [span for message in payloads for resource in message.resource_spans for scope in resource.scope_spans for span in scope.spans]
+        services = {
+            span.name: next(a.value.string_value for a in resource.resource.attributes if a.key == "service.name")
+            for message in payloads for resource in message.resource_spans for scope in resource.scope_spans for span in scope.spans
+        }
+        assert services == {"mx.refit.cycle": "root", "mx.refit": "mx-export-test", "mx.refit.install": "mx-export-test"}
         root = next(span for span in spans if span.name == "mx.refit.cycle")
         children = [span for span in spans if span.name != "mx.refit.cycle"]
         assert len(children) == 2
