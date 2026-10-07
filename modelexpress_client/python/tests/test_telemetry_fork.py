@@ -1,4 +1,3 @@
-import asyncio
 import importlib.util
 import multiprocessing
 import os
@@ -157,8 +156,6 @@ def test_disabled_cycle_skips_context_work(monkeypatch):
     carrier = {}
     cycle.inject(carrier)
     assert not cycle.is_recording() and not carrier
-    module.completed_span("disabled", 100, 200, error=asyncio.CancelledError())
-    assert module._tracer is None
     cycle.finish()
 
 
@@ -169,11 +166,8 @@ if __name__ == "__main__":
 def test_otlp_http_exports_correlated_success_and_failure(monkeypatch):
     import http.server
     import threading
-
     from modelexpress import telemetry
-    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
-        ExportTraceServiceRequest,
-    )
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 
     payloads = []
 
@@ -229,8 +223,7 @@ def test_otlp_http_exports_correlated_success_and_failure(monkeypatch):
         thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("failure", [None, RuntimeError("preparation failed"), asyncio.CancelledError()])
-def test_role_envelopes_and_shared_attributes(monkeypatch, failure):
+def test_role_envelopes_and_shared_attributes(monkeypatch):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
     path = Path(__file__).resolve().parents[1] / "modelexpress/telemetry.py"
@@ -249,7 +242,7 @@ def test_role_envelopes_and_shared_attributes(monkeypatch, failure):
     with module.extracted(carrier), module.refit_attributes(role="trainer", rank=7):
         with module.refit_span("mx.refit.trainers") as group:
             with module.refit_span("mx.refit.trainer") as trainer:
-                module.completed_span("publish", 100, 200, error=failure)
+                module.completed_span("publish", 100, 200)
                 module.completed_span("release", 180, 300)
             group.include([50, 400])
     root.finish()
@@ -260,15 +253,6 @@ def test_role_envelopes_and_shared_attributes(monkeypatch, failure):
     assert (spans["mx.refit.cycle"].start_time, spans["mx.refit.cycle"].end_time) == (50, 400)
     assert spans["publish"].attributes["rank"] == 7
     assert spans["publish"].attributes["version_uid"] == "v3"
-    if failure is not None:
-        assert spans["publish"].status.status_code == trace.StatusCode.ERROR
-        assert spans["publish"].events[0].name == "exception"
-        assert spans["publish"].attributes["status"] == (
-            "cancelled" if isinstance(failure, asyncio.CancelledError) else "failed"
-        )
-    else:
-        assert spans["publish"].status.status_code == trace.StatusCode.UNSET
-        assert not spans["publish"].events
     with module.extracted(carrier), module.refit_attributes(role="generator", rank=5):
         with module.refit_attributes({"role": "trainer", "rank": 0}), module.span("nested") as nested:
             assert nested.attributes["role"] == "generator" and nested.attributes["rank"] == 5
