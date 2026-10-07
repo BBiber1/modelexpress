@@ -75,23 +75,32 @@ class RefitSpanProcessor:
         self.processor._on_ending(span)
 
     def on_end(self, span: Any) -> None:
+        from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import ReadableSpan
 
         with _bounds_lock:
             interval = _bounds.pop((span.context.trace_id, span.context.span_id), None)
-            if interval is not None and interval[0] is not None:
+            bounded = interval is not None and interval[0] is not None
+            if bounded or span.name == "mx.refit.cycle":
                 span = ReadableSpan(
                     name=span.name,
                     context=span.context,
                     parent=span.parent,
-                    resource=span.resource,
+                    resource=(
+                        Resource(
+                            {**span.resource.attributes, "service.name": "root"},
+                            schema_url=span.resource.schema_url,
+                        )
+                        if span.name == "mx.refit.cycle"
+                        else span.resource
+                    ),
                     attributes=span.attributes,
                     events=span.events,
                     links=span.links,
                     kind=span.kind,
                     status=span.status,
-                    start_time=interval[0],
-                    end_time=interval[1],
+                    start_time=interval[0] if bounded else span.start_time,
+                    end_time=interval[1] if bounded else span.end_time,
                     instrumentation_scope=span.instrumentation_scope,
                 )
             if span.parent is not None:
