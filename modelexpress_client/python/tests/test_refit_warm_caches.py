@@ -89,7 +89,13 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     prepared = _PreparedNixlTransfer(
-        plan, capture, {}, (), SimpleNamespace(await_reads=lambda _: None)
+        plan,
+        capture,
+        {},
+        (),
+        SimpleNamespace(await_reads=lambda _: None),
+        {copy.param_name: copy for copy in capture.copies},
+        0,
     )
     for version in range(3):
         source.add_(1)

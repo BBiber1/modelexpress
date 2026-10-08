@@ -12,6 +12,12 @@ class RefitCacheConfig:
     cache_generator_layout: bool = field(
         default_factory=lambda: envs.MX_REFIT_CACHE_GENERATOR_LAYOUT
     )
+    cache_descriptors: bool = field(
+        default_factory=lambda: envs.MX_REFIT_CACHE_DESCRIPTORS
+    )
+    validate_workspace: bool = field(
+        default_factory=lambda: envs.MX_REFIT_DEBUG_VALIDATE_WORKSPACE
+    )
     validate_plan: bool = field(
         default_factory=lambda: envs.MX_REFIT_DEBUG_VALIDATE_PLAN
     )

@@ -1815,16 +1815,23 @@ skip manifest fetches and create no per-shard spans. Cold and diagnostic lookups
 retain fetch, hash and fingerprint timing,
 and resolution timing ends before yielding the candidate for preparation.
 
-Bounded transfer can reuse immutable READ addresses and sizes for the currently
-validated compiled plan. The one-entry cache checks the workspace generation and
-the identity, order and geometry of all receive arenas before every batch. It
-holds only weak arena references; source leases, tensor views and transport
-handles remain owned by the update. Cold and diagnostic preparation validate source metadata and coverage. Every
-batch creates views, zeroes padding,
-posts fresh READs and completes the existing fences. Failed preparation,
-incomplete iteration and workspace teardown discard the descriptors. Private
-transfer counters report hits, misses and builds; descriptor work stays outside
-the wire timer on both cold and warm updates.
+Full and bounded compiled plans contain eagerly bound immutable READ addresses,
+per-batch source selections, conversion mappings, payload totals and parameter
+names. Descriptor reuse is independent of trainer and generator-layout caching:
+disabling it rebuilds bindings each preparation while retaining a compatible
+compiled plan and registered storage. Normal warm preparation and iteration do
+not inspect workspace geometry or rebuild descriptors. Each batch creates the
+needed tensor views, zeroes padding, posts fresh READ handles and completes the
+existing fences. Incomplete iteration invalidates its plan; uncertain drains
+retain the existing transport quarantine behavior.
+
+`MX_REFIT_DEBUG_VALIDATE_WORKSPACE` checks the previous registered binding before
+preparation, even if another cache is disabled, and before READ posts and between
+batch yields. It compares registration generation, tensor identity and geometry;
+drift fails before new reads. Binding snapshots contain weak references and own
+no registered storage. Workspace reset releases registrations only after the
+existing completion guards. Per-version transfer metrics remain fresh, including
+descriptor hits, misses and builds; binding work remains outside the wire timer.
 
 The trainer snapshot owns immutable copies of parsed source rows, session and
 agent metadata maps. It contains host metadata and owns no tensors, transport

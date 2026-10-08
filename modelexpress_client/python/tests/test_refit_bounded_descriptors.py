@@ -13,19 +13,19 @@ import modelexpress_rl.inference.nixl_staged_transfer as module
 import pytest
 import torch
 from modelexpress import envs
-from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
+from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 
 @pytest.fixture
@@ -263,7 +263,7 @@ def test_warm_descriptors_still_transfer_new_values(
     first = prepare()
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
-    assert cold["descriptor_builds"] == len(first.batches)
+    assert cold["descriptor_builds"] == first.metrics["batches"]
     assert cold["descriptor_cache_hits"] == 0
     for values in harness.sources.values():
         values.add_(3)
@@ -273,10 +273,10 @@ def test_warm_descriptors_still_transfer_new_values(
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
     assert len(harness.captures) == 1
-    assert warm["descriptor_cache_hits"] == len(second.batches)
+    assert warm["descriptor_cache_hits"] == second.metrics["batches"]
     assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
     assert len(harness.transports) == 1
-    assert len(second.transport.posts) == 2 * len(second.batches)
+    assert len(second.transport.posts) == 2 * second.metrics["batches"]
     assert second.transport.mem_type == ("DRAM" if device == "cpu" else "VRAM")
     assert second.transport.awaited == second.transport.posted
 
@@ -295,22 +295,26 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
     second = harness.prepare(**kwargs)
     metrics, _ = harness.collect(second)
     assert metrics["descriptor_cache_hits"] == 0
-    assert metrics["descriptor_builds"] == len(second.batches)
+    assert metrics["descriptor_builds"] == second.metrics["batches"]
 
 
+@pytest.mark.parametrize("descriptors", [False, True])
+@pytest.mark.parametrize("plan,layout", [(True, True), (False, True), (True, False)])
 @pytest.mark.parametrize(
     "change", ["replace", "same_address", "reorder", "resize", "registration"]
 )
-def test_arena_change_after_prepare_is_checked_before_each_post(
-    harness, change
+def test_workspace_diagnostic_rejects_drift_before_reads(
+    harness, monkeypatch, descriptors, plan, layout, change
 ) -> None:
-    first = harness.prepare(staging_buffers=2)
-    harness.collect(first)
-    prepared = harness.prepare(staging_buffers=2)
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_WORKSPACE", "1")
+    monkeypatch.setenv("MX_REFIT_CACHE_PLAN", str(int(plan)))
+    monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", str(int(layout)))
+    monkeypatch.setenv("MX_REFIT_CACHE_DESCRIPTORS", str(int(descriptors)))
+    harness.new_transfer()
+    harness.collect(harness.prepare(staging_buffers=2))
     arenas = harness.transfer._staging_arenas
     if change == "replace":
         arenas[1] = arenas[1].clone()
-        harness.transfer._manager.register_dram_buffer(arenas[1])
     elif change == "same_address":
         arenas[1] = arenas[1].view_as(arenas[1])
     elif change == "reorder":
@@ -319,29 +323,30 @@ def test_arena_change_after_prepare_is_checked_before_each_post(
         arenas[1].resize_(arenas[1].numel() + 256)
     else:
         harness.transfer._release_staging_registrations()
-        harness.transfer._staging_registrations = [
-            harness.transfer._manager.register_dram_buffer(arena) for arena in arenas
-        ]
-    metrics, installed = harness.collect(prepared)
+    posts = harness.events.count("post")
+    with pytest.raises(ValueError, match="registered workspace changed"):
+        prepared = harness.prepare(staging_buffers=2)
+        harness.collect(prepared)
+    assert harness.events.count("post") == posts
+    _, installed = harness.collect(harness.prepare(staging_buffers=2))
     _check_values(harness, installed)
-    assert metrics["descriptor_cache_hits"] == 0
-    assert metrics["descriptor_builds"] == len(prepared.batches)
-    assert harness.transfer._descriptor_cache is None
 
 
-def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness) -> None:
-    harness.collect(harness.prepare())
-    prepared = harness.prepare()
-    metrics = {}
-    iterator = harness.transfer.iter_bounded(prepared, metrics)
+@pytest.mark.parametrize("buffers", [1, 2])
+def test_workspace_diagnostic_between_yields_drains_without_posting_again(
+    harness, monkeypatch, buffers
+) -> None:
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_WORKSPACE", "1")
+    harness.new_transfer()
+    prepared = harness.prepare(staging_buffers=buffers)
+    iterator = harness.transfer.iter_bounded(prepared, {})
     next(iterator)
-    assert metrics["descriptor_cache_hits"] == 1
+    posts = len(prepared.transport.posted)
     harness.transfer._staging_arenas[0] = harness.transfer._staging_arenas[0].clone()
-    harness.transfer._manager.register_dram_buffer(harness.transfer._staging_arenas[0])
-    for tensors in iterator:
-        assert tensors
-    assert metrics["descriptor_cache_hits"] == 1
-    assert metrics["descriptor_builds"] == len(prepared.batches) - 1
+    with pytest.raises(ValueError, match="registered workspace changed"):
+        next(iterator)
+    assert len(prepared.transport.posted) == posts
+    assert prepared.transport.awaited == prepared.transport.posted
 
 
 @pytest.mark.parametrize(
@@ -394,14 +399,13 @@ def test_incomplete_iteration_discards_cache_and_preserves_drain(
         else:
             iterator.close()
             assert prepared.transport.awaited == prepared.transport.posted
-    assert harness.transfer._descriptor_cache is None
 
 
 @pytest.mark.parametrize("cleanup", ["reset", "close"])
-def test_metadata_does_not_own_arenas_or_handles(harness, cleanup):
+def test_metadata_does_not_own_arenas_or_handles(harness, cleanup) -> None:
     prepared = harness.prepare()
     harness.collect(prepared)
-    entry = harness.transfer._descriptor_cache
+    entry = prepared.cached_plan
     arena_refs = [weakref.ref(arena) for arena in harness.transfer._staging_arenas]
     transport_ref = weakref.ref(prepared.transport)
     # Drop test-only observation lists and all prepared state.
@@ -412,7 +416,6 @@ def test_metadata_does_not_own_arenas_or_handles(harness, cleanup):
     gc.collect()
     assert all(reference() is None for reference in arena_refs)
     assert transport_ref() is None
-    assert entry.batches and harness.transfer._descriptor_cache is None
 
 
 def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
@@ -433,7 +436,7 @@ def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
 
     monkeypatch.setattr(harness.transfer, "_descriptors", descriptors)
     first = harness.prepare(max_staging_bytes=2048)
-    assert len(first.batches) == 1
+    assert first.metrics["batches"] == 1
     harness.collect(first)
     second = harness.prepare(max_staging_bytes=2048)
     metrics, installed = harness.collect(second)
@@ -476,7 +479,7 @@ def test_required_agents_are_resolved_once_per_compiled_plan(
     monkeypatch.setattr(module, "_required_agent_metadata", record)
     first = harness.prepare()
     cold_calls = len(calls)
-    assert cold_calls == 1 + len(first.batches)
+    assert cold_calls == 1 + first.metrics["batches"]
     harness.collect(first)
     calls.clear()
     second = harness.prepare()
@@ -494,7 +497,7 @@ def test_partial_receive_setup_can_be_reset_and_prepared_again(
     target, name = {
         "allocation": (transfer, "_allocate_arena"),
         "registration": (transfer._manager, "register_dram_buffer"),
-        "descriptors": (transfer, "_prepare_bounded_descriptors"),
+        "descriptors": (transfer, "_bind_descriptors"),
     }[failure]
     original = getattr(target, name)
     attempts = 0

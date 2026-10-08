@@ -29,6 +29,8 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 from torch import nn
 
+from tests.test_refit_nixl_staged_transfer import _iteration_prepared
+
 
 def _install_fake_vllm(monkeypatch, initialize):
     @contextmanager
@@ -2142,18 +2144,14 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
             for d in posted:
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
-    prepared = transfer_module._PreparedBoundedTransfer(
-        planned, {"w": source}, Transport()
-    )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
     transfer.cache_config = RefitCacheConfig()
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
-    transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    prepared = _iteration_prepared(transfer, planned, {"w": source}, Transport())
 
     class Owner(nn.Module):
         def __init__(self, dtype):

@@ -115,10 +115,14 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),
         transport=_Transport(),
+        conversion_copies={},
+        wire_bytes=nbytes,
     )
 
 
-def _stage(monkeypatch, *, nbytes: int, wire_s: float) -> transfer_module._StagedNixlWeights:
+def _stage(
+    monkeypatch, *, nbytes: int, wire_s: float
+) -> transfer_module._StagedNixlWeights:
     """Run stage() to completion on CPU with a scripted wire duration."""
     monkeypatch.setattr(
         transfer_module,

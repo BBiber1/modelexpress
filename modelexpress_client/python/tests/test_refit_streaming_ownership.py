@@ -35,9 +35,7 @@ def setup_method(
                 raise RuntimeError("preparation failed")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(layouts=({"weight": ((2, 2), torch.float32)},))
-                ],
+                cached_plan=SimpleNamespace(parameter_names=frozenset({"weight"})),
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -168,7 +166,9 @@ def test_foreign_or_released_stream_cannot_enter_or_release_active_source(monkey
     assert method._transfer.arena is None
 
 
-def test_failed_unread_preparation_resets_workspace_and_allows_retry(monkeypatch) -> None:
+def test_failed_unread_preparation_resets_workspace_and_allows_retry(
+    monkeypatch,
+) -> None:
     method, source, events, _ = setup_method(monkeypatch)
     method._transfer.fail_prepare = True
     with pytest.raises(RuntimeError, match="preparation failed"):
