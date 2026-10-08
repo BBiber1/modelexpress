@@ -1783,6 +1783,7 @@ def _stage_and_apply(generator, *, version):
         (1, RuntimeError, False),
         (1, grpc.RpcError, False),
         (1, ManifestMismatchError, False),
+        (1, StrategyRecoveryError, False),
         (3, RuntimeError, False),
         (1, RuntimeError, True),
     ],

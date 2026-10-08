@@ -229,10 +229,10 @@ class WeightUpdateSession:
                         staging_device=streaming.staging_device,
                         staging_buffers=streaming.staging_buffers,
                     )
-            except StrategyRecoveryError:
-                raise
             except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
                 if streaming is None:
+                    if isinstance(error, StrategyRecoveryError):
+                        raise
                     self._recover_preparation(plan.method, error)
                 last_error = error
                 logger.warning(
