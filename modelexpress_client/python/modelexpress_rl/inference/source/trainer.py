@@ -116,9 +116,14 @@ class TrainerSourceResolver(SourceResolver):
             return
         if not mesh_response.HasField("mesh"):
             raise RuntimeError("MX GetTrainerMesh response is missing mesh")
-        expected_slots = tuple(sorted({
-            metadata.logical_shard_id for metadata in mesh_response.mesh.workers.values()
-        }))
+        expected_slots = tuple(
+            sorted(
+                {
+                    metadata.logical_shard_id
+                    for metadata in mesh_response.mesh.workers.values()
+                }
+            )
+        )
         mesh_workers = mesh_response.mesh.workers
         mesh_generation = mesh_response.mesh.generation
         try:
@@ -149,37 +154,54 @@ class TrainerSourceResolver(SourceResolver):
                 continue
             published[shard.logical_shard_id].append(shard)
 
+        counters: dict[str, int | float] = {}
         slots = []
         for source_slot_id in expected_slots:
-            ordered = sorted(
-                published[source_slot_id], key=lambda item: item.worker_id
-            )
+            ordered = sorted(published[source_slot_id], key=lambda item: item.worker_id)
             if not ordered:
                 logger.warning(
                     "no trainer source published for required slot %s",
                     source_slot_id,
                 )
                 return
-            slots.append(_SlotReplicas(source_slot_id, ordered, self._resolve_source))
+            slots.append(
+                _SlotReplicas(
+                    source_slot_id,
+                    ordered,
+                    lambda shard: self._resolve_source(shard, counters),
+                )
+            )
 
         seen: set[tuple[tuple[str, str], ...]] = set()
         offset = 0
         while True:
-            selected = []
-            for slot in slots:
-                source = slot.usable(offset)
-                if source is None:
-                    if not slot.usable_count:
-                        logger.warning(
-                            "no usable trainer source for required slot %s",
-                            slot.slot_id,
-                        )
-                        return
-                    # Exhausted and shorter than the candidate index, so cycle
-                    # its healthy replicas rather than give up on a slot that
-                    # simply has fewer of them.
-                    source = slot.usable(offset % slot.usable_count)
-                selected.append(source)
+            with refit_span(
+                "source_preparation",
+                metadata={
+                    "manifest_cache_hits": 0,
+                    "manifest_cache_misses": 0,
+                    "manifest_fetch_count": 0,
+                    "manifest_fetch_bytes": 0,
+                    "manifest_bytes": 0,
+                },
+                accumulate_metadata=True,
+                duration_key="source_resolution_s",
+            ) as counters:
+                selected = []
+                for slot in slots:
+                    source = slot.usable(offset)
+                    if source is None:
+                        if not slot.usable_count:
+                            logger.warning(
+                                "no usable trainer source for required slot %s",
+                                slot.slot_id,
+                            )
+                            return
+                        # Exhausted and shorter than the candidate index, so cycle
+                        # its healthy replicas rather than give up on a slot that
+                        # simply has fewer of them.
+                        source = slot.usable(offset % slot.usable_count)
+                    selected.append(source)
             selection = tuple(
                 (source.source_slot_id, source.worker_id) for source in selected
             )
@@ -189,8 +211,13 @@ class TrainerSourceResolver(SourceResolver):
                     refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
                     timeout=self._rpc_timeout_seconds,
                 )
-                if not current.HasField("mesh") or current.mesh.generation != mesh_generation:
-                    raise RuntimeError("trainer mesh generation changed during source resolution")
+                if (
+                    not current.HasField("mesh")
+                    or current.mesh.generation != mesh_generation
+                ):
+                    raise RuntimeError(
+                        "trainer mesh generation changed during source resolution"
+                    )
                 seen.add(selection)
                 yield TrainerUpdateSource(
                     inputs=GeneratorTransferInputs(
@@ -209,7 +236,7 @@ class TrainerSourceResolver(SourceResolver):
             offset += 1
 
     def _resolve_source(
-        self, shard: refit_pb2.WeightVersionShard
+        self, shard: refit_pb2.WeightVersionShard, counters: dict[str, int | float]
     ) -> GeneratorSource:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
@@ -222,32 +249,26 @@ class TrainerSourceResolver(SourceResolver):
             and cached[0] == shard.manifest_endpoint
             and cached[1] == shard.manifest_digest
         )
-        with refit_span(
-            "source_preparation",
-            metadata={
-                "manifest_cache_hits": int(reusable),
-                "manifest_cache_misses": int(not reusable),
-            },
-            accumulate_metadata=True,
-        ) as counters:
-            if reusable:
-                # These bytes hashed to this digest when they were stored, so
-                # verifying them again would be checking them against
-                # themselves.
-                assert cached is not None
-                manifest = cached[2]
-                structure_digest = cached[3]
-            else:
-                manifest, structure_digest = self._fetch_manifest(shard)
-                self._manifest_cache[key] = (
-                    shard.manifest_endpoint,
-                    shard.manifest_digest,
-                    manifest,
-                    structure_digest,
-                )
-                counters["manifest_fetch_bytes"] = len(manifest)
-                counters["manifest_fetch_count"] = 1
-            counters["manifest_bytes"] = len(manifest)
+        counter = "manifest_cache_hits" if reusable else "manifest_cache_misses"
+        counters[counter] = counters.get(counter, 0) + 1
+        if reusable:
+            assert cached is not None
+            manifest, structure_digest = cached[2:]
+        else:
+            counters["manifest_fetch_count"] = (
+                counters.get("manifest_fetch_count", 0) + 1
+            )
+            manifest, structure_digest = self._fetch_manifest(shard)
+            self._manifest_cache[key] = (
+                shard.manifest_endpoint,
+                shard.manifest_digest,
+                manifest,
+                structure_digest,
+            )
+            counters["manifest_fetch_bytes"] = counters.get(
+                "manifest_fetch_bytes", 0
+            ) + len(manifest)
+        counters["manifest_bytes"] = counters.get("manifest_bytes", 0) + len(manifest)
         return GeneratorSource(
             source_slot_id=shard.logical_shard_id,
             worker_id=shard.worker_id,
@@ -259,9 +280,7 @@ class TrainerSourceResolver(SourceResolver):
             ),
         )
 
-    def _fetch_manifest(
-        self, shard: refit_pb2.WeightVersionShard
-    ) -> tuple[bytes, str]:
+    def _fetch_manifest(self, shard: refit_pb2.WeightVersionShard) -> tuple[bytes, str]:
         """Fetch, verify and fingerprint one worker's manifest.
 
         Three spans on one stage rather than one, because the stage total
@@ -269,19 +288,22 @@ class TrainerSourceResolver(SourceResolver):
         CPU, and with digests published these manifests are refetched by
         construction on every version.
         """
-        with refit_span(
-            "source_preparation",
-            accumulate_metadata=True,
-            duration_key="manifest_fetch_s",
-        ), grpc.insecure_channel(
-            shard.manifest_endpoint,
-            options=[
-                (
-                    "grpc.max_receive_message_length",
-                    _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
-                )
-            ],
-        ) as channel:
+        with (
+            refit_span(
+                "source_preparation",
+                accumulate_metadata=True,
+                duration_key="manifest_fetch_s",
+            ),
+            grpc.insecure_channel(
+                shard.manifest_endpoint,
+                options=[
+                    (
+                        "grpc.max_receive_message_length",
+                        _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
+                    )
+                ],
+            ) as channel,
+        ):
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
             ).GetWeightVersionShardManifest(

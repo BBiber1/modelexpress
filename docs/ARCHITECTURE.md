@@ -1760,6 +1760,11 @@ whole plan and every batch again. Ordered manifest bytes, source mappings,
 agent metadata, capture and capacity still invalidate the plan; connected agents
 with changed metadata remain rejected. This cache owns no transport resources.
 
+Trainer source resolution records one timing span per candidate-selection
+attempt. Each shard updates aggregate cache and byte counters; warm cache hits
+create no per-shard spans. Cache misses retain fetch, hash and fingerprint timing,
+and resolution timing ends before yielding the candidate for preparation.
+
 Bounded transfer can reuse immutable READ addresses and sizes for the currently
 validated compiled plan. The one-entry cache checks the workspace generation and
 the identity, order and geometry of all receive arenas before every batch. It
