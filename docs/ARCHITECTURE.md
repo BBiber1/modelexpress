@@ -1742,6 +1742,16 @@ selects bounded trainer streaming or the configured ordinary source order.
 Object-storage replay resolves and validates its chain before preparation, and
 generator-peer staging reserves a read lease without writing live weights.
 
+Trainer resolution produces a `TrainerSourceSnapshot`: mesh ID and generation
+plus immutable selected-shard records containing worker, endpoint, manifest and
+structural/content digests. Version identity stays in the requested
+`WeightVersion`. Each reusable physical plan contains this trainer snapshot and
+an owned deep copy of the existing `CaptureResult` and a separate full destination
+parameter-layout map. Recorded regions do not describe the complete destination
+layout. The capture snapshot preserves operation argument containers and does not
+alias mutable engine-capture results. These snapshots contain no leases, iterators, metrics or
+installation state.
+
 The transfer has explicit `prepare_full_copy` and `prepare_streaming` entry points.
 Full-copy plan reuse belongs to the update method: a matching physical fingerprint
 skips `prepare_full_copy` entirely. Streaming plan reuse belongs to the transfer's

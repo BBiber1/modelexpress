@@ -12,6 +12,8 @@ from typing import Any
 import modelexpress_rl.inference.nixl_staged_transfer as module
 import pytest
 import torch
+from modelexpress import envs
+from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
@@ -125,7 +127,7 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
         listen_port=None,
     )
 
-    def manifests():
+    def manifests() -> list[bytes]:
         return [
             wrap_rendezvous_blob(
                 b"source",
@@ -144,6 +146,11 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
                                 addr=tensor.data_ptr(),
                                 shard_offset=(0, 0),
                                 shape=(4, 4),
+                                digest=(
+                                    tensor_digest(tensor)
+                                    if envs.MX_RESHARD_PUBLISH_DIGEST
+                                    else None
+                                ),
                             )
                         ],
                     )
@@ -463,3 +470,21 @@ def test_partial_receive_setup_can_be_reset_and_prepared_again(
     monkeypatch.setattr(target, name, original)
     _, installed = harness.collect(harness.prepare(staging_buffers=2))
     _check_values(harness, installed)
+
+
+@pytest.mark.parametrize("tensor_indices", [False, True])
+def test_prepared_list_indexing_replays_selected_rows_after_caller_mutation(
+    harness, monkeypatch, tensor_indices
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    indices = torch.tensor([0, 2]) if tensor_indices else [0, 2]
+    copy = harness.capture.copies[1]
+    copy.op_chain = (("__getitem__", (indices,), ()),)
+    copy.dest_shape = (2, 4)
+    copy.dest_stride = (4, 1)
+    prepared = harness.prepare()
+    indices[:] = torch.tensor([1, 3]) if tensor_indices else [1, 3]
+    _, installed = harness.collect(prepared)
+    expected = torch.zeros(20, dtype=torch.float32)
+    expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
+    assert torch.equal(installed["b.weight"], expected)

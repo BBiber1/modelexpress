@@ -15,8 +15,8 @@ from modelexpress.refit.timing import refit_span
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
 from ...train import WeightPayloadFormat
-from ..adapter import GeneratorSource, GeneratorTransferInputs, NixlGeneratorSource
-from ..plan import ResolvedSource, SourceResolver, TrainerUpdateSource, WeightSource
+from ..adapter import TrainerSourceShard
+from ..plan import ResolvedSource, SourceResolver, TrainerSourceSnapshot, WeightSource
 
 logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 
@@ -41,14 +41,14 @@ class _SlotReplicas:
         self,
         slot_id: str,
         shards: list[refit_pb2.WeightVersionShard],
-        resolve: Callable[[refit_pb2.WeightVersionShard], GeneratorSource],
+        resolve: Callable[[refit_pb2.WeightVersionShard], TrainerSourceShard],
     ) -> None:
         self.slot_id = slot_id
         self._pending = list(shards)
         self._resolve = resolve
-        self._usable: list[GeneratorSource] = []
+        self._usable: list[TrainerSourceShard] = []
 
-    def usable(self, index: int) -> GeneratorSource | None:
+    def usable(self, index: int) -> TrainerSourceShard | None:
         """Return the index-th usable replica, resolving no further than needed."""
         while len(self._usable) <= index and self._pending:
             shard = self._pending.pop(0)
@@ -219,16 +219,10 @@ class TrainerSourceResolver(SourceResolver):
                         "trainer mesh generation changed during source resolution"
                     )
                 seen.add(selection)
-                yield TrainerUpdateSource(
-                    inputs=GeneratorTransferInputs(
-                        version_id=version.version_id,
-                        base_version_id=version.base_version_id,
-                        layout_signature=version.layout_signature,
-                        payload_format=version.payload_format,
-                        sources=tuple(selected),
-                        trainer_mesh_id=version.trainer_mesh_id,
-                        trainer_mesh_generation=mesh_generation,
-                    )
+                yield TrainerSourceSnapshot(
+                    mesh_id=version.trainer_mesh_id,
+                    mesh_generation=mesh_generation,
+                    shards=tuple(selected),
                 )
             deepest = max((slot.usable_count for slot in slots), default=1)
             if all(slot.exhausted for slot in slots) and offset + 1 >= deepest:
@@ -237,7 +231,7 @@ class TrainerSourceResolver(SourceResolver):
 
     def _resolve_source(
         self, shard: refit_pb2.WeightVersionShard, counters: dict[str, int | float]
-    ) -> GeneratorSource:
+    ) -> TrainerSourceShard:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
@@ -269,15 +263,13 @@ class TrainerSourceResolver(SourceResolver):
                 "manifest_fetch_bytes", 0
             ) + len(manifest)
         counters["manifest_bytes"] = counters.get("manifest_bytes", 0) + len(manifest)
-        return GeneratorSource(
+        return TrainerSourceShard(
             source_slot_id=shard.logical_shard_id,
             worker_id=shard.worker_id,
             manifest_digest=shard.manifest_digest,
-            transport=NixlGeneratorSource(
-                manifest_endpoint=shard.manifest_endpoint,
-                manifest=manifest,
-                structural_digest=structure_digest,
-            ),
+            manifest_endpoint=shard.manifest_endpoint,
+            manifest=manifest,
+            structural_digest=structure_digest,
         )
 
     def _fetch_manifest(self, shard: refit_pb2.WeightVersionShard) -> tuple[bytes, str]:

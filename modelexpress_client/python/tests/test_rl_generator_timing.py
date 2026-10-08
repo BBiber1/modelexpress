@@ -22,15 +22,13 @@ from modelexpress.refit import (
 )
 from modelexpress_rl import timing
 from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
+    TrainerSourceShard,
 )
 from modelexpress_rl.inference.methods.load_time_tensor import (
     LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
 )
-from modelexpress_rl.inference.plan import TrainerUpdateSource
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress_rl.train import WeightPayloadFormat
 
 STAGED_METRICS = {
@@ -147,31 +145,39 @@ def test_version_digest_refreshes_verification_without_replanning() -> None:
         capture_layout=lambda _manifest: None,
     )
 
-    def source(version, digest):
-        return TrainerUpdateSource(
-            inputs=GeneratorTransferInputs(
-                version_id=version,
-                base_version_id=None,
-                layout_signature="layout",
-                payload_format=WeightPayloadFormat.FULL_TENSOR,
-                sources=(
-                    GeneratorSource(
-                        source_slot_id="rank:0",
-                        worker_id="trainer-0",
-                        manifest_digest=digest,
-                        transport=NixlGeneratorSource(
-                            manifest_endpoint="trainer:9000",
-                            manifest=version.encode(),
-                            structural_digest="stable-structure",
-                        ),
-                    ),
+    def source(version, digest) -> TrainerSourceSnapshot:
+        return TrainerSourceSnapshot(
+            mesh_id=None,
+            mesh_generation=None,
+            shards=(
+                TrainerSourceShard(
+                    source_slot_id="rank:0",
+                    worker_id="trainer-0",
+                    manifest_digest=digest,
+                    manifest_endpoint="trainer:9000",
+                    manifest=version.encode(),
+                    structural_digest="stable-structure",
                 ),
-            )
+            ),
         )
 
-    first = method.prepare(version=None, source=source("v1", "digest-1"))
+    first = method.prepare(
+        version=SimpleNamespace(
+            base_version_id=None,
+            layout_signature="layout",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+        ),
+        source=source("v1", "digest-1"),
+    )
     method.release(first)
-    second = method.prepare(version=None, source=source("v2", "digest-2"))
+    second = method.prepare(
+        version=SimpleNamespace(
+            base_version_id=None,
+            layout_signature="layout",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+        ),
+        source=source("v2", "digest-2"),
+    )
     method.release(second)
 
     assert transfer.prepare_calls == 1

@@ -31,7 +31,7 @@ from modelexpress_rl import (
     WeightVersionRef,
     WeightVersionState,
 )
-from modelexpress_rl.inference.adapter import GeneratorTransferInputs
+from tests._transfer_inputs import GeneratorTransferInputs
 from modelexpress_rl.inference import checkpoint_store as checkpoint_store_module
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.methods import (

@@ -4,6 +4,7 @@
 import ctypes
 from contextlib import nullcontext
 from dataclasses import replace
+from types import SimpleNamespace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
@@ -25,9 +26,7 @@ from modelexpress.refit.reshard.types import (
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl import WeightPayloadFormat
 from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
+    TrainerSourceShard,
 )
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -42,7 +41,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _ResolvedSources,
     _source_structure,
 )
-from modelexpress_rl.inference.plan import TrainerUpdateSource
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 
 def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(monkeypatch):
@@ -360,23 +359,19 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
             ),
         ],
     )
-    source = TrainerUpdateSource(
-        GeneratorTransferInputs(
-            version_id="v",
-            base_version_id=None,
-            layout_signature="layout",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            sources=(
-                GeneratorSource(
-                    "rank:0",
-                    "trainer",
-                    "unchanged",
-                    NixlGeneratorSource(
-                        "source:19000", manifest, structural_manifest_digest(manifest)
-                    ),
-                ),
+    source = TrainerSourceSnapshot(
+        mesh_id=None,
+        mesh_generation=None,
+        shards=(
+            TrainerSourceShard(
+                source_slot_id="rank:0",
+                worker_id="trainer",
+                manifest_digest="unchanged",
+                manifest_endpoint="source:19000",
+                manifest=manifest,
+                structural_digest=structural_manifest_digest(manifest),
             ),
-        )
+        ),
     )
     capture = CaptureResult(
         copies=[
@@ -428,13 +423,27 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                 assert prepared.metrics["plan_cache_hits"] == int(hit)
                 assert prepared.metrics["owner_plan_builds"] == int(not hit)
                 with pytest.raises(RuntimeError, match="release"):
-                    method.prepare(version=None, source=source)
+                    method.prepare(
+                        version=SimpleNamespace(
+                            base_version_id=None,
+                            layout_signature="layout",
+                            payload_format=WeightPayloadFormat.FULL_TENSOR,
+                        ),
+                        source=source,
+                    )
                 for tensors in prepared.batches():
                     assert torch.equal(tensors["layer.weight"], source_tensor)
                 with pytest.raises(RuntimeError, match="no longer active"):
                     transfer.stage(first_plan)
             else:
-                prepared = method.prepare(version=None, source=source)
+                prepared = method.prepare(
+                    version=SimpleNamespace(
+                        base_version_id=None,
+                        layout_signature="layout",
+                        payload_format=WeightPayloadFormat.FULL_TENSOR,
+                    ),
+                    source=source,
+                )
                 assert torch.equal(
                     prepared.staged.tensors["layer.weight"], source_tensor
                 )

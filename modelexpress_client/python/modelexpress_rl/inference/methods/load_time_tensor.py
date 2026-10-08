@@ -16,7 +16,6 @@ from modelexpress.refit.timing import (
 )
 
 from ...train import WeightPayloadFormat
-from ..adapter import NixlGeneratorSource
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
@@ -28,7 +27,7 @@ from ..plan import (
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
-    TrainerUpdateSource,
+    TrainerSourceSnapshot,
     UpdateMethod,
     WeightSource,
 )
@@ -60,24 +59,23 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         )
 
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
-        del version
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release staged weight before staging another version")
-        if not isinstance(source, TrainerUpdateSource):
+        if not isinstance(source, TrainerSourceSnapshot):
             raise TypeError("load-time tensor method requires a trainer source")
-        inputs = source.inputs
-        if any(
-            not isinstance(item.transport, NixlGeneratorSource)
-            for item in inputs.sources
-        ):
-            raise ValueError("load-time tensor method requires NIXL sources")
+        fingerprint = (
+            version.base_version_id,
+            version.layout_signature,
+            version.payload_format,
+            source.physical_fingerprint,
+        )
         reusable = (
             self._full_copy_plan is not None
-            and self._full_copy_fingerprint == inputs.physical_fingerprint
+            and self._full_copy_fingerprint == fingerprint
         )
         set_refit_cold(not reusable)
-        manifests = [item.transport.manifest for item in inputs.sources]
-        manifest_digests = tuple(item.manifest_digest for item in inputs.sources)
+        manifests = [item.manifest for item in source.shards]
+        manifest_digests = tuple(item.manifest_digest for item in source.shards)
         with refit_span(
             "transfer_planning",
             metadata={
@@ -89,9 +87,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             if not reusable:
                 self._full_copy_plan = self._transfer.prepare_full_copy(
                     manifests=manifests,
+                    trainer_snapshot=source,
                     capture_layout=self._capture_layout,
                 )
-                self._full_copy_fingerprint = inputs.physical_fingerprint
+                self._full_copy_fingerprint = fingerprint
         if reusable and manifest_digests != self._full_copy_manifest_digests:
             assert self._full_copy_plan is not None
             with refit_span(
@@ -116,13 +115,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         staging_buffers: int = 1,
     ) -> PreparedArtifact:
         """Prepare trainer metadata without transferring a full weight copy."""
-        del version
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release the active update before preparing another")
-        if not isinstance(source, TrainerUpdateSource) or any(
-            not isinstance(item.transport, NixlGeneratorSource)
-            for item in source.inputs.sources
-        ):
+        if not isinstance(source, TrainerSourceSnapshot):
             raise ValueError("bounded staging requires NIXL trainer sources")
         # Streaming replaces the full-copy destinations, including any cached
         # descriptors into them. Invalidate before a possibly failing switch.
@@ -131,7 +126,8 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._full_copy_manifest_digests = ()
         try:
             prepared = self._transfer.prepare_streaming(
-                manifests=[item.transport.manifest for item in source.inputs.sources],
+                manifests=[item.manifest for item in source.shards],
+                trainer_snapshot=source,
                 capture_layout=self._capture_layout,
                 max_staging_bytes=max_staging_bytes,
                 staging_device=staging_device,

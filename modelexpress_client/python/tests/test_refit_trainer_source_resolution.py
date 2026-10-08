@@ -96,7 +96,7 @@ def test_warm_shards_share_one_resolution_measurement(monkeypatch, count) -> Non
     recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
     with use_refit_timing(recorder):
         candidates = resolver.candidates(version)
-        assert len(next(candidates).inputs.sources) == count
+        assert len(next(candidates).shards) == count
         stage = recorder.as_dict()["stages"]["source_preparation"]
         assert stage["count"] == 2
         assert stage["metadata"]["manifest_cache_hits"] == count
@@ -116,7 +116,7 @@ def test_mixed_shards_count_failed_fetches_and_successful_bytes(monkeypatch) -> 
     recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
     with use_refit_timing(recorder):
         candidates = resolver.candidates(version)
-        assert len(next(candidates).inputs.sources) == 3
+        assert len(next(candidates).shards) == 3
         candidates.close()
     metadata = recorder.as_dict()["stages"]["source_preparation"]["metadata"]
     assert metadata["manifest_cache_hits"] == 2
@@ -132,5 +132,5 @@ def test_mixed_shards_count_failed_fetches_and_successful_bytes(monkeypatch) -> 
 
 def test_warm_resolution_without_timing(monkeypatch) -> None:
     resolver, version, fetched, _ = sources(monkeypatch, 256)
-    assert len(next(resolver.candidates(version)).inputs.sources) == 256
+    assert len(next(resolver.candidates(version)).shards) == 256
     assert fetched == []

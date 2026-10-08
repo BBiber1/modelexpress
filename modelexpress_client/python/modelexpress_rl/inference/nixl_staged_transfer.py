@@ -20,6 +20,7 @@ import weakref
 from collections.abc import Callable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 import torch
@@ -59,6 +60,8 @@ from modelexpress.refit.reshard.types import (
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+
 from modelexpress_rl.inference._source_snapshot import (
     _freeze_sources,
     _snapshot_structure,
@@ -89,6 +92,8 @@ class _PreparedNixlTransfer:
     sources: dict
     descriptors: tuple[ReadDescriptor | _BoundedReadDescriptor, ...]
     transport: NixlReshardTransport
+    trainer_source_snapshot: TrainerSourceSnapshot | None = None
+    parameter_layout: MappingProxyType | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,9 @@ class _CompiledBoundedPlan:
     batches: tuple[_BoundedBatch, ...]
     required_agents: frozenset[str]
     fingerprint: str | None = None
+    trainer_source_snapshot: TrainerSourceSnapshot | None = None
+    generator_capture_snapshot: CaptureResult | None = None
+    parameter_layout: MappingProxyType | None = None
 
 
 class _BoundedReadDescriptor(NamedTuple):
@@ -226,12 +234,12 @@ class _BoundedPlanCache:
         staging_buffers=1,
         total_staging_bytes=None,
         source_snapshot=None,
+        trainer_snapshot=None,
     ) -> _CompiledBoundedPlan:
-        """Compile a bounded plan, copying inputs when caching is enabled.
+        """Compile a bounded plan over privately owned capture/layout inputs.
 
-        Keep capture/layout stable during compilation. Uncached plans retain
-        capture records, which must stay unchanged until transfer completes.
-        The optional guard serializes compilation, not arbitrary input writers.
+        Keep inputs stable during compilation; the guard serializes compilation,
+        not arbitrary input writers.
         """
         copy_key_on_miss = envs.MX_REFIT_COPY_PLAN_KEY_ON_MISS
         if copy_key_on_miss and not self._compile_lock.acquire(blocking=False):
@@ -305,7 +313,9 @@ class _BoundedPlanCache:
                     _NixlStagedTransfer._validate_complete(
                         capture, parameter_layout, compiled.plan
                     )
-                    metrics["bounded_whole_validation_s"] = time.perf_counter() - started
+                    metrics["bounded_whole_validation_s"] = (
+                        time.perf_counter() - started
+                    )
                     owner_started = time.perf_counter()
                     for batch in compiled.module_batches:
                         _NixlStagedTransfer._validate_complete(
@@ -314,11 +324,11 @@ class _BoundedPlanCache:
                     metrics["owner_validation_s"] = time.perf_counter() - owner_started
                     metrics["plan_cache_validate_s"] = time.perf_counter() - started
                     self._entry = entry
-                    logger.info("reusing bounded physical plan %s", compiled.fingerprint)
+                    logger.info(
+                        "reusing bounded physical plan %s", compiled.fingerprint
+                    )
                     return compiled
-            if enabled:
-                # Plan copies/layouts must not alias the callback or key snapshots.
-                capture, parameter_layout = deepcopy((capture, parameter_layout))
+            capture, parameter_layout = deepcopy((capture, parameter_layout))
             started = time.perf_counter()
             plan = _plan_staged_transfer(capture, resolved.sources)
             metrics["initial_whole_plan_s"] = time.perf_counter() - started
@@ -336,7 +346,9 @@ class _BoundedPlanCache:
                 total_staging_bytes=total_staging_bytes,
                 staging_buffers=staging_buffers,
             )
-            batches = _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
+            batches = (
+                _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
+            )
             fingerprint = None
             if key is not None:
                 started = time.perf_counter()
@@ -358,6 +370,9 @@ class _BoundedPlanCache:
                 batches=batches,
                 required_agents=required_agents,
                 fingerprint=fingerprint,
+                trainer_source_snapshot=trainer_snapshot,
+                generator_capture_snapshot=capture,
+                parameter_layout=MappingProxyType(parameter_layout),
             )
             if key is not None:
                 self._entry = (key, compiled)
@@ -924,7 +939,11 @@ class _NixlStagedTransfer:
         )
 
     def prepare_full_copy(
-        self, *, manifests: list[bytes], capture_layout: _CaptureLayout
+        self,
+        *,
+        manifests: list[bytes],
+        capture_layout: _CaptureLayout,
+        trainer_snapshot: TrainerSourceSnapshot | None = None,
     ) -> _PreparedNixlTransfer:
         """Prepare destinations for a complete independent staged copy."""
         self._descriptor_cache = None
@@ -934,6 +953,7 @@ class _NixlStagedTransfer:
         resolved, capture, parameter_layout = self._resolve_layout(
             manifests, capture_layout, metrics
         )
+        capture, parameter_layout = deepcopy((capture, parameter_layout))
         started = time.perf_counter()
         self._bounded_plan_cache.clear()
         plan = _plan_staged_transfer(capture, resolved.sources)
@@ -957,6 +977,8 @@ class _NixlStagedTransfer:
             },
             descriptors=tuple(self._descriptors(plan)),
             transport=transport,
+            trainer_source_snapshot=trainer_snapshot,
+            parameter_layout=MappingProxyType(parameter_layout),
         )
         self._active = prepared
         return prepared
@@ -969,6 +991,7 @@ class _NixlStagedTransfer:
         max_staging_bytes: int,
         staging_device: str = "cuda",
         staging_buffers: int = 1,
+        trainer_snapshot: TrainerSourceSnapshot | None = None,
     ) -> _PreparedBoundedTransfer:
         """Reserve bounded receive storage and return deferred batch reads."""
         previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
@@ -992,6 +1015,7 @@ class _NixlStagedTransfer:
             staging_buffers=staging_buffers,
             total_staging_bytes=max_staging_bytes,
             source_snapshot=self._source_cache._snapshot,
+            trainer_snapshot=trainer_snapshot,
         )
         metrics["transfer_planning_s"] = time.perf_counter() - started
         started = time.perf_counter()

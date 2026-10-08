@@ -17,7 +17,7 @@ from modelexpress import p2p_pb2
 from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
 from ..train import WeightPayloadFormat
-from .adapter import GeneratorTransferInputs
+from .adapter import TrainerSourceShard
 
 if TYPE_CHECKING:
     from .receiver import PreparedCheckpoint
@@ -77,15 +77,28 @@ class GeneratorPeerUpdateSource:
 
 
 @dataclass(frozen=True)
-class TrainerUpdateSource:
-    """Trainer manifests for one complete full-tensor update."""
+class TrainerSourceSnapshot:
+    """Selected trainer shards and the mesh identity they belong to."""
 
-    inputs: GeneratorTransferInputs
+    mesh_id: str | None
+    mesh_generation: int | None
+    shards: tuple[TrainerSourceShard, ...]
     kind = WeightSource.TRAINER
+    payload_format = WeightPayloadFormat.FULL_TENSOR
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shards", tuple(self.shards))
 
     @property
-    def payload_format(self) -> WeightPayloadFormat:
-        return self.inputs.payload_format
+    def physical_fingerprint(self) -> tuple:
+        return (
+            self.mesh_id,
+            self.mesh_generation,
+            tuple(
+                (shard.source_slot_id, shard.worker_id, shard.physical_fingerprint)
+                for shard in self.shards
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -98,7 +111,7 @@ class ObjectStorageUpdateSource:
 
 
 ResolvedSource = (
-    GeneratorPeerUpdateSource | TrainerUpdateSource | ObjectStorageUpdateSource
+    GeneratorPeerUpdateSource | TrainerSourceSnapshot | ObjectStorageUpdateSource
 )
 
 
@@ -410,7 +423,7 @@ __all__ = [
     "PreparedRuntimeTensors",
     "ResolvedSource",
     "StagedEngineTensors",
-    "TrainerUpdateSource",
+    "TrainerSourceSnapshot",
     "UpdateMethod",
     "WeightSource",
     "SourceResolver",

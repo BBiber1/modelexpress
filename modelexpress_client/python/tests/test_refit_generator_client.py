@@ -28,7 +28,7 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.inference.adapter import GeneratorTransferInputs
+from tests._transfer_inputs import GeneratorTransferInputs
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
@@ -36,10 +36,11 @@ from modelexpress_rl.inference.plan import (
     GeneratorPeerUpdateSource,
     MethodCapabilities,
     ObjectStorageUpdateSource,
+    PreparedArtifact,
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
-    TrainerUpdateSource,
+    TrainerSourceSnapshot,
     UpdateMethod,
     WeightUpdatePlanner,
 )
@@ -309,7 +310,7 @@ class _TestMethod(UpdateMethod):
             artifact_type=PreparedEngineTensors,
         )
 
-    def prepare(self, *, version, source: ResolvedSource):
+    def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         if isinstance(source, GeneratorPeerUpdateSource):
             staged = self._adapter.stage_peer_weight(source.worker)
         else:
@@ -322,8 +323,8 @@ class _TestMethod(UpdateMethod):
                     sources=(),
                     object_storage=source.storage,
                 )
-            elif isinstance(source, TrainerUpdateSource):
-                inputs = source.inputs
+            elif isinstance(source, TrainerSourceSnapshot):
+                inputs = GeneratorTransferInputs.from_trainer(version, source)
             else:
                 raise TypeError("unsupported test source")
             reusable = (
@@ -1019,7 +1020,7 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert adapter.stage_calls == []
 
 
-def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):
+def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch) -> None:
     manifest = b"x" * (4 * 1024 * 1024 + 1)
     server, endpoint, service = _start_server(manifest=manifest)
     adapter = _Adapter(service)
@@ -1037,10 +1038,7 @@ def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch
         generator.close()
         server.stop(grace=None).wait()
 
-    assert all(
-        source.transport.manifest == manifest
-        for source in adapter.stage_calls[0].sources
-    )
+    assert all(source.manifest == manifest for source in adapter.stage_calls[0].sources)
 
 
 def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, caplog):

@@ -7,16 +7,17 @@ import pytest
 import torch
 from modelexpress_rl.inference import runtime
 from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
+    TrainerSourceShard,
+)
+from modelexpress_rl.inference.plan import (
+    PreparedStreamingTensors,
+    TrainerSourceSnapshot,
 )
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
-from modelexpress_rl.inference.plan import PreparedStreamingTensors, TrainerUpdateSource
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def setup_method(monkeypatch) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerUpdateSource, list, torch.Tensor]:
+def setup_method(monkeypatch) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerSourceSnapshot, list, torch.Tensor]:
     events = []
     arena = torch.ones(2, 2)
 
@@ -54,21 +55,19 @@ def setup_method(monkeypatch) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerUp
         capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=None),
         worker_id="receiver",
     )
-    source = TrainerUpdateSource(
-        GeneratorTransferInputs(
-            version_id="v:1",
-            base_version_id=None,
-            layout_signature="",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            sources=(
-                GeneratorSource(
-                    "slot",
-                    "trainer",
-                    "digest",
-                    NixlGeneratorSource("trainer:19000", b"manifest", "structure"),
-                ),
+    source = TrainerSourceSnapshot(
+        mesh_id=None,
+        mesh_generation=None,
+        shards=(
+            TrainerSourceShard(
+                source_slot_id="slot",
+                worker_id="trainer",
+                manifest_digest="digest",
+                manifest_endpoint="trainer:19000",
+                manifest=b"manifest",
+                structural_digest="structure",
             ),
-        )
+        ),
     )
     return method, source, events, arena
 
