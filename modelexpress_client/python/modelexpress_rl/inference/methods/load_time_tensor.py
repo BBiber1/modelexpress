@@ -15,6 +15,8 @@ from modelexpress.refit.timing import (
     set_refit_cold,
 )
 
+from modelexpress_rl.inference._cache_config import RefitCacheConfig
+
 from ...train import WeightPayloadFormat
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
@@ -45,6 +47,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._capture_layout = capture_layout
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
+
+    @property
+    def cache_config(self) -> RefitCacheConfig:
+        return self._transfer.cache_config
 
     def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
         return self._transfer.cached_trainer_source()

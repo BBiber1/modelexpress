@@ -1772,7 +1772,12 @@ trainer mesh ID and generation match the cached trainer snapshot. Warm source
 resolution performs one mesh lookup and skips shard listing and manifest fetches.
 Warm preparation skips source parsing, structural keys, capture, coverage checks
 and required-agent traversal. A different mesh identity or replacement candidate
-creates and validates a new plan. Disabling either cache forces full preparation.
+creates and validates a new plan. Trainer metadata and compiled plans have one
+mesh-bound lifetime. Generator capture has a separate lifetime: cold preparation
+compares source names, dtypes and global shapes, and retains the owned capture
+when that logical schema is compatible. Disabling plan reuse refreshes trainer
+metadata and recompiles while allowing generator capture reuse. Disabling layout
+reuse captures and recompiles while allowing trainer metadata reuse.
 
 `MX_REFIT_DEBUG_VALIDATE_PLAN` fetches current manifests and checks source geometry
 and plan coverage; `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` recaptures and checks
@@ -1782,6 +1787,10 @@ source digests, so it verifies the current weight version.
 
 Workspace mode changes invalidate the containing plan before source resolution.
 Connections, receive buffers, arenas and cached descriptors remain transfer-owned.
+Mesh changes retain compatible registered storage. Cold preparation disconnects
+changed or obsolete owned remote agents and retains exact unchanged metadata;
+failed removal resets the owned manager and rebinds storage and sources. Borrowed
+peer managers are never reset or disconnected by load-time preparation.
 A replacement plan is retained only after connection, allocation, registration and
 descriptor setup succeeds and a final mesh lookup confirms the original identity;
 preparation failure leaves no reusable entry. Each
@@ -1797,8 +1806,8 @@ same artifact interfaces consumed by application.
 
 A compiled plan stores the immutable union of required source agents. Warm
 preparation reuses its established transport without traversing the whole plan
-and every batch again. Connected agents with changed metadata remain rejected
-on validated preparation. The plan owns no transport resources.
+and every batch again. Connected agents with changed metadata are replaced
+on validated preparation after the previous update has quiesced. The plan owns no transport resources.
 
 Trainer source resolution records one timing span per candidate-selection
 attempt. Each cold shard updates aggregate fetch and byte counters; mesh warm hits
@@ -1819,8 +1828,11 @@ the wire timer on both cold and warm updates.
 
 The trainer snapshot owns immutable copies of parsed source rows, session and
 agent metadata maps. It contains host metadata and owns no tensors, transport
-handles or source leases. The generator snapshot privately owns captured
-operation arguments while preserving Python container semantics for replay.
+handles or source leases. The transfer owns one generator capture and complete destination layout, shared
+by plans and retained across compatible mesh or workspace changes. Its captured
+operation arguments preserve Python container semantics for replay. Engine
+capture callbacks always perform a fresh capture; there is no hidden vLLM capture
+cache that can mask diagnostic drift.
 Snapshot construction is charged to source preparation on a cache miss.
 
 The prepared streaming artifact owns its iterator and remains protected by the

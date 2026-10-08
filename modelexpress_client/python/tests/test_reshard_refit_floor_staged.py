@@ -18,16 +18,16 @@ import json
 import logging
 from contextlib import nullcontext
 
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
-
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.inference._cache_config import RefitCacheConfig
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
@@ -118,7 +118,7 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
     )
 
 
-def _stage(monkeypatch, *, nbytes: int, wire_s: float):
+def _stage(monkeypatch, *, nbytes: int, wire_s: float) -> transfer_module._StagedNixlWeights:
     """Run stage() to completion on CPU with a scripted wire duration."""
     monkeypatch.setattr(
         transfer_module,
@@ -131,6 +131,7 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     prepared = _prepared(tensor, nbytes)
 
     transfer = object.__new__(_NixlStagedTransfer)
+    transfer.cache_config = RefitCacheConfig()
     transfer._closed = False
     transfer._device = torch.device("cpu")
     transfer._device_id = DEVICE_ID
@@ -141,7 +142,7 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     return transfer.stage(prepared)
 
 
-def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
+def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float) -> dict[str, object]:
     """Run receive_peer() with the manager reporting a scripted transfer."""
 
     class _Manager:
@@ -186,6 +187,7 @@ def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
         lambda *_args, **_kwargs: (_Lease(), 0),
     )
     transfer = object.__new__(_NixlStagedTransfer)
+    transfer.cache_config = RefitCacheConfig()
     transfer._closed = False
     transfer._workspace_mode = "full"
     transfer._device = torch.device("cpu")

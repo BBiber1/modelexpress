@@ -259,6 +259,14 @@ def _create_resolvers(
                 TrainerSourceResolver(
                     service=service,
                     rpc_timeout_seconds=rpc_timeout_seconds,
+                    cache_config=next(
+                        (
+                            method.cache_config
+                            for method in methods
+                            if isinstance(method, LoadTimeTensorNixlUpdateMethod)
+                        ),
+                        None,
+                    ),
                     cached_source=next(
                         (
                             getattr(method, "cached_trainer_source", None)

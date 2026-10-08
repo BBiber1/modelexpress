@@ -22,8 +22,9 @@ def prepare_warm(state) -> _PreparedBoundedTransfer:
 def test_default_warm_refits_reuse_layout_and_read_new_weight_values(
     harness, monkeypatch
 ) -> None:
-    monkeypatch.delenv("MX_REFIT_CACHE_RESOLVED_SOURCES")
-    monkeypatch.delenv("MX_REFIT_CACHE_BOUNDED_PLANS")
+    monkeypatch.delenv("MX_REFIT_CACHE_GENERATOR_LAYOUT")
+    monkeypatch.delenv("MX_REFIT_CACHE_PLAN")
+    harness.new_transfer()
     first = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
     _check_values(harness, harness.collect(first)[1])
     # A normal refit uses the captured generator layout until the mesh changes.
@@ -58,12 +59,13 @@ def test_mesh_identity_changes_rebuild_then_reuse(harness, mesh_id, generation) 
 def test_debug_validation_accepts_changed_values_with_stable_structure(
     harness, monkeypatch, plan_debug, layout_debug
 ) -> None:
-    first = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
-    harness.collect(first)
     monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", str(int(plan_debug)))
     monkeypatch.setenv(
         "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", str(int(layout_debug))
     )
+    harness.new_transfer()
+    first = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
+    harness.collect(first)
     for tensor in harness.sources.values():
         tensor.add_(3)
     prepared = harness.prepare(
@@ -74,18 +76,22 @@ def test_debug_validation_accepts_changed_values_with_stable_structure(
 
 
 def test_debug_layout_drift_fails_before_transfer(harness, monkeypatch) -> None:
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
+    harness.new_transfer()
     first = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
     harness.collect(first)
-    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
     harness.capture.copies[0].dest_offset += 1
     with pytest.raises(ValueError, match="generator layout changed"):
         harness.prepare(trainer_snapshot=harness.transfer.cached_trainer_source())
 
 
-def test_debug_source_drift_fails_and_next_attempt_rebuilds(harness, monkeypatch) -> None:
+def test_debug_source_drift_fails_and_next_attempt_rebuilds(
+    harness, monkeypatch
+) -> None:
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", "1")
+    harness.new_transfer()
     first = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
     harness.collect(first)
-    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", "1")
     harness.sources["exact"] = harness.sources["exact"].clone().add_(5)
     with pytest.raises(ValueError, match="source metadata changed"):
         harness.prepare(trainer_snapshot=harness.transfer.cached_trainer_source())
@@ -95,14 +101,15 @@ def test_debug_source_drift_fails_and_next_attempt_rebuilds(harness, monkeypatch
 
 
 @pytest.mark.parametrize(
-    "flag", ["MX_REFIT_CACHE_RESOLVED_SOURCES", "MX_REFIT_CACHE_BOUNDED_PLANS"]
+    "flag", ["MX_REFIT_CACHE_GENERATOR_LAYOUT", "MX_REFIT_CACHE_PLAN"]
 )
 def test_explicit_cache_disable_requires_validated_preparation(
     harness, monkeypatch, flag
 ) -> None:
+    monkeypatch.setenv(flag, "0")
+    harness.new_transfer()
     first = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
     harness.collect(first)
-    monkeypatch.setenv(flag, "0")
     prepared = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
     assert prepared.metrics["plan_cache_hits"] == 0
     _check_values(harness, harness.collect(prepared)[1])
@@ -141,6 +148,7 @@ def test_debug_layout_compares_tensor_index_arguments_before_transfer(
 ) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
+    harness.new_transfer()
     indices = torch.tensor([0, 2])
     copy = harness.capture.copies[1]
     copy.op_chain = (("__getitem__", (indices,), ()),)
@@ -151,7 +159,9 @@ def test_debug_layout_compares_tensor_index_arguments_before_transfer(
     expected = torch.zeros(20, dtype=torch.float32)
     expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
     assert torch.equal(installed["b.weight"], expected)
-    _, installed = harness.collect(harness.prepare(trainer_snapshot=harness.transfer.cached_trainer_source()))
+    _, installed = harness.collect(
+        harness.prepare(trainer_snapshot=harness.transfer.cached_trainer_source())
+    )
     assert torch.equal(installed["b.weight"], expected)
     posts = harness.events.count("post")
     indices[0] = 1
@@ -180,3 +190,173 @@ def test_manifest_parser_rows_are_owned_before_transfer(harness, monkeypatch) ->
             shard.shape = (1,)
     _check_values(harness, harness.collect(prepared)[1])
     _check_values(harness, harness.collect(prepare_warm(harness))[1])
+
+
+@pytest.mark.parametrize("plan_cache", [False, True])
+@pytest.mark.parametrize("layout_cache", [False, True])
+def test_plan_and_layout_controls_have_independent_lifetimes(
+    harness, monkeypatch, plan_cache, layout_cache
+) -> None:
+    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+
+    monkeypatch.setenv("MX_REFIT_CACHE_PLAN", str(int(plan_cache)))
+    monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", str(int(layout_cache)))
+    harness.new_transfer()
+    builds = []
+    compile_plan = transfer_module._plan_staged_transfer
+
+    def observe(*args, **kwargs) -> transfer_module.TransferPlan:
+        builds.append(1)
+        return compile_plan(*args, **kwargs)
+
+    monkeypatch.setattr(transfer_module, "_plan_staged_transfer", observe)
+    first = harness.prepare()
+    _check_values(harness, harness.collect(first)[1])
+    first_builds = len(builds)
+    for tensor in harness.sources.values():
+        tensor.add_(3)
+    second = harness.prepare()
+    _check_values(harness, harness.collect(second)[1])
+    assert len(harness.captures) == (1 if layout_cache else 2)
+    assert len(builds) == (
+        first_builds if plan_cache and layout_cache else 2 * first_builds
+    )
+    assert len(harness.allocations) == 1
+
+
+def test_mesh_address_change_preserves_capture_and_registered_arena(harness) -> None:
+    first = harness.prepare()
+    _check_values(harness, harness.collect(first)[1])
+    harness.sources["exact"] = harness.sources["exact"].clone().add_(7)
+    second = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 2, ()))
+    _check_values(harness, harness.collect(second)[1])
+    assert len(harness.captures) == 1
+    assert len(harness.allocations) == 1
+    assert second.metrics["plan_cache_misses"] == 1
+
+
+@pytest.mark.parametrize("remove_ok", [False, True])
+def test_mesh_agent_replacement_rebinds_after_safe_removal(harness, remove_ok) -> None:
+    first = harness.prepare()
+    _check_values(harness, harness.collect(first)[1])
+    harness.remote.update(name="replacement", remove_ok=remove_ok)
+    for tensor in harness.sources.values():
+        tensor.add_(4)
+    replacement = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 2, ()))
+    _check_values(harness, harness.collect(replacement)[1])
+    assert harness.events.count("remove:source") == 1
+    assert len(harness.allocations) == (1 if remove_ok else 2)
+    assert len(harness.captures) == 1
+    _check_values(harness, harness.collect(prepare_warm(harness))[1])
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_changed_source_schema_recaptures_and_rebinds_larger_storage(
+    harness, monkeypatch, bounded
+) -> None:
+    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+    from contextlib import nullcontext
+
+    original_empty = torch.empty
+
+    def empty(shape, **kwargs) -> torch.Tensor:
+        kwargs.pop("device", None)
+        return original_empty(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+
+    def prepare(
+        generation,
+    ) -> (
+        transfer_module._PreparedBoundedTransfer | transfer_module._PreparedNixlTransfer
+    ):
+        if bounded:
+            return harness.prepare(
+                trainer_snapshot=TrainerSourceSnapshot("mesh", generation, ())
+            )
+        return harness.transfer.prepare_full_copy(
+            manifests=harness.manifests(),
+            trainer_snapshot=TrainerSourceSnapshot("mesh", generation, ()),
+            capture_layout=harness.capture_layout,
+        )
+
+    def install(prepared) -> dict[str, torch.Tensor]:
+        if bounded:
+            return harness.collect(prepared)[1]
+        return harness.transfer.stage(prepared).tensors
+
+    initial = install(prepare(1))
+    if bounded:
+        _check_values(harness, initial)
+    else:
+        assert torch.equal(
+            initial["a.weight"][2:18], harness.sources["exact"].reshape(-1)
+        )
+    harness.sources["exact"] = torch.arange(128, dtype=torch.float32).reshape(32, 4)
+    for copy in (harness.capture.copies[0], harness.capture.copies[3]):
+        copy.dest_shape = (32, 4)
+        copy.dest_stride = (4, 1)
+        harness.layout[copy.param_name] = ((132,), torch.float32)
+    values = install(prepare(2))
+    expected = torch.zeros(132)
+    expected[2:130].copy_(harness.sources["exact"].reshape(-1))
+    for name in ("a.weight", "d.weight"):
+        assert torch.equal(values[name][2:130], expected[2:130])
+        if bounded:
+            assert torch.equal(values[name], expected)
+    assert len(harness.captures) == 2
+    if bounded:
+        assert len(harness.allocations) == 2
+
+
+@pytest.mark.parametrize(
+    "buffers,failed_call", [(1, 1), (2, 1), (2, 2), (0, 1), (0, 2), (0, 3)]
+)
+def test_registration_failure_retries_with_fully_bound_workspace(
+    harness, monkeypatch, buffers, failed_call
+) -> None:
+    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+    from contextlib import nullcontext
+
+    original_empty = torch.empty
+
+    def empty(shape, **kwargs) -> torch.Tensor:
+        kwargs.pop("device", None)
+        return original_empty(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    harness.remote["fail_registration"] = failed_call
+
+    def prepare() -> (
+        transfer_module._PreparedBoundedTransfer | transfer_module._PreparedNixlTransfer
+    ):
+        if buffers:
+            return harness.prepare(staging_buffers=buffers)
+        return harness.transfer.prepare_full_copy(
+            manifests=harness.manifests(),
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+            capture_layout=harness.capture_layout,
+        )
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        prepare()
+    assert "post" not in harness.events
+    harness.remote["fail_registration"] = None
+    prepared = prepare()
+    if buffers:
+        _check_values(harness, harness.collect(prepared)[1])
+    else:
+        tensors = harness.transfer.stage(prepared).tensors
+        for source, name, transpose in (
+            ("exact", "a.weight", False),
+            ("full", "b.weight", True),
+            ("convert", "c.weight", False),
+            ("exact", "d.weight", False),
+        ):
+            value = harness.sources[source]
+            expected = (
+                (value.T if transpose else value).reshape(-1).to(tensors[name].dtype)
+            )
+            assert torch.equal(tensors[name][2:18], expected)

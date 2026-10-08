@@ -1532,19 +1532,24 @@ it does not establish a stable configuration API.
 
 | Internal environment variable | Default | Qualification purpose |
 | --- | --- | --- |
-| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `1` | Cache trainer source metadata with the pull plan; disable to fetch and validate manifests for each preparation. |
-| `MX_REFIT_CACHE_BOUNDED_PLANS` | `1` | Cache physical pull plans and generator layouts for full-copy and bounded transfers; disable to rebuild each preparation. |
+| `MX_REFIT_CACHE_PLAN` | `1` | Retain trainer metadata and compiled pull plans for the current mesh. Disable to fetch trainer manifests and compile each preparation. |
+| `MX_REFIT_CACHE_GENERATOR_LAYOUT` | `1` | Retain the owned generator capture across compatible trainer meshes. Disable to capture and compile each preparation while trainer metadata may remain cached. |
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Fetch current manifests and validate cached source geometry and plan coverage on warm refits. Structural drift under unchanged mesh identity fails preparation. |
 | `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Recapture generator load mappings and parameter layout on warm refits; fail preparation on drift. |
-| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
+| `MX_REFIT_PACK_MODULES` | `1` | Pack consecutive owning modules into batches within the staging budget; this controls the batching algorithm, not cache retention. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; it is fixed for the client lifetime. |
 
-Staging capacity, arena configuration and planning controls are fixed for the
-client lifetime; create a new client to change them.
+Cache and diagnostic settings are read once when the transfer is created and shared
+with its trainer source resolver. Staging capacity, arena configuration and
+planning controls are fixed for the client lifetime; create a new client to
+change them. The old resolved-source, bounded-plan and complete-plan switches
+are removed without aliases.
 
 Default warm preparation verifies only trainer mesh ID and generation against the
-cached trainer snapshot. An identity change rebuilds and validates the entire
-plan. The debug flags independently restore source/plan and generator-layout
+cached trainer snapshot. An identity change refreshes trainer metadata and rebuilds the physical
+plan. Compatible generator captures, registered local storage and unchanged
+remote connections survive the change. A changed logical source schema requires
+a fresh capture. Structural changes to the generator require client reinitialization. The debug flags independently restore source/plan and generator-layout
 checks. Digest verification fetches current manifests even with caches enabled,
 so changing weight values are checked against the current version.
 

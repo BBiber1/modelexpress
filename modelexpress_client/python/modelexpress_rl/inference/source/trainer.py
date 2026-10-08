@@ -16,6 +16,7 @@ from modelexpress.refit.timing import refit_span
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
 from ...train import WeightPayloadFormat
+from .._cache_config import RefitCacheConfig
 from ..adapter import TrainerSourceShard
 from ..plan import ResolvedSource, SourceResolver, TrainerSourceSnapshot, WeightSource
 
@@ -86,7 +87,9 @@ class TrainerSourceResolver(SourceResolver):
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
         cached_source: Callable[[], TrainerSourceSnapshot | None] | None = None,
+        cache_config: RefitCacheConfig | None = None,
     ) -> None:
+        self._cache_config = cache_config or RefitCacheConfig()
         self._service = service
         self._rpc_timeout_seconds = rpc_timeout_seconds
         self._cached_source = cached_source
@@ -134,13 +137,10 @@ class TrainerSourceResolver(SourceResolver):
             cached.mesh_id,
             cached.mesh_generation,
         )
-        diagnostic = envs.MX_REFIT_DEBUG_VALIDATE_PLAN or envs.MX_RESHARD_PUBLISH_DIGEST
-        if (
-            same_mesh
-            and envs.MX_REFIT_CACHE_RESOLVED_SOURCES
-            and envs.MX_REFIT_CACHE_BOUNDED_PLANS
-            and not diagnostic
-        ):
+        diagnostic = (
+            self._cache_config.validate_plan or self._cache_config.publish_digest
+        )
+        if same_mesh and self._cache_config.cache_plan and not diagnostic:
             yield cached
             # A resumed candidate means preparation failed: discover fresh replicas.
         expected_slots = tuple(

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
@@ -12,6 +13,7 @@ from modelexpress.engines.vllm.host_quantization import (
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress_rl.inference._cache_config import RefitCacheConfig
 from modelexpress_rl.inference.engines.vllm.installer import (
     _copy_received,
     _standard_module_access,
@@ -1862,82 +1864,19 @@ def test_alias_mutation_fails_before_a_later_hook_can_hide_it(
     assert hooks == ["mutate"]
 
 
-def test_capture_key_unwraps_reload_loaders_but_guards_original_and_receiver(
-    monkeypatch,
-):
-    _install_fake_vllm(monkeypatch, lambda model: None)
-    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
-
-    def default_loader(parameter, value):
-        parameter.copy_(value)
-
-    def original_loader(parameter):
-        loader = getattr(parameter, "weight_loader", default_loader)
-        while loader.__name__ == "online_process_loader":
-            loader = loader.__wrapped__
-        return loader
-
-    layerwise._get_original_loader = original_loader
-    model = nn.Linear(2, 2, bias=False)
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
-    manifest = [("weight", torch.float32, (2, 2))]
-    assert not hasattr(model.weight, "weight_loader")
-    key = installer._capture_key(manifest)
-    model.weight.weight_loader = default_loader
-    assert installer._capture_key(manifest) == key
-    underlying = model.weight.weight_loader
-
-    def wrapped(loader):
-        def online_process_loader(*args, **kwargs):
-            return loader(*args, **kwargs)
-
-        online_process_loader.__wrapped__ = loader
-        return online_process_loader
-
-    for _ in range(2):
-        model.weight.weight_loader = wrapped(wrapped(underlying))
-        assert installer._capture_key(manifest) == key
-    model.weight.weight_loader = wrapped(lambda parameter, value: parameter.add_(value))
-    assert installer._capture_key(manifest) != key
-
-    def ordinary_wrapper(*args, **kwargs):
-        return underlying(*args, **kwargs)
-
-    ordinary_wrapper.__wrapped__ = underlying
-    model.weight.weight_loader = ordinary_wrapper
-    assert installer._capture_key(manifest) != key
-
-    class Loader:
-        def load(self, parameter, value):
-            parameter.copy_(value)
-
-    first, second = Loader(), Loader()
-    model.weight.weight_loader = first.load
-    key = installer._capture_key(manifest)
-    model.weight.weight_loader = wrapped(first.load)
-    assert installer._capture_key(manifest) == key
-    model.weight.weight_loader = second.load
-    assert installer._capture_key(manifest) != key
-
-    resolved_key = installer._capture_key(manifest)
-    del layerwise._get_original_loader
-    assert installer._capture_key(manifest) == resolved_key
-
-
 @pytest.mark.parametrize("missing", ["module", "symbol"])
-def test_capture_key_reports_missing_layerwise_api_before_mutation(
+def test_capture_reports_missing_layerwise_api_before_mutation(
     monkeypatch, missing
-):
+) -> None:
     _install_fake_vllm(monkeypatch, lambda model: None)
     if missing == "module":
         monkeypatch.setitem(
             sys.modules, "vllm.model_executor.model_loader.reload.layerwise", None
         )
+    if missing == "symbol":
+        del sys.modules[
+            "vllm.model_executor.model_loader.reload.layerwise"
+        ].initialize_layerwise_reload
     model = nn.Linear(2, 2, bias=False)
     parameter = model.weight
     before = parameter.detach().clone()
@@ -1951,16 +1890,16 @@ def test_capture_key_reports_missing_layerwise_api_before_mutation(
     with pytest.raises(
         RuntimeError, match="requires vLLM's layerwise reload APIs"
     ) as raised:
-        installer._capture_key([("weight", torch.float32, (2, 2))])
+        installer.capture([("weight", torch.float32, (2, 2))])
 
     assert isinstance(raised.value.__cause__, ImportError)
     assert model.weight is parameter
     assert torch.equal(model.weight, before)
 
 
-def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypatch):
+def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch) -> None:
     class Model(nn.Module):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
             self.embedding = nn.Linear(2, 2, bias=False)
             self.lm_head = nn.Linear(2, 2, bias=False)
@@ -1968,7 +1907,7 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
             self.register_buffer("routing", torch.tensor([0, 1]))
             self.capture_calls = 0
 
-        def load_weights(self, weights):
+        def load_weights(self, weights) -> None:
             self.capture_calls += 1
             for name, weight in weights:
                 if name == "embedding.weight":
@@ -2031,24 +1970,25 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
     assert model.embedding.weight is model.lm_head.weight
     assert torch.equal(model.embedding.weight, original)
     manifest = [("embedding.weight", torch.float32, (2, 2))]
-    cached, _ = installer.capture(manifest)
-    assert model.capture_calls == 1
-    cached.copies.clear()
+    captured, _ = installer.capture(manifest)
+    assert model.capture_calls == 2
+    captured.copies.clear()
     assert installer.capture(manifest)[0].copies
+    assert model.capture_calls == 3
     model.routing.add_(1)
     installer.capture(manifest)
-    assert model.capture_calls == 2
+    assert model.capture_calls == 4
     with torch.inference_mode():
         model.routing = torch.tensor([3, 4])
         installer.capture(manifest)
-        assert model.capture_calls == 3
+        assert model.capture_calls == 5
         model.routing.add_(1)
         installer.capture(manifest)
-        assert model.capture_calls == 4
+        assert model.capture_calls == 6
 
-    for value in (7.0, 11.0, -3.0):
+    for index, value in enumerate((7.0, 11.0, -3.0)):
 
-        def batches(value=value):
+        def batches(value=value) -> Iterator[dict[str, torch.Tensor]]:
             yield {"embedding.weight": torch.full((2, 2), value)}
 
         prepared = PreparedStreamingTensors(batches, frozenset(layout), {})
@@ -2059,7 +1999,7 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
         assert "retention_batch_scans" not in prepared.transfer_metrics
         assert "retention_final_scans" not in prepared.transfer_metrics
         installer.capture(manifest)
-        assert model.capture_calls == 4
+        assert model.capture_calls == 7 + index
 
 
 class _Parent(nn.Module):
@@ -2148,7 +2088,7 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(
 
 def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     monkeypatch,
-):
+) -> None:
     """install_streaming abandons the transfer with close(), not throw().
 
     The generator therefore sees GeneratorExit even while an install error is
@@ -2206,6 +2146,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         planned, {"w": source}, Transport()
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
+    transfer.cache_config = RefitCacheConfig()
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False

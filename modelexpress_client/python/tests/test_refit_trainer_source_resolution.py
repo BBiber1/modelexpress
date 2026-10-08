@@ -136,7 +136,7 @@ def test_warm_resolution_without_timing(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     "change",
-    [None, "mesh_id", "generation", "debug", "digest", "sources_off", "plans_off"],
+    [None, "mesh_id", "generation", "debug", "digest", "layout_off", "plans_off"],
 )
 def test_mesh_cache_controls_publication_and_manifest_rpc_work(
     monkeypatch, change
@@ -159,6 +159,14 @@ def test_mesh_cache_controls_publication_and_manifest_rpc_work(
         return list_rpc(request, **kwargs)
 
     service.GetTrainerMesh, service.ListWeightVersionShards = get_mesh, list_shards
+    settings = {
+        "debug": ("MX_REFIT_DEBUG_VALIDATE_PLAN", "1"),
+        "digest": ("MX_RESHARD_PUBLISH_DIGEST", "1"),
+        "layout_off": ("MX_REFIT_CACHE_GENERATOR_LAYOUT", "0"),
+        "plans_off": ("MX_REFIT_CACHE_PLAN", "0"),
+    }
+    if change in settings:
+        monkeypatch.setenv(*settings[change])
     cached = [None]
     resolver = trainer.TrainerSourceResolver(
         service=lambda: service, rpc_timeout_seconds=1, cached_source=lambda: cached[0]
@@ -171,18 +179,10 @@ def test_mesh_cache_controls_publication_and_manifest_rpc_work(
         current["mesh_id"] = version.trainer_mesh_id = "other"
     elif change == "generation":
         current["generation"] = version.trainer_mesh_generation = 2
-    elif change == "debug":
-        monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", "1")
-    elif change == "digest":
-        monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
-    elif change == "sources_off":
-        monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "0")
-    elif change == "plans_off":
-        monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
     next(resolver.candidates(version))
-    assert counts["list"] == (1 if change is None else 2)
-    assert counts["mesh"] == (3 if change is None else 4)
-    assert len(fetched) == (2 if change is None else 4)
+    assert counts["list"] == (1 if change in (None, "layout_off") else 2)
+    assert counts["mesh"] == (3 if change in (None, "layout_off") else 4)
+    assert len(fetched) == (2 if change in (None, "layout_off") else 4)
 
 
 def test_resumed_warm_candidate_discovers_fresh_replicas(monkeypatch) -> None:

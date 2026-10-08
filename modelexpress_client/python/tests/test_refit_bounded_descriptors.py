@@ -33,8 +33,8 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
-    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "1")
-    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "1")
+    monkeypatch.setenv("MX_REFIT_CACHE_PLAN", "1")
+    monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", "1")
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -56,33 +56,50 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
     layout = {copy.param_name: ((20,), copy.dest_dtype) for copy in copies}
     transports = []
     events = []
+    remote = {"name": "source", "remove_ok": True, "fail_registration": None}
 
     class Manager:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.registered = {}
+            self.epoch = 0
+            self.registration_calls = 0
 
         def initialize(self):
             pass
 
-        def shutdown(self):
+        def shutdown(self) -> None:
+            self.epoch += 1
             self.registered.clear()
 
         def add_remote_agent(self, metadata):
             return metadata.decode()
 
-        def register_tensors(self, tensors):
-            self.registered.update(tensors)
+        def remove_remote_agent(self, agent) -> bool:
+            events.append("remove:" + agent)
+            return remote["remove_ok"]
 
-        def register_dram_buffer(self, tensor):
+        def register_tensors(self, tensors) -> None:
+            self.registered.update(tensors)
+            self.registration_calls += 1
+            if self.registration_calls == remote["fail_registration"]:
+                raise RuntimeError("registration failed")
+
+        def register_dram_buffer(self, tensor) -> object:
             handle = object()
             self.registered[handle] = tensor
+            self.registration_calls += 1
+            if self.registration_calls == remote["fail_registration"]:
+                raise RuntimeError("registration failed")
             return handle
 
         def deregister_memory(self, handle):
             del self.registered[handle]
 
     class Transport:
-        def __init__(self, manager, agents, devices, **kwargs):
+        def __init__(self, manager, agents, devices, **kwargs) -> None:
+            self.epoch = manager.epoch
+            self.manager = manager
+            self.agent_sessions = agents
             self.posts = []
             self.posted = []
             self.awaited = []
@@ -92,12 +109,20 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
             self.mem_type = kwargs["local_mem_type"] or NIXL_ACCELERATOR_MEM_TYPE
             transports.append(self)
 
-        def post_reads(self, descriptors):
+        def post_reads(self, descriptors) -> list[SimpleNamespace]:
+            assert self.epoch == self.manager.epoch
             events.append("post")
             if self.fail_post:
                 raise RuntimeError("post failed")
             self.posts.append(tuple(descriptors))
             for descriptor in descriptors:
+                assert descriptor.session in self.agent_sessions
+                assert any(
+                    tensor.data_ptr() <= descriptor.dst_addr
+                    and descriptor.dst_addr + descriptor.nbytes
+                    <= tensor.data_ptr() + tensor.numel() * tensor.element_size()
+                    for tensor in self.manager.registered.values()
+                )
                 ctypes.memmove(
                     descriptor.dst_addr, descriptor.src_addr, descriptor.nbytes
                 )
@@ -115,37 +140,43 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
 
     monkeypatch.setattr(module, "NixlTransferManager", Manager)
     monkeypatch.setattr(module, "NixlReshardTransport", Transport)
-    monkeypatch.setattr(
-        module._NixlStagedTransfer,
-        "_allocate_arena",
-        lambda self, size: torch.empty(size, dtype=torch.uint8),
-    )
-    transfer = module._NixlStagedTransfer(
-        agent_name="target",
-        device_id=0,
-        device=torch.device("cuda:0"),
-        listen_port=None,
-    )
+    allocations = []
+
+    def allocate(self, size: int) -> torch.Tensor:
+        allocations.append(size)
+        return torch.empty(size, dtype=torch.uint8)
+
+    monkeypatch.setattr(module._NixlStagedTransfer, "_allocate_arena", allocate)
+
+    def create_transfer() -> module._NixlStagedTransfer:
+        return module._NixlStagedTransfer(
+            agent_name="target",
+            device_id=0,
+            device=torch.device("cuda:0"),
+            listen_port=None,
+        )
+
+    transfer = create_transfer()
 
     def manifests() -> list[bytes]:
         return [
             wrap_rendezvous_blob(
-                b"source",
-                "source",
+                remote["name"].encode(),
+                remote["name"],
                 "source:19000",
                 [
                     PublishedTensor(
                         name=name,
                         dtype="torch.float32",
                         elsize=4,
-                        full_shape=(4, 4),
+                        full_shape=tuple(tensor.shape),
                         shards=[
                             PublishedShard(
-                                agent_name="source",
+                                agent_name=remote["name"],
                                 device_id=0,
                                 addr=tensor.data_ptr(),
                                 shard_offset=(0, 0),
-                                shape=(4, 4),
+                                shape=tuple(tensor.shape),
                                 digest=(
                                     tensor_digest(tensor)
                                     if envs.MX_RESHARD_PUBLISH_DIGEST
@@ -181,8 +212,15 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
             installed.update({name: value.clone() for name, value in tensors.items()})
         return metrics, installed
 
+    def new_transfer() -> None:
+        nonlocal transfer
+        transfer.close()
+        transfer = create_transfer()
+        state.transfer = transfer
+
     state = SimpleNamespace(
         transfer=transfer,
+        new_transfer=new_transfer,
         sources=sources,
         capture=capture,
         layout=layout,
@@ -191,6 +229,10 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
         captures=captures,
         transports=transports,
         events=events,
+        allocations=allocations,
+        remote=remote,
+        manifests=manifests,
+        capture_layout=capture_layout,
     )
     yield state
     transfer.close()
@@ -216,6 +258,7 @@ def test_warm_descriptors_still_transfer_new_values(
     harness, monkeypatch, buffers, pack, device
 ) -> None:
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    harness.new_transfer()
     prepare = lambda: harness.prepare(staging_buffers=buffers, staging_device=device)
     first = prepare()
     cold, installed = harness.collect(first)
@@ -248,7 +291,7 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
     elif change == "capture":
         harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
     else:
-        monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
+        monkeypatch.setenv("MX_REFIT_CACHE_PLAN", "0")
     second = harness.prepare(**kwargs)
     metrics, _ = harness.collect(second)
     assert metrics["descriptor_cache_hits"] == 0
@@ -258,13 +301,16 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
 @pytest.mark.parametrize(
     "change", ["replace", "same_address", "reorder", "resize", "registration"]
 )
-def test_arena_change_after_prepare_is_checked_before_each_post(harness, change):
+def test_arena_change_after_prepare_is_checked_before_each_post(
+    harness, change
+) -> None:
     first = harness.prepare(staging_buffers=2)
     harness.collect(first)
     prepared = harness.prepare(staging_buffers=2)
     arenas = harness.transfer._staging_arenas
     if change == "replace":
         arenas[1] = arenas[1].clone()
+        harness.transfer._manager.register_dram_buffer(arenas[1])
     elif change == "same_address":
         arenas[1] = arenas[1].view_as(arenas[1])
     elif change == "reorder":
@@ -283,7 +329,7 @@ def test_arena_change_after_prepare_is_checked_before_each_post(harness, change)
     assert harness.transfer._descriptor_cache is None
 
 
-def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
+def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness) -> None:
     harness.collect(harness.prepare())
     prepared = harness.prepare()
     metrics = {}
@@ -291,6 +337,7 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
     next(iterator)
     assert metrics["descriptor_cache_hits"] == 1
     harness.transfer._staging_arenas[0] = harness.transfer._staging_arenas[0].clone()
+    harness.transfer._manager.register_dram_buffer(harness.transfer._staging_arenas[0])
     for tensors in iterator:
         assert tensors
     assert metrics["descriptor_cache_hits"] == 1
@@ -301,6 +348,9 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
     "failure", ["coverage", "transport", "prepared", "registration"]
 )
 def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure) -> None:
+    if failure == "coverage":
+        monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", "0")
+        harness.new_transfer()
     harness.collect(harness.prepare())
     if failure == "coverage":
         harness.layout["missing.weight"] = ((4,), torch.float32)
@@ -367,8 +417,9 @@ def test_metadata_does_not_own_arenas_or_handles(harness, cleanup):
 
 def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
     harness, monkeypatch
-):
+) -> None:
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", "1")
+    harness.new_transfer()
     original = harness.transfer._descriptors
     builds = []
 
@@ -413,7 +464,8 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
 def test_required_agents_are_resolved_once_per_compiled_plan(
     harness, monkeypatch, enabled
 ) -> None:
-    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", str(int(enabled)))
+    monkeypatch.setenv("MX_REFIT_CACHE_PLAN", str(int(enabled)))
+    harness.new_transfer()
     calls = []
     original = module._required_agent_metadata
 
@@ -469,6 +521,7 @@ def test_prepared_list_indexing_replays_selected_rows_after_caller_mutation(
     harness, monkeypatch, tensor_indices
 ) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    harness.new_transfer()
     indices = torch.tensor([0, 2]) if tensor_indices else [0, 2]
     copy = harness.capture.copies[1]
     copy.op_chain = (("__getitem__", (indices,), ()),)
