@@ -46,6 +46,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
+    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
+        return self._transfer.cached_trainer_source()
+
     @property
     def capabilities(self) -> MethodCapabilities:
         return MethodCapabilities(
@@ -60,12 +63,20 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         if not isinstance(source, TrainerSourceSnapshot):
             raise TypeError("load-time tensor method requires a trainer source")
         fingerprint = (
-            version.base_version_id,
-            version.layout_signature,
-            version.payload_format,
-            source.physical_fingerprint,
+            (
+                version.base_version_id,
+                version.layout_signature,
+                version.payload_format,
+                source.physical_fingerprint,
+            )
+            if source.mesh_id is None
+            else None
         )
-        manifests = [item.manifest for item in source.shards]
+        manifests = (
+            None
+            if source.resolved_metadata is not None
+            else [item.manifest for item in source.shards]
+        )
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare_full_copy(
                 manifests=manifests,
@@ -95,7 +106,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise ValueError("bounded staging requires NIXL trainer sources")
         try:
             prepared = self._transfer.prepare_streaming(
-                manifests=[item.manifest for item in source.shards],
+                manifests=(
+                    None
+                    if source.resolved_metadata is not None
+                    else [item.manifest for item in source.shards]
+                ),
                 trainer_snapshot=source,
                 capture_layout=self._capture_layout,
                 max_staging_bytes=max_staging_bytes,
@@ -145,6 +160,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         if prepared.staged is not self._active_staged:
             raise RuntimeError("load-time staged weight is no longer active")
         self._active_staged = None
+
+    def preparation_failed(self) -> None:
+        self._transfer.reset_workspace()
 
     def validate_close(self) -> None:
         if (

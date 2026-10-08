@@ -254,8 +254,9 @@ def _manifest(
 @pytest.mark.parametrize("switch_failure", [None, "initialize", "register"])
 @pytest.mark.parametrize("warm_cache", [False, True])
 @pytest.mark.parametrize("verify_digest", [False, True])
+@pytest.mark.parametrize("mesh_cache", [False, True])
 def test_released_updates_switch_workspaces_without_reusing_stale_plans(
-    monkeypatch, switch_failure, warm_cache, verify_digest
+    monkeypatch, switch_failure, warm_cache, verify_digest, mesh_cache
 ) -> None:
     """Switch modes with real plans and byte copies, mocking only CUDA/NIXL."""
     events = []
@@ -359,11 +360,26 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                     )
                 ],
             ),
+            PublishedTensor(
+                name="unused",
+                dtype="torch.float32",
+                elsize=4,
+                full_shape=(4,),
+                shards=[
+                    PublishedShard(
+                        agent_name="source",
+                        device_id=0,
+                        addr=source_tensor.data_ptr(),
+                        shard_offset=(0,),
+                        shape=(4,),
+                    )
+                ],
+            ),
         ],
     )
     source = TrainerSourceSnapshot(
-        mesh_id=None,
-        mesh_generation=None,
+        mesh_id="mesh" if mesh_cache else None,
+        mesh_generation=1 if mesh_cache else None,
         shards=(
             TrainerSourceShard(
                 source_slot_id="rank:0",
@@ -423,18 +439,27 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                         ),
                     ),
                 )
+            candidate = (
+                method.cached_trainer_source() or source
+                if mesh_cache and warm_cache and not verify_digest
+                else source
+            )
             if bounded:
                 if index == 2 and switch_failure is not None:
                     setattr(transfer._manager, f"fail_{switch_failure}", 1)
                     with pytest.raises(RuntimeError, match="failed"):
                         method.prepare_streaming(
-                            version=None, source=source, max_staging_bytes=256
+                            version=None, source=candidate, max_staging_bytes=256
                         )
                     assert not transfer._manager.registered
                 prepared = method.prepare_streaming(
-                    version=None, source=source, max_staging_bytes=256
+                    version=None, source=candidate, max_staging_bytes=256
                 )
-                hit = warm_cache and not verify_digest and index in (3, 4, 8, 9)
+                hit = (
+                    warm_cache
+                    and (not verify_digest or mesh_cache)
+                    and index in (3, 4, 8, 9)
+                )
                 assert prepared.metrics["plan_cache_hits"] == int(hit)
                 assert prepared.metrics["owner_plan_builds"] == int(not hit)
                 with pytest.raises(RuntimeError, match="release"):
@@ -444,7 +469,7 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                             layout_signature="layout",
                             payload_format=WeightPayloadFormat.FULL_TENSOR,
                         ),
-                        source=source,
+                        source=candidate,
                     )
                 for tensors in prepared.batches():
                     assert torch.equal(tensors["layer.weight"], source_tensor)
@@ -457,14 +482,14 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                         layout_signature="layout",
                         payload_format=WeightPayloadFormat.FULL_TENSOR,
                     ),
-                    source=source,
+                    source=candidate,
                 )
                 assert torch.equal(
                     prepared.staged.tensors["layer.weight"], source_tensor
                 )
                 with pytest.raises(RuntimeError, match="release"):
                     method.prepare_streaming(
-                        version=None, source=source, max_staging_bytes=256
+                        version=None, source=candidate, max_staging_bytes=256
                     )
                 if first_plan is None:
                     first_plan = transfer._active
@@ -1275,6 +1300,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
 
 def test_prepare_rejects_invalid_staging_options() -> None:
     transfer = object.__new__(_NixlStagedTransfer)
+    transfer._cached_pull_plan = None
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False

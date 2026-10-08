@@ -1532,11 +1532,22 @@ it does not establish a stable configuration API.
 
 | Internal environment variable | Default | Qualification purpose |
 | --- | --- | --- |
-| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
-| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse physical plans when manifests, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
+| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `1` | Cache trainer source metadata with the pull plan; disable to fetch and validate manifests for each preparation. |
+| `MX_REFIT_CACHE_BOUNDED_PLANS` | `1` | Cache physical pull plans and generator layouts for full-copy and bounded transfers; disable to rebuild each preparation. |
+| `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Fetch current manifests and validate cached source geometry and plan coverage on warm refits. Structural drift under unchanged mesh identity fails preparation. |
+| `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Recapture generator load mappings and parameter layout on warm refits; fail preparation on drift. |
 | `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
 | `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
-| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; it is fixed for the client lifetime. |
+
+Staging capacity, arena configuration and planning controls are fixed for the
+client lifetime; create a new client to change them.
+
+Default warm preparation verifies only trainer mesh ID and generation against the
+cached trainer snapshot. An identity change rebuilds and validates the entire
+plan. The debug flags independently restore source/plan and generator-layout
+checks. Digest verification fetches current manifests even with caches enabled,
+so changing weight values are checked against the current version.
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive

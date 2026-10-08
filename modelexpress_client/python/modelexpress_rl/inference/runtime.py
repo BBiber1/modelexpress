@@ -13,6 +13,7 @@ from typing import Any
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 
+from .. import refit_pb2
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
@@ -179,8 +180,22 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    service: Callable | None = None,
+    rpc_timeout_seconds: float = 30.0,
 ) -> LoadTimeTensorNixlUpdateMethod:
+    def verify_mesh(source) -> None:
+        response = service().GetTrainerMesh(
+            refit_pb2.GetTrainerMeshRequest(mesh_id=source.mesh_id),
+            timeout=rpc_timeout_seconds,
+        )
+        if not response.HasField("mesh") or (
+            response.mesh.mesh_id,
+            response.mesh.generation,
+        ) != (source.mesh_id, source.mesh_generation):
+            raise RuntimeError("trainer mesh identity changed during plan preparation")
+
     transfer = _NixlStagedTransfer(
+        verify_trainer_mesh=verify_mesh if service is not None else None,
         agent_name=f"mx-refit-load-time-{worker_id}",
         device_id=capability.device_id,
         device=capability.device,
@@ -219,6 +234,7 @@ def _create_resolvers(
     p2p_client: MxClient | None,
     rpc_timeout_seconds: float,
     service: Callable,
+    methods: tuple[UpdateMethod, ...] = (),
 ) -> tuple[SourceResolver, ...]:
     resolvers = []
     for source in source_order:
@@ -243,6 +259,15 @@ def _create_resolvers(
                 TrainerSourceResolver(
                     service=service,
                     rpc_timeout_seconds=rpc_timeout_seconds,
+                    cached_source=next(
+                        (
+                            getattr(method, "cached_trainer_source", None)
+                            for method in methods
+                            if getattr(method, "cached_trainer_source", None)
+                            is not None
+                        ),
+                        None,
+                    ),
                 )
             )
         else:
@@ -326,6 +351,8 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            service=service,
+                            rpc_timeout_seconds=rpc_timeout_seconds,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:
@@ -377,6 +404,7 @@ def initialize_generator_runtime(
                         p2p_client=p2p_client,
                         rpc_timeout_seconds=rpc_timeout_seconds,
                         service=service,
+                        methods=method_tuple,
                     ),
                     methods=method_tuple,
                     installer=engine.installer,

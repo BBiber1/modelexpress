@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import grpc
+from modelexpress import envs
 from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 from modelexpress.refit.timing import refit_span
 
@@ -84,9 +85,11 @@ class TrainerSourceResolver(SourceResolver):
         *,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
+        cached_source: Callable[[], TrainerSourceSnapshot | None] | None = None,
     ) -> None:
         self._service = service
         self._rpc_timeout_seconds = rpc_timeout_seconds
+        self._cached_source = cached_source
         self._manifest_cache: dict[tuple[str, str], tuple[str, str, bytes, str]] = {}
 
     @property
@@ -116,6 +119,25 @@ class TrainerSourceResolver(SourceResolver):
             return
         if not mesh_response.HasField("mesh"):
             raise RuntimeError("MX GetTrainerMesh response is missing mesh")
+        mesh = mesh_response.mesh
+        if mesh.mesh_id != version.trainer_mesh_id:
+            raise RuntimeError("MX GetTrainerMesh returned a different mesh ID")
+        cached = self._cached_source() if self._cached_source is not None else None
+        same_mesh = cached is not None and (mesh.mesh_id, mesh.generation) == (
+            cached.mesh_id,
+            cached.mesh_generation,
+        )
+        diagnostic = envs.MX_REFIT_DEBUG_VALIDATE_PLAN or envs.MX_RESHARD_PUBLISH_DIGEST
+        if (
+            same_mesh
+            and envs.MX_REFIT_CACHE_RESOLVED_SOURCES
+            and envs.MX_REFIT_CACHE_BOUNDED_PLANS
+            and not diagnostic
+        ):
+            yield cached
+            # A resumed candidate means preparation failed: discover fresh replicas.
+        if diagnostic or self._cached_source is not None:
+            self._manifest_cache.clear()
         expected_slots = tuple(
             sorted(
                 {
@@ -213,6 +235,7 @@ class TrainerSourceResolver(SourceResolver):
                 )
                 if (
                     not current.HasField("mesh")
+                    or current.mesh.mesh_id != version.trainer_mesh_id
                     or current.mesh.generation != mesh_generation
                 ):
                     raise RuntimeError(

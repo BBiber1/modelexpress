@@ -1757,14 +1757,24 @@ and owns one cached pull plan for either mode. That entry contains the trainer
 snapshot with immutable resolved source metadata, the generator snapshot used by
 planning and replay, and the compiled transfer. The update method creates fresh
 version-scoped artifacts and attributes transfer metrics; it owns no physical
-plan cache. Full-copy reuse compares the physical fingerprint and refreshes
-current content digests without replanning when source geometry is unchanged.
-Bounded reuse retains its structural-key checks and coverage validation.
+plan cache. Both modes reuse the plan and generator layout by default when the requested
+trainer mesh ID and generation match the cached trainer snapshot. Warm source
+resolution performs one mesh lookup and skips shard listing and manifest fetches.
+Warm preparation skips source parsing, structural keys, capture, coverage checks
+and required-agent traversal. A different mesh identity or replacement candidate
+creates and validates a new plan. Disabling either cache forces full preparation.
+
+`MX_REFIT_DEBUG_VALIDATE_PLAN` fetches current manifests and checks source geometry
+and plan coverage; `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` recaptures and checks
+the load layout. Both default to false, and detected drift fails preparation.
+Digest verification also fetches current manifests and refreshes only the used
+source digests, so it verifies the current weight version.
 
 Workspace mode changes invalidate the containing plan before source resolution.
 Connections, receive buffers, arenas and cached descriptors remain transfer-owned.
 A replacement plan is retained only after connection, allocation, registration and
-descriptor setup succeeds; preparation failure leaves no reusable entry. Each
+descriptor setup succeeds and a final mesh lookup confirms the original identity;
+preparation failure leaves no reusable entry. Each
 prepared transfer carries its own metrics and current source metadata. Both
 preparation entry points share source/layout resolution, connection setup, a
 failure guard that discards incomplete cache entries, and final plan publication.
@@ -1775,11 +1785,10 @@ arenas and descriptors, and returns deferred batch reads. Full-copy preparation
 creates independent destinations for the eager staged transfer. Both retain the
 same artifact interfaces consumed by application.
 
-A compiled bounded plan stores the immutable union of required source agents.
-Warm preparation selects current metadata from this set without traversing the
-whole plan and every batch again. Ordered manifest bytes, source mappings,
-agent metadata, capture and capacity still invalidate the plan; connected agents
-with changed metadata remain rejected. This cache owns no transport resources.
+A compiled plan stores the immutable union of required source agents. Warm
+preparation reuses its established transport without traversing the whole plan
+and every batch again. Connected agents with changed metadata remain rejected
+on validated preparation. The plan owns no transport resources.
 
 Trainer source resolution records one timing span per candidate-selection
 attempt. Each shard updates aggregate cache and byte counters; warm cache hits
@@ -1790,23 +1799,18 @@ Bounded transfer can reuse immutable READ addresses and sizes for the currently
 validated compiled plan. The one-entry cache checks the workspace generation and
 the identity, order and geometry of all receive arenas before every batch. It
 holds only weak arena references; source leases, tensor views and transport
-handles remain owned by the update. Preparation still validates current source
-metadata and coverage, and every batch still creates views, zeroes padding,
+handles remain owned by the update. Cold and diagnostic preparation validate source metadata and coverage. Every
+batch creates views, zeroes padding,
 posts fresh READs and completes the existing fences. Failed preparation,
 incomplete iteration and workspace teardown discard the descriptors. Private
 transfer counters report hits, misses and builds; descriptor work stays outside
 the wire timer on both cold and warm updates.
 
-The manifest-byte cache owns an immutable snapshot of ordinary parsed source
-and shard rows. A warm bounded-plan lookup reuses its structural key only while
-the resolved source table is the snapshot's table. Session and agent metadata maps in the trainer snapshot are immutable copies;
-their schema remains unchanged. The snapshot contains only
-host metadata; it owns no tensors, transport handles or source leases. Custom
-or mutable source rows retain the original field-by-field checks. Ordered
-manifest bytes, agent and device maps,
-captured layouts and the staging configuration still participate in invalidation,
-and current source coverage is checked before transfer. Snapshot construction is
-charged to source preparation on a cache miss.
+The trainer snapshot owns immutable copies of parsed source rows, session and
+agent metadata maps. It contains host metadata and owns no tensors, transport
+handles or source leases. The generator snapshot privately owns captured
+operation arguments while preserving Python container semantics for replay.
+Snapshot construction is charged to source preparation on a cache miss.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back

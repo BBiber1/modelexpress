@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     MX_REFIT_CACHE_RESOLVED_SOURCES: bool
     MX_REFIT_CACHE_BOUNDED_PLANS: bool
     MX_REFIT_COPY_PLAN_KEY_ON_MISS: bool
+    MX_REFIT_DEBUG_VALIDATE_PLAN: bool
+    MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
     MX_RESHARD_MAX_GBPS: float
     MX_RESHARD_MIN_GBPS: float
@@ -334,10 +336,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_REFIT_REUSE_COMPLETE_PLAN", False
     ),
     "MX_REFIT_CACHE_RESOLVED_SOURCES": lambda: _env_bool(
-        "MX_REFIT_CACHE_RESOLVED_SOURCES", False
+        "MX_REFIT_CACHE_RESOLVED_SOURCES", True
     ),
     "MX_REFIT_CACHE_BOUNDED_PLANS": lambda: _env_bool(
-        "MX_REFIT_CACHE_BOUNDED_PLANS", False
+        "MX_REFIT_CACHE_BOUNDED_PLANS", True
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_PLAN", False
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", False
     ),
     "MX_REFIT_COPY_PLAN_KEY_ON_MISS": lambda: _env_bool(
         "MX_REFIT_COPY_PLAN_KEY_ON_MISS", False

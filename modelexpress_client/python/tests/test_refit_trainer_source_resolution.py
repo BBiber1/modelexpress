@@ -134,3 +134,77 @@ def test_warm_resolution_without_timing(monkeypatch) -> None:
     resolver, version, fetched, _ = sources(monkeypatch, 256)
     assert len(next(resolver.candidates(version)).shards) == 256
     assert fetched == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "mesh_id", "generation", "debug", "digest", "sources_off", "plans_off"],
+)
+def test_mesh_cache_controls_publication_and_manifest_rpc_work(monkeypatch, change) -> None:
+    original, version, fetched, _ = sources(monkeypatch, 2)
+    service = original._service()
+    mesh_rpc, list_rpc = service.GetTrainerMesh, service.ListWeightVersionShards
+    counts = {"mesh": 0, "list": 0}
+    current = {"mesh_id": "mesh", "generation": 1}
+
+    def get_mesh(request, **kwargs) -> refit_pb2.GetTrainerMeshResponse:
+        counts["mesh"] += 1
+        response = mesh_rpc(request, **kwargs)
+        response.mesh.mesh_id = current["mesh_id"]
+        response.mesh.generation = current["generation"]
+        return response
+
+    def list_shards(request, **kwargs) -> refit_pb2.ListWeightVersionShardsResponse:
+        counts["list"] += 1
+        return list_rpc(request, **kwargs)
+
+    service.GetTrainerMesh, service.ListWeightVersionShards = get_mesh, list_shards
+    cached = [None]
+    resolver = trainer.TrainerSourceResolver(
+        service=lambda: service, rpc_timeout_seconds=1, cached_source=lambda: cached[0]
+    )
+    cached[0] = next(resolver.candidates(version))
+    assert counts == {"mesh": 2, "list": 1}
+    assert len(fetched) == 2
+    version.version_id = "v2"
+    if change == "mesh_id":
+        current["mesh_id"] = version.trainer_mesh_id = "other"
+    elif change == "generation":
+        current["generation"] = 2
+    elif change == "debug":
+        monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", "1")
+    elif change == "digest":
+        monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    elif change == "sources_off":
+        monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "0")
+    elif change == "plans_off":
+        monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
+    next(resolver.candidates(version))
+    assert counts["list"] == (1 if change is None else 2)
+    assert counts["mesh"] == (3 if change is None else 4)
+    assert len(fetched) == (2 if change is None else 4)
+
+
+def test_resumed_warm_candidate_discovers_fresh_replicas(monkeypatch) -> None:
+    original, version, fetched, _ = sources(monkeypatch, 1)
+    service = original._service()
+    list_rpc = service.ListWeightVersionShards
+    requests = []
+
+    def list_shards(request, **kwargs) -> refit_pb2.ListWeightVersionShardsResponse:
+        requests.append(request.version_id)
+        return list_rpc(request, **kwargs)
+
+    service.ListWeightVersionShards = list_shards
+    cached = [None]
+    resolver = trainer.TrainerSourceResolver(
+        service=lambda: service, rpc_timeout_seconds=1, cached_source=lambda: cached[0]
+    )
+    cached[0] = next(resolver.candidates(version))
+    version.version_id = "v2"
+    candidates = resolver.candidates(version)
+    next(candidates)
+    assert requests == ["v1"]
+    next(candidates)
+    assert requests == ["v1", "v2"]
+    assert len(fetched) == 2

@@ -177,7 +177,7 @@ def test_changed_manifest_keeps_current_version_metadata(field_name):
 
 
 @pytest.mark.parametrize("which", ["agents", "devices", "metadata"])
-def test_outer_metadata_remains_fresh_and_mutable(which):
+def test_outer_metadata_remains_fresh_and_mutable(which) -> None:
     args = _bounded_cache_inputs()
     original = args["resolved"]
     resolved, token = _freeze(original)
@@ -188,6 +188,7 @@ def test_outer_metadata_remains_fresh_and_mutable(which):
     first = cache.compile(**args, metrics={})
     if which == "agents":
         resolved.session_to_agent["a"] = "changed"
+        resolved.agent_metadata["changed"] = b"changed"
     elif which == "devices":
         resolved.session_to_device["a"] = 7
     else:
