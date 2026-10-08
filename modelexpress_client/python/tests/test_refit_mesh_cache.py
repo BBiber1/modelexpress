@@ -158,3 +158,25 @@ def test_debug_layout_compares_tensor_index_arguments_before_transfer(
     with pytest.raises(ValueError, match="generator layout changed"):
         harness.prepare(trainer_snapshot=harness.transfer.cached_trainer_source())
     assert harness.events.count("post") == posts
+
+
+def test_manifest_parser_rows_are_owned_before_transfer(harness, monkeypatch) -> None:
+    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+
+    parsed = []
+    resolve = transfer_module._resolve_sources
+
+    def observe(*args, **kwargs) -> transfer_module._ResolvedSources:
+        result = resolve(*args, **kwargs)
+        parsed.extend(result.sources.values())
+        return result
+
+    monkeypatch.setattr(transfer_module, "_resolve_sources", observe)
+    prepared = harness.prepare()
+    for source in parsed:
+        source.global_shape = (1,)
+        for shard in source.shards:
+            shard.addr = 0
+            shard.shape = (1,)
+    _check_values(harness, harness.collect(prepared)[1])
+    _check_values(harness, harness.collect(prepare_warm(harness))[1])

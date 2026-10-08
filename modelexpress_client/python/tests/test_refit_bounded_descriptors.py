@@ -13,6 +13,7 @@ import modelexpress_rl.inference.nixl_staged_transfer as module
 import pytest
 import torch
 from modelexpress import envs
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
@@ -34,7 +35,6 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
     monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "1")
     monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "1")
-    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "1")
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -167,6 +167,11 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
         return transfer.prepare_streaming(
             manifests=manifests(),
             capture_layout=capture_layout,
+            trainer_snapshot=kwargs.pop(
+                "trainer_snapshot",
+                transfer.cached_trainer_source()
+                or TrainerSourceSnapshot("mesh", 1, ()),
+            ),
             **{"max_staging_bytes": 1024, "staging_device": "cpu", **kwargs},
         )
 
@@ -209,16 +214,12 @@ def _check_values(harness, installed):
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_warm_descriptors_still_transfer_new_values(
     harness, monkeypatch, buffers, pack, device
-):
+) -> None:
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
     prepare = lambda: harness.prepare(staging_buffers=buffers, staging_device=device)
     first = prepare()
-    assert any(batch.plan.full_pulls for batch in first.batches)
-    assert any(batch.plan.converts for batch in first.batches)
-    assert any(batch.plan.segments for batch in first.batches)
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
-    cached = harness.transfer._descriptor_cache
     assert cold["descriptor_builds"] == len(first.batches)
     assert cold["descriptor_cache_hits"] == 0
     for values in harness.sources.values():
@@ -228,40 +229,30 @@ def test_warm_descriptors_still_transfer_new_values(
     second = prepare()
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
-    assert len(harness.captures) == 2
-    assert first.batches is second.batches
-    assert harness.transfer._descriptor_cache is cached
+    assert len(harness.captures) == 1
     assert warm["descriptor_cache_hits"] == len(second.batches)
     assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
-    assert first.transport is not second.transport
+    assert len(harness.transports) == 1
+    assert len(second.transport.posts) == 2 * len(second.batches)
     assert second.transport.mem_type == ("DRAM" if device == "cpu" else "VRAM")
-    assert first.transport.posts == second.transport.posts
     assert second.transport.awaited == second.transport.posted
-    descriptor = second.transport.posts[0][0]
-    with pytest.raises(AttributeError):
-        descriptor.dst_addr = 0
 
 
-@pytest.mark.parametrize("change", ["address", "capture", "budget", "disabled"])
-def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change):
+@pytest.mark.parametrize("change", ["address", "capture", "disabled"])
+def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -> None:
     first = harness.prepare()
     harness.collect(first)
-    kwargs = {}
+    kwargs = {"trainer_snapshot": TrainerSourceSnapshot("mesh", 2, ())}
     if change == "address":
         harness.sources["exact"] = harness.sources["exact"].clone() + 5
     elif change == "capture":
         harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
-    elif change == "budget":
-        kwargs["max_staging_bytes"] = 2048
     else:
         monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
     second = harness.prepare(**kwargs)
     metrics, _ = harness.collect(second)
-    assert second.batches is not first.batches
     assert metrics["descriptor_cache_hits"] == 0
     assert metrics["descriptor_builds"] == len(second.batches)
-    if change == "disabled":
-        assert harness.transfer._descriptor_cache is None
 
 
 @pytest.mark.parametrize(
@@ -309,9 +300,8 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
 @pytest.mark.parametrize(
     "failure", ["coverage", "transport", "prepared", "registration"]
 )
-def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
+def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure) -> None:
     harness.collect(harness.prepare())
-    assert harness.transfer._descriptor_cache is not None
     if failure == "coverage":
         harness.layout["missing.weight"] = ((4,), torch.float32)
         expected = IncompleteRefit
@@ -329,14 +319,16 @@ def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
             monkeypatch.setattr(harness.transfer._manager, "register_dram_buffer", fail)
         expected = RuntimeError
     with pytest.raises(expected):
-        harness.prepare()
-    assert harness.transfer._descriptor_cache is None
+        harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
 
 
 @pytest.mark.parametrize("failure", ["post", "wait", "abandon", "drain"])
-def test_incomplete_iteration_discards_cache_and_preserves_drain(harness, failure):
+def test_incomplete_iteration_discards_cache_and_preserves_drain(
+    harness, failure
+) -> None:
     harness.collect(harness.prepare(staging_buffers=2))
     prepared = harness.prepare(staging_buffers=2)
+    previous_posts = len(prepared.transport.posted)
     if failure in ("post", "wait"):
         setattr(prepared.transport, f"fail_{failure}", True)
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
@@ -344,7 +336,7 @@ def test_incomplete_iteration_discards_cache_and_preserves_drain(harness, failur
     else:
         iterator = harness.transfer.iter_bounded(prepared, {})
         next(iterator)
-        assert len(prepared.transport.posted) == 2
+        assert len(prepared.transport.posted) - previous_posts == 2
         if failure == "drain":
             prepared.transport.fail_wait = True
             with pytest.raises(RuntimeError, match="could not be drained"):

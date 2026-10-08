@@ -534,10 +534,10 @@ The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
 Full-tensor trainers reuse manifest bytes while registrations, addresses, and
 tensor geometry remain stable and content digests are disabled. Generators
-cache each selected worker manifest by endpoint and digest. A changed endpoint,
-registration metadata,
-address, dtype, shape, or sharding changes the structural fingerprint and
-rebuilds the transfer plan. Content-only digest changes refresh verification
+retain selected worker manifests in the physical plan. A changed trainer
+mesh generation invalidates the transfer plan. Changes to registration,
+address, dtype, shape, or sharding require a mesh update; optional debug checks
+detect unannounced source drift. Content-only digest changes refresh verification
 metadata without rebuilding that plan. Releasing a trainer shard evicts its
 worker-local version entry only after the central service accepts the deletion;
 the service rejects deletion while a version lease is active.
@@ -1742,6 +1742,16 @@ selects bounded trainer streaming or the configured ordinary source order.
 Object-storage replay resolves and validates its chain before preparation, and
 generator-peer staging reserves a read lease without writing live weights.
 
+Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
+The unchanged creation API supplies a mesh ID; the server reads and stamps its
+generation atomically while creating the version. Idempotent retries return the
+original stamp. Shard publication, including the final READY transition and
+repeated publications, rejects a changed mesh generation before writing. Trainer
+resolution compares the recorded generation with the current mesh and cached
+trainer snapshot. Versions created before this field must be recreated; missing
+or zero mesh generations fail explicitly. Versions without a trainer mesh,
+including object-storage versions, carry generation zero.
+
 Trainer resolution produces a `TrainerSourceSnapshot`: mesh ID and generation
 plus immutable selected-shard records containing worker, endpoint, manifest and
 structural/content digests. Version identity stays in the requested
@@ -1780,7 +1790,7 @@ preparation entry points share source/layout resolution, connection setup, a
 failure guard that discards incomplete cache entries, and final plan publication.
 Full-copy destinations and bounded receive arenas keep their separate setup.
 Bounded preparation validates capacity, resolves sources, captures the engine
-layout, compiles or revalidates a plan, connects required agents, prepares receive
+layout, compiles a plan, connects required agents, prepares receive
 arenas and descriptors, and returns deferred batch reads. Full-copy preparation
 creates independent destinations for the eager staged transfer. Both retain the
 same artifact interfaces consumed by application.
@@ -1791,8 +1801,9 @@ and every batch again. Connected agents with changed metadata remain rejected
 on validated preparation. The plan owns no transport resources.
 
 Trainer source resolution records one timing span per candidate-selection
-attempt. Each shard updates aggregate cache and byte counters; warm cache hits
-create no per-shard spans. Cache misses retain fetch, hash and fingerprint timing,
+attempt. Each cold shard updates aggregate fetch and byte counters; mesh warm hits
+skip manifest fetches and create no per-shard spans. Cold and diagnostic lookups
+retain fetch, hash and fingerprint timing,
 and resolution timing ends before yielding the candidate for preparation.
 
 Bounded transfer can reuse immutable READ addresses and sizes for the currently

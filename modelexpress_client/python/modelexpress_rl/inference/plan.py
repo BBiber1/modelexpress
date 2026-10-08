@@ -81,17 +81,24 @@ class GeneratorPeerUpdateSource:
 class TrainerSourceSnapshot:
     """Selected trainer shards and the mesh identity they belong to."""
 
-    mesh_id: str | None
-    mesh_generation: int | None
+    mesh_id: str
+    mesh_generation: int
     shards: tuple[TrainerSourceShard, ...]
     resolved_metadata: _ResolvedSources | None = field(
         default=None, compare=False, repr=False
     )
-    resolved_structure: tuple | None = field(default=None, compare=False, repr=False)
     kind = WeightSource.TRAINER
     payload_format = WeightPayloadFormat.FULL_TENSOR
 
     def __post_init__(self) -> None:
+        if (
+            not self.mesh_id
+            or type(self.mesh_generation) is not int
+            or self.mesh_generation <= 0
+        ):
+            raise ValueError(
+                "trainer source requires a mesh ID and positive generation"
+            )
         object.__setattr__(self, "shards", tuple(self.shards))
 
     @property

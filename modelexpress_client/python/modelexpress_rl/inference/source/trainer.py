@@ -90,7 +90,6 @@ class TrainerSourceResolver(SourceResolver):
         self._service = service
         self._rpc_timeout_seconds = rpc_timeout_seconds
         self._cached_source = cached_source
-        self._manifest_cache: dict[tuple[str, str], tuple[str, str, bytes, str]] = {}
 
     @property
     def kind(self) -> WeightSource:
@@ -105,6 +104,10 @@ class TrainerSourceResolver(SourceResolver):
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         if version.trainer_mesh_id is None:
             raise RuntimeError("trainer publication requires trainer_mesh_id")
+        if version.trainer_mesh_generation <= 0:
+            raise RuntimeError(
+                "trainer publication requires a positive trainer_mesh_generation; recreate the version"
+            )
         try:
             mesh_response = self._service().GetTrainerMesh(
                 refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
@@ -122,6 +125,10 @@ class TrainerSourceResolver(SourceResolver):
         mesh = mesh_response.mesh
         if mesh.mesh_id != version.trainer_mesh_id:
             raise RuntimeError("MX GetTrainerMesh returned a different mesh ID")
+        if mesh.generation != version.trainer_mesh_generation:
+            raise RuntimeError(
+                "weight version trainer mesh generation differs from the current mesh"
+            )
         cached = self._cached_source() if self._cached_source is not None else None
         same_mesh = cached is not None and (mesh.mesh_id, mesh.generation) == (
             cached.mesh_id,
@@ -136,8 +143,6 @@ class TrainerSourceResolver(SourceResolver):
         ):
             yield cached
             # A resumed candidate means preparation failed: discover fresh replicas.
-        if diagnostic or self._cached_source is not None:
-            self._manifest_cache.clear()
         expected_slots = tuple(
             sorted(
                 {
@@ -147,7 +152,7 @@ class TrainerSourceResolver(SourceResolver):
             )
         )
         mesh_workers = mesh_response.mesh.workers
-        mesh_generation = mesh_response.mesh.generation
+        mesh_generation = version.trainer_mesh_generation
         try:
             with refit_span(
                 "source_preparation",
@@ -200,8 +205,6 @@ class TrainerSourceResolver(SourceResolver):
             with refit_span(
                 "source_preparation",
                 metadata={
-                    "manifest_cache_hits": 0,
-                    "manifest_cache_misses": 0,
                     "manifest_fetch_count": 0,
                     "manifest_fetch_bytes": 0,
                     "manifest_bytes": 0,
@@ -259,32 +262,11 @@ class TrainerSourceResolver(SourceResolver):
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
             raise RuntimeError("source is missing its manifest digest")
-        key = (shard.logical_shard_id, shard.worker_id)
-        cached = self._manifest_cache.get(key)
-        reusable = (
-            cached is not None
-            and cached[0] == shard.manifest_endpoint
-            and cached[1] == shard.manifest_digest
-        )
-        counter = "manifest_cache_hits" if reusable else "manifest_cache_misses"
-        counters[counter] = counters.get(counter, 0) + 1
-        if reusable:
-            assert cached is not None
-            manifest, structure_digest = cached[2:]
-        else:
-            counters["manifest_fetch_count"] = (
-                counters.get("manifest_fetch_count", 0) + 1
-            )
-            manifest, structure_digest = self._fetch_manifest(shard)
-            self._manifest_cache[key] = (
-                shard.manifest_endpoint,
-                shard.manifest_digest,
-                manifest,
-                structure_digest,
-            )
-            counters["manifest_fetch_bytes"] = counters.get(
-                "manifest_fetch_bytes", 0
-            ) + len(manifest)
+        counters["manifest_fetch_count"] = counters.get("manifest_fetch_count", 0) + 1
+        manifest, structure_digest = self._fetch_manifest(shard)
+        counters["manifest_fetch_bytes"] = counters.get(
+            "manifest_fetch_bytes", 0
+        ) + len(manifest)
         counters["manifest_bytes"] = counters.get("manifest_bytes", 0) + len(manifest)
         return TrainerSourceShard(
             source_slot_id=shard.logical_shard_id,

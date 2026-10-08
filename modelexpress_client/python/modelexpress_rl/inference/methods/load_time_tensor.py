@@ -62,16 +62,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release staged weight before staging another version")
         if not isinstance(source, TrainerSourceSnapshot):
             raise TypeError("load-time tensor method requires a trainer source")
-        fingerprint = (
-            (
-                version.base_version_id,
-                version.layout_signature,
-                version.payload_format,
-                source.physical_fingerprint,
-            )
-            if source.mesh_id is None
-            else None
-        )
         manifests = (
             None
             if source.resolved_metadata is not None
@@ -82,7 +72,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 manifests=manifests,
                 trainer_snapshot=source,
                 capture_layout=self._capture_layout,
-                physical_fingerprint=fingerprint,
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))

@@ -77,7 +77,6 @@ if TYPE_CHECKING:
     MX_REFIT_REUSE_COMPLETE_PLAN: bool
     MX_REFIT_CACHE_RESOLVED_SOURCES: bool
     MX_REFIT_CACHE_BOUNDED_PLANS: bool
-    MX_REFIT_COPY_PLAN_KEY_ON_MISS: bool
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
@@ -259,7 +258,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
         "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
     ),
-    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
+    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get(
+        "MODEL_EXPRESS_LOG_LEVEL", ""
+    ).upper(),
     "MX_MODEL_NAME_OVERRIDE": lambda: os.environ.get("MX_MODEL_NAME_OVERRIDE"),
     # ── Auth (client) ──────────────────────────────────────────────────────
     "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
@@ -346,9 +347,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT": lambda: _env_bool(
         "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", False
-    ),
-    "MX_REFIT_COPY_PLAN_KEY_ON_MISS": lambda: _env_bool(
-        "MX_REFIT_COPY_PLAN_KEY_ON_MISS", False
     ),
     "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
         os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")

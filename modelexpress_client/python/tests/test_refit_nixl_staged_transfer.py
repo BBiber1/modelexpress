@@ -254,9 +254,8 @@ def _manifest(
 @pytest.mark.parametrize("switch_failure", [None, "initialize", "register"])
 @pytest.mark.parametrize("warm_cache", [False, True])
 @pytest.mark.parametrize("verify_digest", [False, True])
-@pytest.mark.parametrize("mesh_cache", [False, True])
 def test_released_updates_switch_workspaces_without_reusing_stale_plans(
-    monkeypatch, switch_failure, warm_cache, verify_digest, mesh_cache
+    monkeypatch, switch_failure, warm_cache, verify_digest
 ) -> None:
     """Switch modes with real plans and byte copies, mocking only CUDA/NIXL."""
     events = []
@@ -266,7 +265,6 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
     for flag in (
         "MX_REFIT_CACHE_RESOLVED_SOURCES",
         "MX_REFIT_CACHE_BOUNDED_PLANS",
-        "MX_REFIT_COPY_PLAN_KEY_ON_MISS",
         "MX_REFIT_REUSE_COMPLETE_PLAN",
     ):
         monkeypatch.setenv(flag, str(int(warm_cache)))
@@ -378,8 +376,8 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
         ],
     )
     source = TrainerSourceSnapshot(
-        mesh_id="mesh" if mesh_cache else None,
-        mesh_generation=1 if mesh_cache else None,
+        mesh_id="mesh",
+        mesh_generation=1,
         shards=(
             TrainerSourceShard(
                 source_slot_id="rank:0",
@@ -441,7 +439,7 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                 )
             candidate = (
                 method.cached_trainer_source() or source
-                if mesh_cache and warm_cache and not verify_digest
+                if warm_cache and not verify_digest
                 else source
             )
             if bounded:
@@ -455,11 +453,7 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                 prepared = method.prepare_streaming(
                     version=None, source=candidate, max_staging_bytes=256
                 )
-                hit = (
-                    warm_cache
-                    and (not verify_digest or mesh_cache)
-                    and index in (3, 4, 8, 9)
-                )
+                hit = warm_cache and index in (3, 4, 8, 9)
                 assert prepared.metrics["plan_cache_hits"] == int(hit)
                 assert prepared.metrics["owner_plan_builds"] == int(not hit)
                 with pytest.raises(RuntimeError, match="release"):
@@ -1256,6 +1250,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         )
         with pytest.raises(IncompleteRefit, match=expected):
             transfer.prepare_streaming(
+                trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
                 manifests=[manifest],
                 capture_layout=lambda m: (capture, layout),
                 max_staging_bytes=256 * staging_buffers - 1,
@@ -1263,6 +1258,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
                 staging_buffers=staging_buffers,
             )
         prepared = transfer.prepare_streaming(
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
             manifests=[manifest],
             capture_layout=lambda m: (capture, layout),
             max_staging_bytes=256 * staging_buffers,
@@ -1284,6 +1280,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
             # are deregistered before the agent is torn down and rebuilt.
             transfer._active = None
             transfer.prepare_streaming(
+                trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
                 manifests=[manifest],
                 capture_layout=lambda m: (capture, layout),
                 max_staging_bytes=256,
@@ -1307,6 +1304,7 @@ def test_prepare_rejects_invalid_staging_options() -> None:
     transfer._device = torch.device("cuda:0")
     with pytest.raises(ValueError, match="staging_device"):
         transfer.prepare_streaming(
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
             manifests=[],
             capture_layout=None,
             max_staging_bytes=1,
@@ -1314,7 +1312,11 @@ def test_prepare_rejects_invalid_staging_options() -> None:
         )
     with pytest.raises(ValueError, match="staging_buffers"):
         transfer.prepare_streaming(
-            manifests=[], capture_layout=None, max_staging_bytes=1, staging_buffers=0
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+            manifests=[],
+            capture_layout=None,
+            max_staging_bytes=1,
+            staging_buffers=0,
         )
 
 

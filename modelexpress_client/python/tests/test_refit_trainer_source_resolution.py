@@ -12,7 +12,9 @@ from modelexpress_rl.inference.source import trainer
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def sources(monkeypatch, count, *, miss=None, failed_replica=False) -> tuple[trainer.TrainerSourceResolver, SimpleNamespace, list[str], int]:
+def sources(
+    monkeypatch, count, *, failed_replica=False
+) -> tuple[trainer.TrainerSourceResolver, SimpleNamespace, list[str], int]:
     manifest = b'{"tensors": []}'
     digest = hashlib.sha256(manifest).hexdigest()
     workers, shards = {}, []
@@ -53,14 +55,6 @@ def sources(monkeypatch, count, *, miss=None, failed_replica=False) -> tuple[tra
     resolver = trainer.TrainerSourceResolver(
         service=lambda: service, rpc_timeout_seconds=1
     )
-    for shard in shards:
-        if shard.worker_id != miss and shard.worker_id != "a-failed":
-            resolver._manifest_cache[(shard.logical_shard_id, shard.worker_id)] = (
-                shard.manifest_endpoint,
-                digest,
-                manifest,
-                "structure",
-            )
     fetched = []
 
     def stub(endpoint) -> SimpleNamespace:
@@ -83,6 +77,7 @@ def sources(monkeypatch, count, *, miss=None, failed_replica=False) -> tuple[tra
     version = SimpleNamespace(
         version_id="v1",
         trainer_mesh_id="mesh",
+        trainer_mesh_generation=1,
         base_version_id=None,
         layout_signature="layout",
         payload_format=WeightPayloadFormat.FULL_TENSOR,
@@ -91,47 +86,50 @@ def sources(monkeypatch, count, *, miss=None, failed_replica=False) -> tuple[tra
 
 
 @pytest.mark.parametrize("count", [1, 256])
-def test_warm_shards_share_one_resolution_measurement(monkeypatch, count) -> None:
+def test_cold_shards_aggregate_fetch_counts(monkeypatch, count) -> None:
     resolver, version, fetched, size = sources(monkeypatch, count)
     recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
     with use_refit_timing(recorder):
         candidates = resolver.candidates(version)
         assert len(next(candidates).shards) == count
         stage = recorder.as_dict()["stages"]["source_preparation"]
-        assert stage["count"] == 2
-        assert stage["metadata"]["manifest_cache_hits"] == count
-        assert stage["metadata"]["manifest_cache_misses"] == 0
+        assert stage["count"] == count * 3 + 2
+        assert stage["metadata"]["manifest_fetch_count"] == count
         assert stage["metadata"]["manifest_bytes"] == count * size
         assert "source_resolution_s" in stage["metadata"]
         before = dict(stage["metadata"])
         candidates.close()
         assert recorder.as_dict()["stages"]["source_preparation"]["metadata"] == before
-    assert fetched == []
+    assert fetched == [
+        f"worker-{index}"
+        for index in sorted(range(count), key=lambda index: f"slot-{index}")
+    ]
 
 
 def test_mixed_shards_count_failed_fetches_and_successful_bytes(monkeypatch) -> None:
-    resolver, version, fetched, size = sources(
-        monkeypatch, 3, miss="worker-1", failed_replica=True
-    )
+    resolver, version, fetched, size = sources(monkeypatch, 3, failed_replica=True)
     recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
     with use_refit_timing(recorder):
         candidates = resolver.candidates(version)
         assert len(next(candidates).shards) == 3
         candidates.close()
     metadata = recorder.as_dict()["stages"]["source_preparation"]["metadata"]
-    assert metadata["manifest_cache_hits"] == 2
-    assert metadata["manifest_cache_misses"] == 2
-    assert metadata["manifest_fetch_count"] == 2
-    assert metadata["manifest_fetch_bytes"] == size
+    assert metadata["manifest_fetch_count"] == 4
+    assert metadata["manifest_fetch_bytes"] == 3 * size
     assert metadata["manifest_bytes"] == 3 * size
     assert "manifest_fetch_s" in metadata
     assert "manifest_hash_s" in metadata
     assert "manifest_fingerprint_s" in metadata
-    assert fetched == ["a-failed", "worker-1"]
+    assert fetched == ["a-failed", "worker-0", "worker-1", "worker-2"]
 
 
 def test_warm_resolution_without_timing(monkeypatch) -> None:
     resolver, version, fetched, _ = sources(monkeypatch, 256)
+    cached = next(resolver.candidates(version))
+    resolver = trainer.TrainerSourceResolver(
+        service=resolver._service, rpc_timeout_seconds=1, cached_source=lambda: cached
+    )
+    fetched.clear()
     assert len(next(resolver.candidates(version)).shards) == 256
     assert fetched == []
 
@@ -140,7 +138,9 @@ def test_warm_resolution_without_timing(monkeypatch) -> None:
     "change",
     [None, "mesh_id", "generation", "debug", "digest", "sources_off", "plans_off"],
 )
-def test_mesh_cache_controls_publication_and_manifest_rpc_work(monkeypatch, change) -> None:
+def test_mesh_cache_controls_publication_and_manifest_rpc_work(
+    monkeypatch, change
+) -> None:
     original, version, fetched, _ = sources(monkeypatch, 2)
     service = original._service()
     mesh_rpc, list_rpc = service.GetTrainerMesh, service.ListWeightVersionShards
@@ -170,7 +170,7 @@ def test_mesh_cache_controls_publication_and_manifest_rpc_work(monkeypatch, chan
     if change == "mesh_id":
         current["mesh_id"] = version.trainer_mesh_id = "other"
     elif change == "generation":
-        current["generation"] = 2
+        current["generation"] = version.trainer_mesh_generation = 2
     elif change == "debug":
         monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", "1")
     elif change == "digest":
@@ -208,3 +208,16 @@ def test_resumed_warm_candidate_discovers_fresh_replicas(monkeypatch) -> None:
     next(candidates)
     assert requests == ["v1", "v2"]
     assert len(fetched) == 2
+
+
+@pytest.mark.parametrize("generation", [0, 2])
+def test_version_generation_mismatch_fails_before_source_fetch_and_recovers(
+    monkeypatch, generation
+) -> None:
+    resolver, version, fetched, _ = sources(monkeypatch, 1)
+    version.trainer_mesh_generation = generation
+    with pytest.raises(RuntimeError, match="generation"):
+        next(resolver.candidates(version))
+    assert fetched == []
+    version.trainer_mesh_generation = 1
+    assert len(next(resolver.candidates(version)).shards) == 1

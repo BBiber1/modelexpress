@@ -1537,7 +1537,6 @@ it does not establish a stable configuration API.
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Fetch current manifests and validate cached source geometry and plan coverage on warm refits. Structural drift under unchanged mesh identity fails preparation. |
 | `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Recapture generator load mappings and parameter layout on warm refits; fail preparation on drift. |
 | `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
-| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; it is fixed for the client lifetime. |
 
 Staging capacity, arena configuration and planning controls are fixed for the

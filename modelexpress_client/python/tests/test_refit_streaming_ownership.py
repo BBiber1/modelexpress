@@ -17,7 +17,9 @@ from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def setup_method(monkeypatch) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerSourceSnapshot, list, torch.Tensor]:
+def setup_method(
+    monkeypatch,
+) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerSourceSnapshot, list, torch.Tensor]:
     events = []
     arena = torch.ones(2, 2)
 
@@ -56,8 +58,8 @@ def setup_method(monkeypatch) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerSo
         worker_id="receiver",
     )
     source = TrainerSourceSnapshot(
-        mesh_id=None,
-        mesh_generation=None,
+        mesh_id="mesh",
+        mesh_generation=1,
         shards=(
             TrainerSourceShard(
                 source_slot_id="slot",

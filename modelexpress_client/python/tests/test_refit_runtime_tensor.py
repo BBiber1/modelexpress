@@ -213,7 +213,7 @@ def test_runtime_method_rejects_a_trainer_source() -> None:
         transfer=_Transfer(),
         runtime_tensors={},
     )
-    source = TrainerSourceSnapshot(mesh_id=None, mesh_generation=None, shards=())
+    source = TrainerSourceSnapshot(mesh_id="mesh", mesh_generation=1, shards=())
 
     try:
         method.prepare(version=object(), source=source)
