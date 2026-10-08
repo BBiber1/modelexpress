@@ -12,7 +12,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
+import grpc
 from modelexpress import p2p_pb2
+from modelexpress.adapter import StrategyRecoveryError
+from modelexpress.types import ManifestMismatchError
 
 from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
@@ -349,15 +352,27 @@ class WeightUpdatePlanner:
         version: WeightVersion,
         *,
         source_kind: WeightSource | None = None,
-    ):
+    ) -> Iterator[WeightUpdatePlan]:
+        discovery_error: BaseException | None = None
+        yielded = False
         for resolver in self._resolvers:
             if source_kind is not None and resolver.kind is not source_kind:
                 continue
             if not resolver.supports(version):
                 continue
             resolved_plans = []
-            for attempt, source in enumerate(resolver.candidates(version)):
-                if attempt >= self._max_transfer_attempts:
+            candidates = None
+            for _ in range(self._max_transfer_attempts):
+                try:
+                    if candidates is None:
+                        candidates = iter(resolver.candidates(version))
+                    source = next(candidates)
+                except StopIteration:
+                    break
+                except StrategyRecoveryError:
+                    raise
+                except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
+                    discovery_error = error
                     break
                 for method in self._methods:
                     if not method.supports(source=source):
@@ -379,6 +394,7 @@ class WeightUpdatePlanner:
                         installer=self._installer,
                     )
                     resolved_plans.append(plan)
+                    yielded = True
                     yield plan
                     break
             # Trainer and object-storage transfers may fail transiently even
@@ -388,6 +404,8 @@ class WeightUpdatePlanner:
             if resolver.kind is not WeightSource.GENERATOR and len(resolved_plans) == 1:
                 for _ in range(1, self._max_transfer_attempts):
                     yield resolved_plans[0]
+        if not yielded and discovery_error is not None:
+            raise discovery_error
 
     def validate(
         self,

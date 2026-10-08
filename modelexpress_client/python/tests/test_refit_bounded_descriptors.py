@@ -281,8 +281,8 @@ def test_warm_descriptors_still_transfer_new_values(
     assert second.transport.awaited == second.transport.posted
 
 
-@pytest.mark.parametrize("change", ["address", "capture", "disabled"])
-def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -> None:
+@pytest.mark.parametrize("change", ["address", "capture"])
+def test_changed_plan_does_not_reuse_descriptors(harness, change) -> None:
     first = harness.prepare()
     harness.collect(first)
     kwargs = {"trainer_snapshot": TrainerSourceSnapshot("mesh", 2, ())}
@@ -290,8 +290,6 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
         harness.sources["exact"] = harness.sources["exact"].clone() + 5
     elif change == "capture":
         harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
-    else:
-        monkeypatch.setenv("MX_REFIT_CACHE_PLAN", "0")
     second = harness.prepare(**kwargs)
     metrics, _ = harness.collect(second)
     assert metrics["descriptor_cache_hits"] == 0

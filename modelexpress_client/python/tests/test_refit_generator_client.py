@@ -2742,3 +2742,51 @@ def test_streaming_creates_and_emits_one_timing_cycle(
         generator.close()
         method.close()
         server.stop(grace=None).wait()
+
+
+@pytest.mark.parametrize("peer", ["ready", "absent", "preparation_failure"])
+def test_stale_trainer_discovery_preserves_exact_version_peer_fallback(
+    monkeypatch, peer
+) -> None:
+    server, endpoint, service = _start_server()
+    service.mesh_generation_on_recheck = 2
+    # The next mesh response reflects a replacement of the published version's mesh.
+    service.mesh_calls = 1
+    adapter = _Adapter(service)
+    failure = RuntimeError("peer preparation failed")
+    if peer != "absent":
+        _add_generator_peer(service)
+    if peer == "preparation_failure":
+
+        def fail(source) -> None:
+            raise failure
+
+        adapter.stage_peer_weight = fail
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR),
+    )
+    try:
+        if peer == "absent":
+            with pytest.raises(
+                RuntimeError, match="weight version trainer mesh generation differs"
+            ):
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+        elif peer == "preparation_failure":
+            with pytest.raises(RuntimeError, match="peer preparation failed") as caught:
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert caught.value is failure
+        else:
+            staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert len(adapter.peer_stage_calls) == 1
+            assert generator.apply_weight(staged) == "installed"
+            staged.release()
+        assert adapter.stage_calls == []
+        assert service.list_calls == 0
+        assert not service.worker.requests
+        assert not service.active_leases
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()

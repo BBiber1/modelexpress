@@ -1809,6 +1809,12 @@ preparation reuses its established transport without traversing the whole plan
 and every batch again. Connected agents with changed metadata are replaced
 on validated preparation after the previous update has quiesced. The plan owns no transport resources.
 
+Configured source fallback also applies to discovery failures. A stale trainer
+mesh rejects trainer reads while allowing a later exact-version generator peer
+to serve that version. If discovery yields no supported plan, its original
+availability error is reported. Once a supported plan was yielded, a subsequent
+preparation failure retains its own diagnostic; recovery failures remain fatal.
+
 Trainer source resolution records one timing span per candidate-selection
 attempt. Each cold shard updates aggregate fetch and byte counters; mesh warm hits
 skip manifest fetches and create no per-shard spans. Cold and diagnostic lookups
