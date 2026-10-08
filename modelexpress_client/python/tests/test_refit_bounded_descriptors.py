@@ -410,6 +410,31 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     assert warm["descriptor_builds"] == 0
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_required_agents_are_resolved_once_per_compiled_plan(
+    harness, monkeypatch, enabled
+) -> None:
+    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", str(int(enabled)))
+    calls = []
+    original = module._required_agent_metadata
+
+    def record(plan, resolved) -> dict[str, bytes]:
+        calls.append(plan)
+        return original(plan, resolved)
+
+    monkeypatch.setattr(module, "_required_agent_metadata", record)
+    first = harness.prepare()
+    cold_calls = len(calls)
+    assert cold_calls == 1 + len(first.batches)
+    harness.collect(first)
+    calls.clear()
+    second = harness.prepare()
+    assert len(calls) == (0 if enabled else cold_calls)
+    assert second.metrics["plan_cache_hits"] == int(enabled)
+    _, installed = harness.collect(second)
+    _check_values(harness, installed)
+
+
 @pytest.mark.parametrize("failure", ["allocation", "registration", "descriptors"])
 def test_partial_receive_setup_can_be_reset_and_prepared_again(
     harness, monkeypatch, failure

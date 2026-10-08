@@ -370,7 +370,7 @@ def test_copy_plan_key_on_miss_rejects_overlapping_compile_and_recovers(
 )
 def test_bounded_plan_cache_invalidates_each_planning_input(
     monkeypatch, component, copy_key_on_miss
-):
+) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", str(int(copy_key_on_miss)))
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", "0")
@@ -390,6 +390,8 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
         shard.addr += 16
     elif component == "session":
         shard.session = "replacement"
+        args["resolved"].session_to_agent["replacement"] = "a"
+        args["resolved"].session_to_device["replacement"] = 0
     elif component == "offset":
         shard.shard_offset = (1,)
     elif component == "shape":
@@ -407,6 +409,7 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
         source.elsize = 8
     elif component == "session_agent":
         args["resolved"].session_to_agent["a"] = "replacement"
+        args["resolved"].agent_metadata["replacement"] = b"replacement"
     elif component == "session_device":
         args["resolved"].session_to_device["a"] = 1
     elif component == "agent_metadata":
@@ -491,3 +494,19 @@ def test_supplied_complete_plan_keeps_global_coverage_gate(monkeypatch, defect):
         complete.fallback.append("w")
     with pytest.raises(IncompleteRefit):
         _bounded_batches(capture, layout, {"w": source}, 512, complete_plan=complete)
+
+
+@pytest.mark.parametrize("missing", ["session", "agent"])
+def test_compiled_plan_requires_complete_agent_metadata(monkeypatch, missing) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    args = _bounded_cache_inputs()
+    cache = _BoundedPlanCache()
+    cache.compile(**args, metrics={})
+    if missing == "session":
+        del args["resolved"].session_to_agent["a"]
+        message = "unknown source sessions"
+    else:
+        del args["resolved"].agent_metadata["a"]
+        message = "without NIXL metadata"
+    with pytest.raises(RuntimeError, match=message):
+        cache.compile(**args, metrics={})

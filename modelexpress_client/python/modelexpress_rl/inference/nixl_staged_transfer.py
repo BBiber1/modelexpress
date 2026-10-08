@@ -149,6 +149,7 @@ class _CompiledBoundedPlan:
     plan: TransferPlan
     module_batches: tuple[_BoundedBatch, ...]
     batches: tuple[_BoundedBatch, ...]
+    required_agents: frozenset[str]
     fingerprint: str | None = None
 
 
@@ -346,7 +347,18 @@ class _BoundedPlanCache:
                 digest.update(repr(key[1:]).encode())
                 fingerprint = digest.hexdigest()
                 metrics["plan_cache_fingerprint_s"] = time.perf_counter() - started
-            compiled = _CompiledBoundedPlan(plan, modules, batches, fingerprint)
+            required_agents = frozenset(
+                agent
+                for transfer_plan in (plan, *(batch.plan for batch in batches))
+                for agent in _required_agent_metadata(transfer_plan, resolved)
+            )
+            compiled = _CompiledBoundedPlan(
+                plan=plan,
+                module_batches=modules,
+                batches=batches,
+                required_agents=required_agents,
+                fingerprint=fingerprint,
+            )
             if key is not None:
                 self._entry = (key, compiled)
                 logger.info("compiled bounded physical plan %s", fingerprint)
@@ -984,9 +996,11 @@ class _NixlStagedTransfer:
         metrics["transfer_planning_s"] = time.perf_counter() - started
         started = time.perf_counter()
         self._select_workspace_mode(f"bounded:{staging_device}:{staging_buffers}")
-        required_metadata = _required_agent_metadata(compiled.plan, resolved)
-        for batch in compiled.batches:
-            required_metadata.update(_required_agent_metadata(batch.plan, resolved))
+        required_metadata = {
+            agent: metadata
+            for agent, metadata in resolved.agent_metadata.items()
+            if agent in compiled.required_agents
+        }
         transport = self._connect_sources(
             resolved, required_metadata, host_staging=staging_device == "cpu"
         )

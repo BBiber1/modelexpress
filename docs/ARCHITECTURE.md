@@ -1754,6 +1754,12 @@ arenas and descriptors, and returns deferred batch reads. Full-copy preparation
 creates independent destinations for the eager staged transfer. Both retain the
 same artifact interfaces consumed by application.
 
+A compiled bounded plan stores the immutable union of required source agents.
+Warm preparation selects current metadata from this set without traversing the
+whole plan and every batch again. Ordered manifest bytes, source mappings,
+agent metadata, capture and capacity still invalidate the plan; connected agents
+with changed metadata remain rejected. This cache owns no transport resources.
+
 Bounded transfer can reuse immutable READ addresses and sizes for the currently
 validated compiled plan. The one-entry cache checks the workspace generation and
 the identity, order and geometry of all receive arenas before every batch. It
