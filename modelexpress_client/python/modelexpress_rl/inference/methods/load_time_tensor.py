@@ -18,7 +18,6 @@ from modelexpress.refit.timing import (
 from ...train import WeightPayloadFormat
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
-    _PreparedNixlTransfer,
     _StagedNixlWeights,
 )
 from ..plan import (
@@ -44,9 +43,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
     ) -> None:
         self._transfer = transfer
         self._capture_layout = capture_layout
-        self._full_copy_plan: _PreparedNixlTransfer | None = None
-        self._full_copy_fingerprint: tuple | None = None
-        self._full_copy_manifest_digests: tuple[str, ...] = ()
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
@@ -69,39 +65,17 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             version.payload_format,
             source.physical_fingerprint,
         )
-        reusable = (
-            self._full_copy_plan is not None
-            and self._full_copy_fingerprint == fingerprint
-        )
-        set_refit_cold(not reusable)
         manifests = [item.manifest for item in source.shards]
-        manifest_digests = tuple(item.manifest_digest for item in source.shards)
-        with refit_span(
-            "transfer_planning",
-            metadata={
-                "plan_cache_hits": int(reusable),
-                "plan_cache_misses": int(not reusable),
-            },
-            accumulate_metadata=True,
-        ):
-            if not reusable:
-                self._full_copy_plan = self._transfer.prepare_full_copy(
-                    manifests=manifests,
-                    trainer_snapshot=source,
-                    capture_layout=self._capture_layout,
-                )
-                self._full_copy_fingerprint = fingerprint
-        if reusable and manifest_digests != self._full_copy_manifest_digests:
-            assert self._full_copy_plan is not None
-            with refit_span(
-                "source_preparation",
-                metadata={"manifest_refreshes": 1},
-                accumulate_metadata=True,
-                duration_key="manifest_refresh_s",
-            ):
-                self._transfer.refresh_sources(self._full_copy_plan, manifests)
-        self._full_copy_manifest_digests = manifest_digests
-        self._active_staged = self._transfer.stage(self._full_copy_plan)
+        with refit_span("transfer_planning", accumulate_metadata=True) as counters:
+            prepared = self._transfer.prepare_full_copy(
+                manifests=manifests,
+                trainer_snapshot=source,
+                capture_layout=self._capture_layout,
+                physical_fingerprint=fingerprint,
+            )
+            counters.update(prepared.metrics)
+        set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
+        self._active_staged = self._transfer.stage(prepared)
         _attribute_transfer(self._active_staged.metrics)
         return PreparedEngineTensors(staged=self._active_staged)
 
@@ -119,11 +93,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, TrainerSourceSnapshot):
             raise ValueError("bounded staging requires NIXL trainer sources")
-        # Streaming replaces the full-copy destinations, including any cached
-        # descriptors into them. Invalidate before a possibly failing switch.
-        self._full_copy_plan = None
-        self._full_copy_fingerprint = None
-        self._full_copy_manifest_digests = ()
         try:
             prepared = self._transfer.prepare_streaming(
                 manifests=[item.manifest for item in source.shards],
@@ -190,9 +159,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self.validate_close()
         self._active_streamed = None
         self._active_staged = None
-        self._full_copy_plan = None
-        self._full_copy_fingerprint = None
-        self._full_copy_manifest_digests = ()
         self._transfer.close()
 
 

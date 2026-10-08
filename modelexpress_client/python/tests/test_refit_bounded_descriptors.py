@@ -13,13 +13,13 @@ import modelexpress_rl.inference.nixl_staged_transfer as module
 import pytest
 import torch
 from modelexpress import envs
-from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
+from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,

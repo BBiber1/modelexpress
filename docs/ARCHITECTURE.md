@@ -1749,15 +1749,26 @@ structural/content digests. Version identity stays in the requested
 an owned deep copy of the existing `CaptureResult` and a separate full destination
 parameter-layout map. Recorded regions do not describe the complete destination
 layout. The capture snapshot preserves operation argument containers and does not
-alias mutable engine-capture results. These snapshots contain no leases, iterators, metrics or
-installation state.
+alias mutable engine-capture results. These snapshots contain no leases,
+iterators, metrics or installation state.
 
-The transfer has explicit `prepare_full_copy` and `prepare_streaming` entry points.
-Full-copy plan reuse belongs to the update method: a matching physical fingerprint
-skips `prepare_full_copy` entirely. Streaming plan reuse belongs to the transfer's
-`_bounded_plan_cache`; full-copy preparation clears that bounded cache. Bounded
-cache lookup, hit validation and miss compilation run in one guarded operation;
-only a successfully validated or compiled entry is retained.
+The transfer has explicit `prepare_full_copy` and `prepare_streaming` entry points
+and owns one cached pull plan for either mode. That entry contains the trainer
+snapshot with immutable resolved source metadata, the generator snapshot used by
+planning and replay, and the compiled transfer. The update method creates fresh
+version-scoped artifacts and attributes transfer metrics; it owns no physical
+plan cache. Full-copy reuse compares the physical fingerprint and refreshes
+current content digests without replanning when source geometry is unchanged.
+Bounded reuse retains its structural-key checks and coverage validation.
+
+Workspace mode changes invalidate the containing plan before source resolution.
+Connections, receive buffers, arenas and cached descriptors remain transfer-owned.
+A replacement plan is retained only after connection, allocation, registration and
+descriptor setup succeeds; preparation failure leaves no reusable entry. Each
+prepared transfer carries its own metrics and current source metadata. Both
+preparation entry points share source/layout resolution, connection setup, a
+failure guard that discards incomplete cache entries, and final plan publication.
+Full-copy destinations and bounded receive arenas keep their separate setup.
 Bounded preparation validates capacity, resolves sources, captures the engine
 layout, compiles or revalidates a plan, connects required agents, prepares receive
 arenas and descriptors, and returns deferred batch reads. Full-copy preparation
@@ -1788,8 +1799,8 @@ the wire timer on both cold and warm updates.
 
 The manifest-byte cache owns an immutable snapshot of ordinary parsed source
 and shard rows. A warm bounded-plan lookup reuses its structural key only while
-the resolved source table is the snapshot's table. All other resolved fields
-and maps keep their original schema and ownership. The snapshot contains only
+the resolved source table is the snapshot's table. Session and agent metadata maps in the trainer snapshot are immutable copies;
+their schema remains unchanged. The snapshot contains only
 host metadata; it owns no tensors, transport handles or source leases. Custom
 or mutable source rows retain the original field-by-field checks. Ordered
 manifest bytes, agent and device maps,

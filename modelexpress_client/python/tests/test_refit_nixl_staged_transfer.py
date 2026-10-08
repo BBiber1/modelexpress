@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import json
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -252,14 +253,15 @@ def _manifest(
 
 @pytest.mark.parametrize("switch_failure", [None, "initialize", "register"])
 @pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize("verify_digest", [False, True])
 def test_released_updates_switch_workspaces_without_reusing_stale_plans(
-    monkeypatch, switch_failure, warm_cache
+    monkeypatch, switch_failure, warm_cache, verify_digest
 ) -> None:
     """Switch modes with real plans and byte copies, mocking only CUDA/NIXL."""
     events = []
     source_tensor = torch.arange(4, dtype=torch.float32)
     real_empty = torch.empty
-    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify_digest)))
     for flag in (
         "MX_REFIT_CACHE_RESOLVED_SOURCES",
         "MX_REFIT_CACHE_BOUNDED_PLANS",
@@ -402,24 +404,37 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
     first_plan = None
     try:
         for index, bounded in enumerate(
-            (False, True, True, True, False, True, True, True)
+            (False, False, True, True, True, False, False, True, True, True)
         ):
             source_tensor.add_(1)
+            if verify_digest:
+                payload = json.loads(manifest)
+                payload["tensors"][0]["shards"][0]["digest"] = tensor_digest(
+                    source_tensor
+                )
+                current_manifest = json.dumps(payload).encode()
+                source = replace(
+                    source,
+                    shards=(
+                        replace(
+                            source.shards[0],
+                            manifest=current_manifest,
+                            manifest_digest=f"version-{index}",
+                        ),
+                    ),
+                )
             if bounded:
-                if index == 1 and switch_failure is not None:
+                if index == 2 and switch_failure is not None:
                     setattr(transfer._manager, f"fail_{switch_failure}", 1)
                     with pytest.raises(RuntimeError, match="failed"):
                         method.prepare_streaming(
                             version=None, source=source, max_staging_bytes=256
                         )
-                    assert method._full_copy_plan is None
                     assert not transfer._manager.registered
                 prepared = method.prepare_streaming(
                     version=None, source=source, max_staging_bytes=256
                 )
-                hit = warm_cache and (
-                    index in (3, 7) or (index == 2 and switch_failure is not None)
-                )
+                hit = warm_cache and not verify_digest and index in (3, 4, 8, 9)
                 assert prepared.metrics["plan_cache_hits"] == int(hit)
                 assert prepared.metrics["owner_plan_builds"] == int(not hit)
                 with pytest.raises(RuntimeError, match="release"):
@@ -452,9 +467,7 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                         version=None, source=source, max_staging_bytes=256
                     )
                 if first_plan is None:
-                    first_plan = method._full_copy_plan
-                else:
-                    assert method._full_copy_plan is not first_plan
+                    first_plan = transfer._active
             method.release(prepared)
         # Every switch disconnects/deregisters before registering replacement storage.
         expected_registrations = 5 if switch_failure == "register" else 4
@@ -465,8 +478,8 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
                 assert events[i + 1] == "initialize"
     finally:
         method.close()
-        assert transfer._source_cache._entry is None
-        assert transfer._bounded_plan_cache._entry is None
+        with pytest.raises(RuntimeError, match="closed"):
+            transfer.stage(first_plan)
 
 
 def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
@@ -734,8 +747,8 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     transfer._full_buffers = {}
     transfer._staging_arenas = []
     transfer._staging_registrations = []
-    transfer._source_cache = transfer_module._SourceResolutionCache()
-    transfer._bounded_plan_cache = transfer_module._BoundedPlanCache()
+    transfer._cached_pull_plan = None
+    transfer._full_copy_descriptors = None
     transfer.close()
     transfer.close()
     assert calls == ["initialize", "shutdown", "shutdown"]

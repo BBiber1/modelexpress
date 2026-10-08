@@ -19,6 +19,7 @@ import time
 import weakref
 from collections.abc import Callable, Iterator
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -84,6 +85,16 @@ class _ResolvedSources:
 
 
 @dataclass(frozen=True)
+class _CachedPullPlan:
+    trainer_source_snapshot: TrainerSourceSnapshot
+    generator_capture_snapshot: CaptureResult
+    parameter_layout: MappingProxyType
+    compiled: TransferPlan | _CompiledBoundedPlan
+    key: tuple | None
+    manifests: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
 class _PreparedNixlTransfer:
     """One immutable physical plan over reusable registered destinations."""
 
@@ -92,8 +103,7 @@ class _PreparedNixlTransfer:
     sources: dict
     descriptors: tuple[ReadDescriptor | _BoundedReadDescriptor, ...]
     transport: NixlReshardTransport
-    trainer_source_snapshot: TrainerSourceSnapshot | None = None
-    parameter_layout: MappingProxyType | None = None
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -156,9 +166,6 @@ class _CompiledBoundedPlan:
     batches: tuple[_BoundedBatch, ...]
     required_agents: frozenset[str]
     fingerprint: str | None = None
-    trainer_source_snapshot: TrainerSourceSnapshot | None = None
-    generator_capture_snapshot: CaptureResult | None = None
-    parameter_layout: MappingProxyType | None = None
 
 
 class _BoundedReadDescriptor(NamedTuple):
@@ -234,12 +241,12 @@ class _BoundedPlanCache:
         staging_buffers=1,
         total_staging_bytes=None,
         source_snapshot=None,
-        trainer_snapshot=None,
     ) -> _CompiledBoundedPlan:
-        """Compile a bounded plan over privately owned capture/layout inputs.
+        """Compile a bounded plan, copying inputs when caching is enabled.
 
-        Keep inputs stable during compilation; the guard serializes compilation,
-        not arbitrary input writers.
+        Keep capture/layout stable during compilation. Uncached plans retain
+        capture records, which must stay unchanged until transfer completes.
+        The optional guard serializes compilation, not arbitrary input writers.
         """
         copy_key_on_miss = envs.MX_REFIT_COPY_PLAN_KEY_ON_MISS
         if copy_key_on_miss and not self._compile_lock.acquire(blocking=False):
@@ -328,7 +335,9 @@ class _BoundedPlanCache:
                         "reusing bounded physical plan %s", compiled.fingerprint
                     )
                     return compiled
-            capture, parameter_layout = deepcopy((capture, parameter_layout))
+            if enabled:
+                # Plan copies/layouts must not alias the callback or key snapshots.
+                capture, parameter_layout = deepcopy((capture, parameter_layout))
             started = time.perf_counter()
             plan = _plan_staged_transfer(capture, resolved.sources)
             metrics["initial_whole_plan_s"] = time.perf_counter() - started
@@ -370,9 +379,6 @@ class _BoundedPlanCache:
                 batches=batches,
                 required_agents=required_agents,
                 fingerprint=fingerprint,
-                trainer_source_snapshot=trainer_snapshot,
-                generator_capture_snapshot=capture,
-                parameter_layout=MappingProxyType(parameter_layout),
             )
             if key is not None:
                 self._entry = (key, compiled)
@@ -806,8 +812,9 @@ class _NixlStagedTransfer:
         self._staging_registrations: list[Any] = []
         self._staging_device: torch.device | None = None
         self._workspace_mode: str | None = None
-        self._source_cache = _SourceResolutionCache()
-        self._bounded_plan_cache = _BoundedPlanCache()
+        self._cached_pull_plan: _CachedPullPlan | None = None
+        self._full_copy_descriptors: tuple[ReadDescriptor, ...] | None = None
+        self._plan_compile_lock = threading.Lock()
         self._workspace_generation = 0
         self._descriptor_cache: _BoundedDescriptors | None = None
 
@@ -866,8 +873,8 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._loaded_agent_metadata.clear()
         self._workspace_mode = None
-        self._source_cache.clear()
-        self._bounded_plan_cache.clear()
+        self._cached_pull_plan = None
+        self._full_copy_descriptors = None
 
     def _select_workspace_mode(self, mode: str) -> None:
         """Replace released staging storage only after tearing down its agent."""
@@ -887,15 +894,49 @@ class _NixlStagedTransfer:
                 raise
         self._workspace_mode = mode
 
+    def _resolve_metadata(
+        self, manifests: list[bytes], metrics: dict
+    ) -> tuple[_ResolvedSources, _SourceSnapshot | None]:
+        cache = _SourceResolutionCache()
+        previous = self._cached_pull_plan
+        if previous is not None:
+            trainer = previous.trainer_source_snapshot
+            cache._entry = (previous.manifests, trainer.resolved_metadata)
+            if trainer.resolved_structure is not None:
+                cache._snapshot = _SourceSnapshot(
+                    trainer.resolved_metadata.sources, trainer.resolved_structure
+                )
+        resolved = cache.resolve(
+            manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
+        )
+        # Freeze source rows even when the manifest-byte cache is disabled.
+        frozen = cache._snapshot or _freeze_sources(resolved.sources)
+        if frozen is not None:
+            resolved = replace(resolved, sources=frozen.sources)
+        resolved = replace(
+            resolved,
+            session_to_agent=MappingProxyType(dict(resolved.session_to_agent)),
+            session_to_device=MappingProxyType(dict(resolved.session_to_device)),
+            session_to_memory=MappingProxyType(dict(resolved.session_to_memory)),
+            agent_metadata=MappingProxyType(dict(resolved.agent_metadata)),
+        )
+        return resolved, frozen
+
     def _resolve_layout(
         self,
         manifests: list[bytes],
         capture_layout: _CaptureLayout,
         metrics: dict[str, float],
-    ) -> tuple[_ResolvedSources, CaptureResult, _StagingLayout]:
+        trainer_snapshot: TrainerSourceSnapshot | None,
+    ) -> tuple[
+        TrainerSourceSnapshot, CaptureResult, _StagingLayout, _SourceSnapshot | None
+    ]:
         started = time.perf_counter()
-        resolved = self._source_cache.resolve(
-            manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
+        resolved, frozen = self._resolve_metadata(manifests, metrics)
+        trainer = replace(
+            trainer_snapshot or TrainerSourceSnapshot(None, None, ()),
+            resolved_metadata=resolved,
+            resolved_structure=frozen.structure if frozen is not None else None,
         )
         manifest = [
             (name, source.dtype, tuple(source.global_shape))
@@ -904,8 +945,9 @@ class _NixlStagedTransfer:
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
         capture, parameter_layout = capture_layout(manifest)
+        capture, parameter_layout = deepcopy((capture, parameter_layout))
         metrics["layout_capture_s"] = time.perf_counter() - started
-        return resolved, capture, parameter_layout
+        return trainer, capture, parameter_layout, frozen
 
     def _connect_sources(
         self,
@@ -938,50 +980,116 @@ class _NixlStagedTransfer:
             session_to_memory=resolved.session_to_memory,
         )
 
+    @contextmanager
+    def _preparing(self) -> Iterator[None]:
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        try:
+            yield
+        except Exception:
+            self._cached_pull_plan = None
+            self._full_copy_descriptors = None
+            raise
+
+    def _publish_prepared(
+        self,
+        cached: _CachedPullPlan,
+        prepared: _PreparedNixlTransfer | _PreparedBoundedTransfer,
+    ) -> None:
+        self._cached_pull_plan = cached
+        self._active = prepared
+
     def prepare_full_copy(
         self,
         *,
         manifests: list[bytes],
         capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot | None = None,
+        physical_fingerprint: tuple | None = None,
     ) -> _PreparedNixlTransfer:
-        """Prepare destinations for a complete independent staged copy."""
-        self._descriptor_cache = None
-        if self._closed:
-            raise RuntimeError("NIXL staged transfer is closed")
-        metrics = {}
-        resolved, capture, parameter_layout = self._resolve_layout(
-            manifests, capture_layout, metrics
-        )
-        capture, parameter_layout = deepcopy((capture, parameter_layout))
-        started = time.perf_counter()
-        self._bounded_plan_cache.clear()
-        plan = _plan_staged_transfer(capture, resolved.sources)
-        metrics["initial_whole_plan_s"] = time.perf_counter() - started
-        validation_started = time.perf_counter()
-        self._validate_complete(capture, parameter_layout, plan)
-        metrics["initial_whole_validation_s"] = time.perf_counter() - validation_started
-        metrics["transfer_planning_s"] = time.perf_counter() - started
-        self._select_workspace_mode("full")
-        transport = self._connect_sources(
-            resolved, _required_agent_metadata(plan, resolved)
-        )
-        self._ensure_workspace(plan, parameter_layout)
-        prepared = _PreparedNixlTransfer(
-            plan=plan,
-            capture=capture,
-            sources={
-                copy.src_name: resolved.sources[copy.src_name]
-                for copy in capture.copies
-                if copy.src_name in resolved.sources
-            },
-            descriptors=tuple(self._descriptors(plan)),
-            transport=transport,
-            trainer_source_snapshot=trainer_snapshot,
-            parameter_layout=MappingProxyType(parameter_layout),
-        )
-        self._active = prepared
-        return prepared
+        """Create a version-scoped transfer over one reusable full-copy plan."""
+        with self._preparing():
+            self._descriptor_cache = None
+            self._select_workspace_mode("full")
+            previous, self._cached_pull_plan = self._cached_pull_plan, None
+            reusable = (
+                previous is not None
+                and isinstance(previous.compiled, TransferPlan)
+                and physical_fingerprint is not None
+                and previous.key == physical_fingerprint
+            )
+            metrics = {
+                "plan_cache_hits": int(reusable),
+                "plan_cache_misses": int(not reusable),
+            }
+            if reusable:
+                trainer = previous.trainer_source_snapshot
+                capture = previous.generator_capture_snapshot
+                parameter_layout = previous.parameter_layout
+                plan = previous.compiled
+                if tuple(manifests) != previous.manifests:
+                    self._cached_pull_plan = previous
+                    resolved, frozen = self._resolve_metadata(manifests, metrics)
+                    self._cached_pull_plan = None
+                    old = trainer.resolved_metadata
+                    if set(resolved.sources) != set(old.sources) or any(
+                        _source_structure(source)
+                        != _source_structure(old.sources[name])
+                        for name, source in resolved.sources.items()
+                    ):
+                        raise RuntimeError(
+                            "source geometry changed while reusing transfer plan"
+                        )
+                    trainer = replace(
+                        trainer_snapshot or trainer,
+                        resolved_metadata=resolved,
+                        resolved_structure=(
+                            frozen.structure if frozen is not None else None
+                        ),
+                    )
+                    metrics["manifest_refreshes"] = 1
+            else:
+                trainer, capture, parameter_layout, _ = self._resolve_layout(
+                    manifests, capture_layout, metrics, trainer_snapshot
+                )
+                started = time.perf_counter()
+                plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
+                metrics["initial_whole_plan_s"] = time.perf_counter() - started
+                validation_started = time.perf_counter()
+                self._validate_complete(capture, dict(parameter_layout), plan)
+                metrics["initial_whole_validation_s"] = (
+                    time.perf_counter() - validation_started
+                )
+                metrics["transfer_planning_s"] = time.perf_counter() - started
+            resolved = trainer.resolved_metadata
+            transport = self._connect_sources(
+                resolved, _required_agent_metadata(plan, resolved)
+            )
+            self._ensure_workspace(plan, parameter_layout)
+            if not reusable or self._full_copy_descriptors is None:
+                self._full_copy_descriptors = tuple(self._descriptors(plan))
+            prepared = _PreparedNixlTransfer(
+                plan=plan,
+                capture=capture,
+                sources={
+                    copy.src_name: resolved.sources[copy.src_name]
+                    for copy in capture.copies
+                    if copy.src_name in resolved.sources
+                },
+                descriptors=self._full_copy_descriptors,
+                transport=transport,
+                metrics=metrics,
+            )
+            cached = _CachedPullPlan(
+                trainer,
+                capture,
+                MappingProxyType(parameter_layout),
+                plan,
+                physical_fingerprint,
+                tuple(manifests),
+            )
+            self._publish_prepared(cached, prepared)
+            return prepared
 
     def prepare_streaming(
         self,
@@ -993,54 +1101,74 @@ class _NixlStagedTransfer:
         staging_buffers: int = 1,
         trainer_snapshot: TrainerSourceSnapshot | None = None,
     ) -> _PreparedBoundedTransfer:
-        """Reserve bounded receive storage and return deferred batch reads."""
-        previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
-        buffer_budget = self._validate_streaming_settings(
-            max_staging_bytes, staging_device, staging_buffers
-        )
-        metrics = {}
-        resolved, capture, parameter_layout = self._resolve_layout(
-            manifests, capture_layout, metrics
-        )
-        started = time.perf_counter()
-        compiled = self._bounded_plan_cache.compile(
-            manifests=manifests,
-            resolved=resolved,
-            capture=capture,
-            parameter_layout=parameter_layout,
-            max_staging_bytes=buffer_budget,
-            enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-            metrics=metrics,
-            staging_device=staging_device,
-            staging_buffers=staging_buffers,
-            total_staging_bytes=max_staging_bytes,
-            source_snapshot=self._source_cache._snapshot,
-            trainer_snapshot=trainer_snapshot,
-        )
-        metrics["transfer_planning_s"] = time.perf_counter() - started
-        started = time.perf_counter()
-        self._select_workspace_mode(f"bounded:{staging_device}:{staging_buffers}")
-        required_metadata = {
-            agent: metadata
-            for agent, metadata in resolved.agent_metadata.items()
-            if agent in compiled.required_agents
-        }
-        transport = self._connect_sources(
-            resolved, required_metadata, host_staging=staging_device == "cpu"
-        )
-        self._prepare_arenas(
-            compiled.batches, buffer_budget, staging_device, staging_buffers
-        )
-        metrics["connection_registration_s"] = time.perf_counter() - started
-        descriptors = self._prepare_bounded_descriptors(
-            compiled, previous_descriptors, enabled=bool(metrics["plan_cache_enabled"])
-        )
-        prepared = _PreparedBoundedTransfer(
-            compiled.batches, resolved.sources, transport, metrics
-        )
-        self._active = prepared
-        self._descriptor_cache = descriptors
-        return prepared
+        """Create fresh deferred reads over one reusable bounded pull plan."""
+        with self._preparing():
+            previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
+            buffer_budget = self._validate_streaming_settings(
+                max_staging_bytes, staging_device, staging_buffers
+            )
+            self._select_workspace_mode(f"bounded:{staging_device}:{staging_buffers}")
+            previous = self._cached_pull_plan
+            metrics = {}
+            trainer, capture, parameter_layout, frozen = self._resolve_layout(
+                manifests, capture_layout, metrics, trainer_snapshot
+            )
+            compiler = _BoundedPlanCache()
+            compiler._compile_lock = self._plan_compile_lock
+            if previous is not None and isinstance(
+                previous.compiled, _CompiledBoundedPlan
+            ):
+                compiler._entry = (previous.key, previous.compiled)
+            self._cached_pull_plan = None
+            started = time.perf_counter()
+            compiled = compiler.compile(
+                manifests=manifests,
+                resolved=trainer.resolved_metadata,
+                capture=capture,
+                parameter_layout=dict(parameter_layout),
+                max_staging_bytes=buffer_budget,
+                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
+                metrics=metrics,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
+                total_staging_bytes=max_staging_bytes,
+                source_snapshot=frozen,
+            )
+            metrics["transfer_planning_s"] = time.perf_counter() - started
+            started = time.perf_counter()
+            resolved = trainer.resolved_metadata
+            required_metadata = {
+                agent: metadata
+                for agent, metadata in resolved.agent_metadata.items()
+                if agent in compiled.required_agents
+            }
+            transport = self._connect_sources(
+                resolved, required_metadata, host_staging=staging_device == "cpu"
+            )
+            self._prepare_arenas(
+                compiled.batches, buffer_budget, staging_device, staging_buffers
+            )
+            metrics["connection_registration_s"] = time.perf_counter() - started
+            descriptors = self._prepare_bounded_descriptors(
+                compiled,
+                previous_descriptors,
+                enabled=bool(metrics["plan_cache_enabled"]),
+            )
+            prepared = _PreparedBoundedTransfer(
+                compiled.batches, resolved.sources, transport, metrics
+            )
+            key = compiler._entry[0] if compiler._entry is not None else None
+            cached = _CachedPullPlan(
+                trainer,
+                capture,
+                MappingProxyType(parameter_layout),
+                compiled,
+                key,
+                tuple(manifests),
+            )
+            self._publish_prepared(cached, prepared)
+            self._descriptor_cache = descriptors
+            return prepared
 
     def _validate_streaming_settings(
         self, max_staging_bytes: int, staging_device: str, staging_buffers: int
@@ -1283,31 +1411,6 @@ class _NixlStagedTransfer:
                             "generator engine"
                         ) from error
             self._active = prepared
-
-    def refresh_sources(
-        self, prepared: _PreparedNixlTransfer, manifests: list[bytes]
-    ) -> None:
-        """Refresh version-specific source digests without rebuilding the plan."""
-        if prepared is not self._active:
-            raise RuntimeError("NIXL transfer plan is no longer active")
-        metrics = {}
-        resolved = self._source_cache.resolve(
-            manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
-        )
-        used_sources = {
-            copy.src_name: resolved.sources[copy.src_name]
-            for copy in prepared.capture.copies
-            if copy.src_name in resolved.sources
-        }
-        if set(used_sources) != set(prepared.sources):
-            raise RuntimeError("source tensor set changed while reusing transfer plan")
-        if any(
-            _source_structure(source) != _source_structure(prepared.sources[name])
-            for name, source in used_sources.items()
-        ):
-            raise RuntimeError("source geometry changed while reusing transfer plan")
-        prepared.sources.clear()
-        prepared.sources.update(used_sources)
 
     @staticmethod
     def _validate_complete(
@@ -1716,8 +1819,8 @@ class _NixlStagedTransfer:
         if self._closed:
             return
         self._invalidate_descriptors()
-        self._source_cache.clear()
-        self._bounded_plan_cache.clear()
+        self._cached_pull_plan = None
+        self._full_copy_descriptors = None
         self._closed = True
         if self._owns_manager:
             self._release_staging_registrations()

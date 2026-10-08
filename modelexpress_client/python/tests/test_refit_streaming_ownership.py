@@ -168,16 +168,10 @@ def test_foreign_or_released_stream_cannot_enter_or_release_active_source(monkey
 
 def test_failed_unread_preparation_resets_workspace_and_allows_retry(monkeypatch) -> None:
     method, source, events, _ = setup_method(monkeypatch)
-    method._full_copy_plan = object()
-    method._full_copy_fingerprint = ("old",)
-    method._full_copy_manifest_digests = ("old",)
     method._transfer.fail_prepare = True
     with pytest.raises(RuntimeError, match="preparation failed"):
         prepare(method, source)
     assert method._active_streamed is None
-    assert method._full_copy_plan is None
-    assert method._full_copy_fingerprint is None
-    assert method._full_copy_manifest_digests == ()
     assert [name for name, _ in events] == ["prepare", "reset"]
     method._transfer.fail_prepare = False
     prepared = prepare(method, source)

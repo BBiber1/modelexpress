@@ -20,6 +20,7 @@ from ..train import WeightPayloadFormat
 from .adapter import TrainerSourceShard
 
 if TYPE_CHECKING:
+    from .nixl_staged_transfer import _ResolvedSources
     from .receiver import PreparedCheckpoint
 
 
@@ -83,6 +84,10 @@ class TrainerSourceSnapshot:
     mesh_id: str | None
     mesh_generation: int | None
     shards: tuple[TrainerSourceShard, ...]
+    resolved_metadata: _ResolvedSources | None = field(
+        default=None, compare=False, repr=False
+    )
+    resolved_structure: tuple | None = field(default=None, compare=False, repr=False)
     kind = WeightSource.TRAINER
     payload_format = WeightPayloadFormat.FULL_TENSOR
 
