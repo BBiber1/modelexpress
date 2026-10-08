@@ -45,9 +45,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
     ) -> None:
         self._transfer = transfer
         self._capture_layout = capture_layout
-        self._active_plan: _PreparedNixlTransfer | None = None
-        self._active_fingerprint: tuple | None = None
-        self._active_manifest_digests: tuple[str, ...] = ()
+        self._full_copy_plan: _PreparedNixlTransfer | None = None
+        self._full_copy_fingerprint: tuple | None = None
+        self._full_copy_manifest_digests: tuple[str, ...] = ()
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
@@ -72,8 +72,8 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         ):
             raise ValueError("load-time tensor method requires NIXL sources")
         reusable = (
-            self._active_plan is not None
-            and self._active_fingerprint == inputs.physical_fingerprint
+            self._full_copy_plan is not None
+            and self._full_copy_fingerprint == inputs.physical_fingerprint
         )
         set_refit_cold(not reusable)
         manifests = [item.transport.manifest for item in inputs.sources]
@@ -87,22 +87,22 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             accumulate_metadata=True,
         ):
             if not reusable:
-                self._active_plan = self._transfer.prepare(
+                self._full_copy_plan = self._transfer.prepare_full_copy(
                     manifests=manifests,
                     capture_layout=self._capture_layout,
                 )
-                self._active_fingerprint = inputs.physical_fingerprint
-        if reusable and manifest_digests != self._active_manifest_digests:
-            assert self._active_plan is not None
+                self._full_copy_fingerprint = inputs.physical_fingerprint
+        if reusable and manifest_digests != self._full_copy_manifest_digests:
+            assert self._full_copy_plan is not None
             with refit_span(
                 "source_preparation",
                 metadata={"manifest_refreshes": 1},
                 accumulate_metadata=True,
                 duration_key="manifest_refresh_s",
             ):
-                self._transfer.refresh_sources(self._active_plan, manifests)
-        self._active_manifest_digests = manifest_digests
-        self._active_staged = self._transfer.stage(self._active_plan)
+                self._transfer.refresh_sources(self._full_copy_plan, manifests)
+        self._full_copy_manifest_digests = manifest_digests
+        self._active_staged = self._transfer.stage(self._full_copy_plan)
         _attribute_transfer(self._active_staged.metrics)
         return PreparedEngineTensors(staged=self._active_staged)
 
@@ -126,11 +126,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise ValueError("bounded staging requires NIXL trainer sources")
         # Streaming replaces the full-copy destinations, including any cached
         # descriptors into them. Invalidate before a possibly failing switch.
-        self._active_plan = None
-        self._active_fingerprint = None
-        self._active_manifest_digests = ()
+        self._full_copy_plan = None
+        self._full_copy_fingerprint = None
+        self._full_copy_manifest_digests = ()
         try:
-            prepared = self._transfer.prepare(
+            prepared = self._transfer.prepare_streaming(
                 manifests=[item.transport.manifest for item in source.inputs.sources],
                 capture_layout=self._capture_layout,
                 max_staging_bytes=max_staging_bytes,
@@ -194,9 +194,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self.validate_close()
         self._active_streamed = None
         self._active_staged = None
-        self._active_plan = None
-        self._active_fingerprint = None
-        self._active_manifest_digests = ()
+        self._full_copy_plan = None
+        self._full_copy_fingerprint = None
+        self._full_copy_manifest_digests = ()
         self._transfer.close()
 
 

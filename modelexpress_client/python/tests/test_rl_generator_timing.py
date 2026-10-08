@@ -122,7 +122,7 @@ def test_reusing_a_transfer_plan_is_marked_warm(monkeypatch):
     assert recorder.as_dict()["cold_warm"] == "warm"
 
 
-def test_version_digest_refreshes_verification_without_replanning():
+def test_version_digest_refreshes_verification_without_replanning() -> None:
     class Transfer:
         def __init__(self):
             self.prepare_calls = 0
@@ -131,7 +131,7 @@ def test_version_digest_refreshes_verification_without_replanning():
         def unpublish_peer(self):
             pass
 
-        def prepare(self, **_kwargs):
+        def prepare_full_copy(self, **_kwargs) -> object:
             self.prepare_calls += 1
             return object()
 

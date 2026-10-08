@@ -4,8 +4,10 @@
 import ctypes
 import gc
 import weakref
+from collections.abc import Iterator
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import modelexpress_rl.inference.nixl_staged_transfer as module
 import pytest
@@ -24,7 +26,7 @@ from modelexpress.refit.reshard.types import (
 
 
 @pytest.fixture
-def harness(monkeypatch):
+def harness(monkeypatch) -> Iterator[SimpleNamespace]:
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
@@ -154,8 +156,8 @@ def harness(monkeypatch):
         captures.append(manifest)
         return capture, layout
 
-    def prepare(**kwargs):
-        return transfer.prepare(
+    def prepare(**kwargs) -> module._PreparedBoundedTransfer:
+        return transfer.prepare_streaming(
             manifests=manifests(),
             capture_layout=capture_layout,
             **{"max_staging_bytes": 1024, "staging_device": "cpu", **kwargs},
@@ -406,3 +408,33 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     assert now[0] == 400
     assert cold["wire_s"] == warm["wire_s"] == 0
     assert warm["descriptor_builds"] == 0
+
+
+@pytest.mark.parametrize("failure", ["allocation", "registration", "descriptors"])
+def test_partial_receive_setup_can_be_reset_and_prepared_again(
+    harness, monkeypatch, failure
+) -> None:
+    transfer = harness.transfer
+    target, name = {
+        "allocation": (transfer, "_allocate_arena"),
+        "registration": (transfer._manager, "register_dram_buffer"),
+        "descriptors": (transfer, "_prepare_bounded_descriptors"),
+    }[failure]
+    original = getattr(target, name)
+    attempts = 0
+
+    def fail(*args, **kwargs) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if failure == "descriptors" or attempts == 2:
+            raise RuntimeError("injected setup failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, fail)
+    with pytest.raises(RuntimeError, match="injected setup failure"):
+        harness.prepare(staging_buffers=2)
+    transfer.reset_workspace()
+    assert transfer._manager.registered == {}
+    monkeypatch.setattr(target, name, original)
+    _, installed = harness.collect(harness.prepare(staging_buffers=2))
+    _check_values(harness, installed)

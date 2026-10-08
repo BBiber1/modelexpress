@@ -136,7 +136,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             mesh=refit_pb2.TrainerMesh(
                 mesh_id="mesh-a",
                 model_name="test/model",
-                generation=1 if self.mesh_calls == 1 else self.mesh_generation_on_recheck,
+                generation=1
+                if self.mesh_calls == 1
+                else self.mesh_generation_on_recheck,
                 workers={
                     shard.worker_id: refit_pb2.TrainerTensorsMetadata(
                         logical_shard_id=shard.logical_shard_id,
@@ -789,7 +791,9 @@ def test_generator_discovers_mesh_backed_version(monkeypatch):
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         assert service.mesh_calls == 2
         assert service.list_calls == 1
-        assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
+        assert [
+            source.source_slot_id for source in adapter.create_calls[0].sources
+        ] == [
             "rank:0",
             "rank:1",
         ]
@@ -1785,7 +1789,7 @@ def _stage_and_apply(generator, *, version):
 )
 def test_streaming_client_holds_lease_and_fences_partial_install(
     monkeypatch, fail_second, prepare_failures, prepare_error, reset_failure
-):
+) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     generator = _initialize(
@@ -1805,7 +1809,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             if reset_failure:
                 raise RuntimeError("cleanup failure")
 
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             assert kwargs["max_staging_bytes"] == 512
             assert kwargs["staging_device"] == "cuda"
             assert kwargs["staging_buffers"] == 1
@@ -2368,7 +2372,7 @@ def test_streaming_rejects_invalid_staging_options_before_leasing(kwargs, match)
 @pytest.mark.parametrize("buffer_bytes,count", [(512, 1), (1024, 2)])
 def test_streaming_forwards_staging_options_to_the_method(
     monkeypatch, buffer_bytes, count
-):
+) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     generator = _initialize(
@@ -2383,7 +2387,7 @@ def test_streaming_forwards_staging_options_to_the_method(
     prepare_calls = []
 
     class Transfer:
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             prepare_calls.append(kwargs)
             return SimpleNamespace(
                 metrics={},
@@ -2438,7 +2442,7 @@ def test_streaming_forwards_staging_options_to_the_method(
 )
 def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
-):
+) -> None:
     import torch
     from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
@@ -2491,7 +2495,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         def __init__(self):
             self.arena = arena
 
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             assert not guard_active
             events.append("prepare")
@@ -2665,7 +2669,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 @pytest.mark.parametrize("prepare_fails", [False, True])
 def test_streaming_creates_and_emits_one_timing_cycle(
     monkeypatch, caplog, prepare_fails
-):
+) -> None:
     import json
 
     from modelexpress.refit.timing import (
@@ -2691,7 +2695,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
         observed.append(recorder)
 
     class Transfer:
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             observe_cycle()
             with refit_span("transfer_planning"):
                 if prepare_fails:

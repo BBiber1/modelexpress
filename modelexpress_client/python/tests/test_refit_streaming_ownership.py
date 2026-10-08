@@ -11,11 +11,12 @@ from modelexpress_rl.inference.adapter import (
     GeneratorTransferInputs,
     NixlGeneratorSource,
 )
+from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.plan import PreparedStreamingTensors, TrainerUpdateSource
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def setup_method(monkeypatch):
+def setup_method(monkeypatch) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerUpdateSource, list, torch.Tensor]:
     events = []
     arena = torch.ones(2, 2)
 
@@ -25,7 +26,7 @@ def setup_method(monkeypatch):
         def __init__(self, **kwargs):
             self.arena = arena
 
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             events.append(("prepare", kwargs))
             if self.fail_prepare:
                 raise RuntimeError("preparation failed")
@@ -166,18 +167,18 @@ def test_foreign_or_released_stream_cannot_enter_or_release_active_source(monkey
     assert method._transfer.arena is None
 
 
-def test_failed_unread_preparation_resets_workspace_and_allows_retry(monkeypatch):
+def test_failed_unread_preparation_resets_workspace_and_allows_retry(monkeypatch) -> None:
     method, source, events, _ = setup_method(monkeypatch)
-    method._active_plan = object()
-    method._active_fingerprint = ("old",)
-    method._active_manifest_digests = ("old",)
+    method._full_copy_plan = object()
+    method._full_copy_fingerprint = ("old",)
+    method._full_copy_manifest_digests = ("old",)
     method._transfer.fail_prepare = True
     with pytest.raises(RuntimeError, match="preparation failed"):
         prepare(method, source)
     assert method._active_streamed is None
-    assert method._active_plan is None
-    assert method._active_fingerprint is None
-    assert method._active_manifest_digests == ()
+    assert method._full_copy_plan is None
+    assert method._full_copy_fingerprint is None
+    assert method._full_copy_manifest_digests == ()
     assert [name for name, _ in events] == ["prepare", "reset"]
     method._transfer.fail_prepare = False
     prepared = prepare(method, source)

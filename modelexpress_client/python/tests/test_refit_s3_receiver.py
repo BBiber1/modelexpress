@@ -1975,7 +1975,7 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
 @pytest.mark.parametrize("aliased_manifest_ids", [False, True])
 def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids, startup_seed
-):
+) -> None:
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
     objects = _full_artifact(tensors[0], version_label=0)
     inputs = [_full_inputs(version="base-a", version_label=0)]
@@ -2042,9 +2042,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
-    generator._staging_buffer_bytes = None
-    generator._staging_buffers_count = 1
-    generator._staging_device = "cuda"
+    generator._streaming = None
     monkeypatch.setattr(
         generator,
         "_fetch_ready_version",

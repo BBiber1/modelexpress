@@ -1732,6 +1732,28 @@ therefore not a total GPU-memory bound. Two arenas can overlap the next READ wit
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
+Staging follows four ownership boundaries: the client validates the exact version
+and manages the active handle; the session selects sources and protects revision
+leases; the update method creates an installable artifact; the transfer owns
+physical plans, connections and reusable receive storage. The client constructs
+immutable streaming settings during initialization. Its `stage_weight` validates
+the requested version and calls the session's single `stage` entry point, which
+selects bounded trainer streaming or the configured ordinary source order.
+Object-storage replay resolves and validates its chain before preparation, and
+generator-peer staging reserves a read lease without writing live weights.
+
+The transfer has explicit `prepare_full_copy` and `prepare_streaming` entry points.
+Full-copy plan reuse belongs to the update method: a matching physical fingerprint
+skips `prepare_full_copy` entirely. Streaming plan reuse belongs to the transfer's
+`_bounded_plan_cache`; full-copy preparation clears that bounded cache. Bounded
+cache lookup, hit validation and miss compilation run in one guarded operation;
+only a successfully validated or compiled entry is retained.
+Bounded preparation validates capacity, resolves sources, captures the engine
+layout, compiles or revalidates a plan, connects required agents, prepares receive
+arenas and descriptors, and returns deferred batch reads. Full-copy preparation
+creates independent destinations for the eager staged transfer. Both retain the
+same artifact interfaces consumed by application.
+
 Bounded transfer can reuse immutable READ addresses and sizes for the currently
 validated compiled plan. The one-entry cache checks the workspace generation and
 the identity, order and geometry of all receive arenas before every batch. It
