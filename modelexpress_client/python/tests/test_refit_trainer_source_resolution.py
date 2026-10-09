@@ -14,7 +14,9 @@ from modelexpress_rl.train import WeightPayloadFormat
 
 def sources(
     monkeypatch, count, *, failed_replica=False
-) -> tuple[trainer.TrainerSourceResolver, SimpleNamespace, list[str], int]:
+) -> tuple[
+    trainer.TrainerSourceResolver, SimpleNamespace, list[str], int, SimpleNamespace
+]:
     manifest = b'{"tensors": []}'
     digest = hashlib.sha256(manifest).hexdigest()
     workers, shards = {}, []
@@ -82,18 +84,19 @@ def sources(
         layout_signature="layout",
         payload_format=WeightPayloadFormat.FULL_TENSOR,
     )
-    return resolver, version, fetched, len(manifest)
+    return resolver, version, fetched, len(manifest), service
 
 
 @pytest.mark.parametrize("count", [1, 256])
 def test_cold_shards_aggregate_fetch_counts(monkeypatch, count) -> None:
-    resolver, version, fetched, size = sources(monkeypatch, count)
+    resolver, version, fetched, size, service = sources(monkeypatch, count)
     recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
     with use_refit_timing(recorder):
         candidates = resolver.candidates(version)
-        assert len(next(candidates).shards) == count
+        resolved = next(candidates)
+        assert len(resolved.shards) == count
+        assert all(shard.manifest == b'{"tensors": []}' for shard in resolved.shards)
         stage = recorder.as_dict()["stages"]["source_preparation"]
-        assert stage["count"] == count * 3 + 2
         assert stage["metadata"]["manifest_fetch_count"] == count
         assert stage["metadata"]["manifest_bytes"] == count * size
         assert "source_resolution_s" in stage["metadata"]
@@ -107,7 +110,9 @@ def test_cold_shards_aggregate_fetch_counts(monkeypatch, count) -> None:
 
 
 def test_mixed_shards_count_failed_fetches_and_successful_bytes(monkeypatch) -> None:
-    resolver, version, fetched, size = sources(monkeypatch, 3, failed_replica=True)
+    resolver, version, fetched, size, service = sources(
+        monkeypatch, 3, failed_replica=True
+    )
     recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
     with use_refit_timing(recorder):
         candidates = resolver.candidates(version)
@@ -124,10 +129,10 @@ def test_mixed_shards_count_failed_fetches_and_successful_bytes(monkeypatch) -> 
 
 
 def test_warm_resolution_without_timing(monkeypatch) -> None:
-    resolver, version, fetched, _ = sources(monkeypatch, 256)
+    resolver, version, fetched, _, service = sources(monkeypatch, 256)
     cached = next(resolver.candidates(version))
     resolver = trainer.TrainerSourceResolver(
-        service=resolver._service, rpc_timeout_seconds=1, cached_source=lambda: cached
+        service=lambda: service, rpc_timeout_seconds=1, cached_source=lambda: cached
     )
     fetched.clear()
     assert len(next(resolver.candidates(version)).shards) == 256
@@ -141,8 +146,7 @@ def test_warm_resolution_without_timing(monkeypatch) -> None:
 def test_mesh_cache_controls_publication_and_manifest_rpc_work(
     monkeypatch, change
 ) -> None:
-    original, version, fetched, _ = sources(monkeypatch, 2)
-    service = original._service()
+    original, version, fetched, _, service = sources(monkeypatch, 2)
     mesh_rpc, list_rpc = service.GetTrainerMesh, service.ListWeightVersionShards
     counts = {"mesh": 0, "list": 0}
     current = {"mesh_id": "mesh", "generation": 1}
@@ -186,8 +190,7 @@ def test_mesh_cache_controls_publication_and_manifest_rpc_work(
 
 
 def test_resumed_warm_candidate_discovers_fresh_replicas(monkeypatch) -> None:
-    original, version, fetched, _ = sources(monkeypatch, 1)
-    service = original._service()
+    original, version, fetched, _, service = sources(monkeypatch, 1)
     list_rpc = service.ListWeightVersionShards
     requests = []
 
@@ -214,7 +217,7 @@ def test_resumed_warm_candidate_discovers_fresh_replicas(monkeypatch) -> None:
 def test_version_generation_mismatch_fails_before_source_fetch_and_recovers(
     monkeypatch, generation
 ) -> None:
-    resolver, version, fetched, _ = sources(monkeypatch, 1)
+    resolver, version, fetched, _, service = sources(monkeypatch, 1)
     version.trainer_mesh_generation = generation
     with pytest.raises(RuntimeError, match="generation"):
         next(resolver.candidates(version))

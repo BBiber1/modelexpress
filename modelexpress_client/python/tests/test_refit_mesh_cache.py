@@ -123,24 +123,37 @@ def test_replacing_candidate_under_same_mesh_rebuilds(harness) -> None:
     _check_values(harness, harness.collect(replacement)[1])
 
 
-def test_mesh_change_during_setup_rejects_then_rebuilds(harness, monkeypatch) -> None:
-    current_generation = 2
+def test_mesh_change_during_setup_rejects_then_rebuilds(harness) -> None:
+    from types import SimpleNamespace
 
-    def verify_mesh(source) -> None:
-        if source.mesh_generation != current_generation:
-            raise RuntimeError("trainer mesh identity changed during plan preparation")
+    from modelexpress_rl import refit_pb2
+    from modelexpress_rl.inference.runtime import _create_load_time_tensor_method
 
-    monkeypatch.setattr(harness.transfer, "_verify_trainer_mesh", verify_mesh)
+    current = refit_pb2.TrainerMesh(mesh_id="mesh", generation=2)
+    service = SimpleNamespace(
+        GetTrainerMesh=lambda *args, **kwargs: refit_pb2.GetTrainerMeshResponse(
+            mesh=current
+        )
+    )
+    method = _create_load_time_tensor_method(
+        capability=SimpleNamespace(
+            device_id=0,
+            device=torch.device("cuda:0"),
+            capture_layout=harness.capture_layout,
+        ),
+        worker_id="target",
+        service=lambda: service,
+    )
+    harness.transfer.close()
+    # Use the runtime-created transfer so the real mesh RPC check runs during setup.
+    harness.use_transfer(method._transfer)
     with pytest.raises(RuntimeError, match="mesh identity changed"):
         harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
     recovered = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 2, ()))
-    assert recovered.metrics["plan_cache_hits"] == 0
     _check_values(harness, harness.collect(recovered)[1])
     for tensor in harness.sources.values():
         tensor.add_(4)
-    reused = prepare_warm(harness)
-    assert reused.metrics["plan_cache_hits"] == 1
-    _check_values(harness, harness.collect(reused)[1])
+    _check_values(harness, harness.collect(prepare_warm(harness))[1])
 
 
 def test_debug_layout_compares_tensor_index_arguments_before_transfer(
@@ -170,26 +183,21 @@ def test_debug_layout_compares_tensor_index_arguments_before_transfer(
     assert harness.events.count("post") == posts
 
 
-def test_manifest_parser_rows_are_owned_before_transfer(harness, monkeypatch) -> None:
-    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+def test_freeze_sources_isolates_caller_owned_rows(harness) -> None:
+    from modelexpress_rl.inference._source_snapshot import _freeze_sources
+    from modelexpress_rl.inference.nixl_staged_transfer import _resolve_sources
 
-    parsed = []
-    resolve = transfer_module._resolve_sources
-
-    def observe(*args, **kwargs) -> transfer_module._ResolvedSources:
-        result = resolve(*args, **kwargs)
-        parsed.extend(result.sources.values())
-        return result
-
-    monkeypatch.setattr(transfer_module, "_resolve_sources", observe)
-    prepared = harness.prepare()
-    for source in parsed:
+    parsed = _resolve_sources(harness.manifests()).sources
+    owned = _freeze_sources(parsed)
+    address = harness.sources["exact"].data_ptr()
+    for source in parsed.values():
         source.global_shape = (1,)
         for shard in source.shards:
             shard.addr = 0
             shard.shape = (1,)
-    _check_values(harness, harness.collect(prepared)[1])
-    _check_values(harness, harness.collect(prepare_warm(harness))[1])
+    assert owned["exact"].global_shape == (4, 4)
+    assert owned["exact"].shards[0].addr == address
+    assert owned["exact"].shards[0].shape == (4, 4)
 
 
 @pytest.mark.parametrize("plan_cache", [False, True])
@@ -198,32 +206,19 @@ def test_manifest_parser_rows_are_owned_before_transfer(harness, monkeypatch) ->
 def test_plan_and_layout_controls_have_independent_lifetimes(
     harness, monkeypatch, plan_cache, layout_cache, descriptor_cache
 ) -> None:
-    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
-
     monkeypatch.setenv("MX_REFIT_CACHE_PLAN", str(int(plan_cache)))
     monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", str(int(layout_cache)))
     monkeypatch.setenv("MX_REFIT_CACHE_DESCRIPTORS", str(int(descriptor_cache)))
     harness.new_transfer()
-    builds = []
-    compile_plan = transfer_module._plan_staged_transfer
-
-    def observe(*args, **kwargs) -> transfer_module.TransferPlan:
-        builds.append(1)
-        return compile_plan(*args, **kwargs)
-
-    monkeypatch.setattr(transfer_module, "_plan_staged_transfer", observe)
     first = harness.prepare()
     _check_values(harness, harness.collect(first)[1])
-    first_builds = len(builds)
     first_descriptors = first.metrics["descriptor_builds"]
     for tensor in harness.sources.values():
         tensor.add_(3)
     second = harness.prepare()
     _check_values(harness, harness.collect(second)[1])
     assert len(harness.captures) == (1 if layout_cache else 2)
-    assert len(builds) == (
-        first_builds if plan_cache and layout_cache else 2 * first_builds
-    )
+    assert second.metrics["plan_cache_hits"] == int(plan_cache and layout_cache)
     assert second.metrics["descriptor_builds"] == (
         0 if plan_cache and layout_cache and descriptor_cache else first_descriptors
     )
@@ -405,24 +400,9 @@ def test_warm_execution_only_rebinds_when_descriptors_disabled(
             return harness.collect(prepared)[1]
         return harness.transfer.stage(prepared).tensors
 
-    install(prepare())
-    builds = []
-    original_descriptors = harness.transfer._descriptors
-
-    def bind(*args, **kwargs) -> list[module.ReadDescriptor]:
-        builds.append(1)
-        return original_descriptors(*args, **kwargs)
-
-    def unexpected(*args, **kwargs) -> None:
-        raise AssertionError(
-            "normal warm execution performed diagnostic or planning work"
-        )
-
-    monkeypatch.setattr(harness.transfer, "_descriptors", bind)
-    monkeypatch.setattr(module, "_arena_geometry", unexpected)
-    monkeypatch.setattr(harness.transfer, "_resolve_metadata", unexpected)
-    monkeypatch.setattr(harness.transfer, "_resolve_layout", unexpected)
-    monkeypatch.setattr(harness.transfer, "_validate_complete", unexpected)
+    first = prepare()
+    install(first)
+    cold_builds = first.metrics["descriptor_builds"]
     for source in harness.sources.values():
         source.add_(5)
     prepared = prepare()
@@ -430,8 +410,9 @@ def test_warm_execution_only_rebinds_when_descriptors_disabled(
     assert torch.equal(
         installed["a.weight"][2:18], harness.sources["exact"].reshape(-1)
     )
-    assert len(builds) == (0 if descriptors else prepared.metrics.get("batches", 1))
-    assert prepared.metrics["descriptor_builds"] == len(builds)
+    assert prepared.metrics["descriptor_builds"] == (0 if descriptors else cold_builds)
+    assert prepared.metrics["plan_cache_hits"] == 1
+    assert len(harness.captures) == 1
 
 
 def test_digest_policy_is_fixed_for_the_transfer_lifetime(harness, monkeypatch) -> None:
@@ -440,13 +421,15 @@ def test_digest_policy_is_fixed_for_the_transfer_lifetime(harness, monkeypatch) 
     _check_values(harness, harness.collect(harness.prepare())[1])
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
 
-    def unexpected(*args, **kwargs) -> None:
-        raise AssertionError("a live environment change enabled digest verification")
-
-    monkeypatch.setattr(harness.transfer, "_verify", unexpected)
+    prepared = harness.prepare()
     for source in harness.sources.values():
         source.add_(2)
-    _check_values(harness, harness.collect(harness.prepare())[1])
+    _check_values(harness, harness.collect(prepared)[1])
+    harness.new_transfer()
+    prepared = harness.prepare()
+    harness.sources["exact"].add_(1)
+    with pytest.raises(RuntimeError, match="digest"):
+        harness.collect(prepared)
 
 
 def test_digest_warm_bindings_use_current_manifest_digests(

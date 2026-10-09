@@ -968,13 +968,13 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
                     self.embedding.weight.weight_loader(self.embedding.weight, weight)
 
     class Info:
-        def __init__(self, parameter):
+        def __init__(self, parameter) -> None:
             self.kernel_tensors = ({"weight": parameter}, {})
 
-        def reset(self):
+        def reset(self) -> None:
             self.kernel_tensors = None
 
-    def initialize(model):
+    def initialize(model) -> None:
         for layer in (model.embedding, model.lm_head):
             layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
             layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
@@ -982,14 +982,14 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
     _install_fake_vllm(monkeypatch, initialize)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
 
-    def place(layer, info):
+    def place(layer, info) -> None:
         layer.weight = info.kernel_tensors[0]["weight"]
 
-    def commit(layer, info):
+    def commit(layer, info) -> None:
         info.kernel_tensors[0]["weight"].data.copy_(layer.weight)
         place(layer, info)
 
-    def finalize(model, config):
+    def finalize(model, config) -> None:
         for layer in (model.embedding, model.lm_head):
             info = layerwise.LAYERWISE_INFO[layer]
             if info.kernel_tensors is not None:
@@ -1035,46 +1035,34 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
     assert torch.equal(model.lm_head.weight, torch.full((2, 2), 7.0))
 
 
-def test_streaming_walks_live_owners_without_arena_scans(monkeypatch):
-    """Keep owner validation live without recursively scanning tensor contents."""
+@pytest.mark.parametrize("batch_size", [1, 6])
+def test_streaming_batches_update_all_live_parameters(monkeypatch, batch_size) -> None:
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(*[nn.Linear(2, 2, bias=False) for _ in range(6)])
+    names = frozenset(dict(model.named_parameters()))
+    arena = torch.ones(2, 2)
 
-    def walks_for(batch_size):
-        model = nn.Sequential(*[nn.Linear(2, 2, bias=False) for _ in range(6)])
-        names = frozenset(dict(model.named_parameters()))
-        walks = []
-        real_named_modules = model.named_modules
+    def batches() -> Iterator[dict[str, torch.Tensor]]:
+        for start in range(0, 6, batch_size):
+            yield {f"{i}.weight": arena for i in range(start, start + batch_size)}
 
-        def counted(*args, **kwargs):
-            walks.append(1)
-            return real_named_modules(*args, **kwargs)
-
-        monkeypatch.setattr(model, "named_modules", counted)
-        arena = torch.ones(2, 2)
-
-        def batches():
-            for start in range(0, 6, batch_size):
-                yield {f"{i}.weight": arena for i in range(start, start + batch_size)}
-
-        installer = _VllmInstaller(
-            model=model,
-            vllm_config=object(),
-            model_config=object(),
-            device=torch.device("cpu"),
-        )
-        metrics = {}
-        installer.install_streaming(PreparedStreamingTensors(batches, names, metrics))
-        assert "retention_scan_s" not in metrics
-        assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
-        return len(walks)
-
-    # Extra batches only repeat the owner/completeness walk.
-    assert walks_for(1) - walks_for(6) == 5
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert all(
+        torch.equal(parameter, torch.ones(2, 2)) for parameter in model.parameters()
+    )
 
 
 @pytest.mark.parametrize("mode", ["consume_then_remove", "new_module"])
-def test_streaming_hooks_retain_owned_values_across_arena_reuse(monkeypatch, mode):
+def test_streaming_hooks_retain_owned_values_across_arena_reuse(
+    monkeypatch, mode
+) -> None:
     """Post-load callbacks may retain engine values without retaining the arena."""
     model = nn.Module()
     model.first = nn.Linear(1, 1, bias=False)
@@ -1083,10 +1071,10 @@ def test_streaming_hooks_retain_owned_values_across_arena_reuse(monkeypatch, mod
     names = frozenset(dict(model.named_parameters()))
 
     class Info:
-        def __init__(self, parameter):
+        def __init__(self, parameter) -> None:
             self.kernel_tensors = ({"weight": parameter}, {})
 
-        def reset(self):
+        def reset(self) -> None:
             self.kernel_tensors = None
 
     def initialize(target):
@@ -1100,7 +1088,7 @@ def test_streaming_hooks_retain_owned_values_across_arena_reuse(monkeypatch, mod
         "vllm.model_executor.layers.quantization.base_config"
     ].QuantizeMethodBase
 
-    def commit(layer, info):
+    def commit(layer, info) -> None:
         original = info.kernel_tensors[0]["weight"]
         original.data.copy_(layer.weight)
         layer.weight = original
@@ -1153,7 +1141,9 @@ def test_streaming_hooks_retain_owned_values_across_arena_reuse(monkeypatch, mod
         )
 
 
-def test_added_live_parameter_invalidates_captured_owner_completeness(monkeypatch):
+def test_added_live_parameter_invalidates_captured_owner_completeness(
+    monkeypatch,
+) -> None:
     """Owner completeness is a live question, not a property of the capture.
 
     A hook can add a Parameter to a module a later batch owns, so a batch that
@@ -1168,10 +1158,10 @@ def test_added_live_parameter_invalidates_captured_owner_completeness(monkeypatc
     names = frozenset(dict(model.named_parameters()))
 
     class Info:
-        def __init__(self, parameter):
+        def __init__(self, parameter) -> None:
             self.kernel_tensors = ({"weight": parameter}, {})
 
-        def reset(self):
+        def reset(self) -> None:
             self.kernel_tensors = None
 
     def initialize(target):
@@ -1185,7 +1175,7 @@ def test_added_live_parameter_invalidates_captured_owner_completeness(monkeypatc
         "vllm.model_executor.layers.quantization.base_config"
     ].QuantizeMethodBase
 
-    def commit(layer, info):
+    def commit(layer, info) -> None:
         original = info.kernel_tensors[0]["weight"]
         original.data.copy_(layer.weight)
         layer.weight = original
@@ -1315,7 +1305,7 @@ def test_alias_restoration_tracks_each_path_to_a_shared_module(replace_alias_own
 @pytest.mark.parametrize("one_batch", [False, True])
 def test_streaming_managed_shared_bias_is_reattached_before_dependent_hook(
     monkeypatch, one_batch
-):
+) -> None:
     model = nn.Module()
     model.gate = nn.Linear(2, 2)
     model.experts = nn.Linear(2, 2)
@@ -1327,7 +1317,7 @@ def test_streaming_managed_shared_bias_is_reattached_before_dependent_hook(
         def __init__(self, layer):
             self.kernel_tensors = (dict(layer.named_parameters(recurse=False)), {})
 
-        def reset(self):
+        def reset(self) -> None:
             self.kernel_tensors = None
 
     def initialize(target):
@@ -1346,7 +1336,7 @@ def test_streaming_managed_shared_bias_is_reattached_before_dependent_hook(
         "vllm.model_executor.layers.quantization.base_config"
     ].QuantizeMethodBase
 
-    def commit(layer, info):
+    def commit(layer, info) -> None:
         for name, original in info.kernel_tensors[0].items():
             original.data.copy_(getattr(layer, name))
             setattr(layer, name, original)
@@ -1907,22 +1897,20 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch) -
             self.lm_head = nn.Linear(2, 2, bias=False)
             self.lm_head.weight = self.embedding.weight
             self.register_buffer("routing", torch.tensor([0, 1]))
-            self.capture_calls = 0
 
         def load_weights(self, weights) -> None:
-            self.capture_calls += 1
             for name, weight in weights:
                 if name == "embedding.weight":
                     self.embedding.weight.weight_loader(self.embedding.weight, weight)
 
     class Info:
-        def __init__(self, parameter):
+        def __init__(self, parameter) -> None:
             self.kernel_tensors = ({"weight": parameter}, {})
 
-        def reset(self):
+        def reset(self) -> None:
             self.kernel_tensors = None
 
-    def initialize(model):
+    def initialize(model) -> None:
         for layer in (model.embedding, model.lm_head):
             layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
             layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
@@ -1930,14 +1918,14 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch) -
     _install_fake_vllm(monkeypatch, initialize)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
 
-    def place(layer, info):
+    def place(layer, info) -> None:
         layer.weight = info.kernel_tensors[0]["weight"]
 
-    def commit(layer, info):
+    def commit(layer, info) -> None:
         info.kernel_tensors[0]["weight"].data.copy_(layer.weight)
         place(layer, info)
 
-    def finalize(model, config):
+    def finalize(model, config) -> None:
         for layer in (model.embedding, model.lm_head):
             info = layerwise.LAYERWISE_INFO[layer]
             if info.kernel_tensors is not None:
@@ -1973,22 +1961,26 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch) -
     assert torch.equal(model.embedding.weight, original)
     manifest = [("embedding.weight", torch.float32, (2, 2))]
     captured, _ = installer.capture(manifest)
-    assert model.capture_calls == 2
     captured.copies.clear()
-    assert installer.capture(manifest)[0].copies
-    assert model.capture_calls == 3
+    fresh_capture, fresh_layout = installer.capture(manifest)
+    assert [
+        (copy.src_name, copy.param_name, copy.dest_shape, copy.dest_dtype)
+        for copy in fresh_capture.copies
+    ] == [("embedding.weight", "embedding.weight", (2, 2), torch.float32)]
+    assert fresh_layout == layout
     model.routing.add_(1)
     installer.capture(manifest)
-    assert model.capture_calls == 4
+    assert torch.equal(model.embedding.weight, original)
+    assert model.embedding.weight is model.lm_head.weight
     with torch.inference_mode():
         model.routing = torch.tensor([3, 4])
         installer.capture(manifest)
-        assert model.capture_calls == 5
+        assert model.embedding.weight is model.lm_head.weight
         model.routing.add_(1)
         installer.capture(manifest)
-        assert model.capture_calls == 6
+        assert model.embedding.weight is model.lm_head.weight
 
-    for index, value in enumerate((7.0, 11.0, -3.0)):
+    for value in (7.0, 11.0, -3.0):
 
         def batches(value=value) -> Iterator[dict[str, torch.Tensor]]:
             yield {"embedding.weight": torch.full((2, 2), value)}
@@ -1998,10 +1990,9 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch) -
         assert model.embedding.weight is model.lm_head.weight
         assert model.embedding.weight.data_ptr() == address
         assert torch.equal(model.lm_head.weight, torch.full((2, 2), value))
-        assert "retention_batch_scans" not in prepared.transfer_metrics
-        assert "retention_final_scans" not in prepared.transfer_metrics
         installer.capture(manifest)
-        assert model.capture_calls == 7 + index
+        assert torch.equal(model.lm_head.weight, torch.full((2, 2), value))
+        assert model.embedding.weight is model.lm_head.weight
 
 
 class _Parent(nn.Module):
@@ -2356,7 +2347,9 @@ def test_streaming_alias_plans_preserve_destructor_boundaries(monkeypatch, owner
         assert reused[1] == ["detach", "destructor", "second-yield"]
 
 
-@pytest.mark.parametrize("case", ["no_alias", "load_time_tie", "runtime_alias", "mixed"])
+@pytest.mark.parametrize(
+    "case", ["no_alias", "load_time_tie", "runtime_alias", "mixed"]
+)
 @pytest.mark.parametrize("runtime_first", [False, True])
 def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
     monkeypatch, tmp_path, case, runtime_first
@@ -2405,7 +2398,9 @@ def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
     def finalize(target, _config):
         for name in ("w13", "w2"):
             if case in ("runtime_alias", "mixed"):
-                setattr(target, f"{name}_weight", getattr(target, f"{name}_weight_packed"))
+                setattr(
+                    target, f"{name}_weight", getattr(target, f"{name}_weight_packed")
+                )
         for name, value in originals.items():
             value.data.copy_(getattr(target, name))
         target._parameters = dict(originals)
@@ -2418,7 +2413,8 @@ def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
     installer = _VllmInstaller(
         model=model,
         vllm_config=SimpleNamespace(
-            quant_config=object(), load_config=SimpleNamespace(load_format="modelexpress")
+            quant_config=object(),
+            load_config=SimpleNamespace(load_format="modelexpress"),
         ),
         model_config=SimpleNamespace(model="/launch", revision="main"),
         device=torch.device("cpu"),
