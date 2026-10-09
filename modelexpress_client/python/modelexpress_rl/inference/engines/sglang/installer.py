@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 
 import torch
+from modelexpress import telemetry
 
 from ...plan import (
     EngineCapabilities,
@@ -30,14 +31,15 @@ class _SglangInstaller(EngineInstaller):
         )
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
-        if not isinstance(prepared, PreparedCheckpointArtifact):
-            raise TypeError("SGLang requires a prepared checkpoint")
-        checkpoint = prepared.checkpoint
-        if not isinstance(checkpoint, PreparedCheckpoint):
-            raise TypeError("checkpoint preparation has an invalid value")
-        started = time.perf_counter()
-        self._install_checkpoint(checkpoint)
-        return {"perf/mx_receive_install_time": time.perf_counter() - started}
+        with telemetry.span("mx.refit.install"):
+            if not isinstance(prepared, PreparedCheckpointArtifact):
+                raise TypeError("SGLang requires a prepared checkpoint")
+            checkpoint = prepared.checkpoint
+            if not isinstance(checkpoint, PreparedCheckpoint):
+                raise TypeError("checkpoint preparation has an invalid value")
+            started = time.perf_counter()
+            self._install_checkpoint(checkpoint)
+            return {"perf/mx_receive_install_time": time.perf_counter() - started}
 
     def _install_checkpoint(self, prepared: PreparedCheckpoint) -> None:
         runner = self._model_runner

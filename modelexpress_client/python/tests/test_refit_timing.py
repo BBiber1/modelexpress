@@ -85,9 +85,15 @@ def test_error_span_is_recorded_and_reraised():
     assert stage["duration_ms"] == 250.0
 
 
-def test_context_helpers_and_emit_once(caplog):
+@pytest.mark.parametrize("tracing", [False, True])
+@pytest.mark.parametrize("log_enabled", [False, True])
+def test_context_helpers_and_emit_once(caplog, monkeypatch, tracing, log_enabled) -> None:
+    from modelexpress import telemetry
+
+    monkeypatch.setattr(telemetry, "enabled", lambda: tracing)
+    monkeypatch.setattr(telemetry, "configure", lambda service: None)
     logger = logging.getLogger("modelexpress.test.refit_timing")
-    timing = RefitTimingRecorder(backend="test", version=1)
+    timing = RefitTimingRecorder(backend="test", version=1, log_enabled=log_enabled)
 
     with caplog.at_level(logging.INFO, logger=logger.name):
         with use_refit_timing(timing):
@@ -104,8 +110,9 @@ def test_context_helpers_and_emit_once(caplog):
         for record in caplog.records
         if record.message.startswith(MX_REFIT_TIMING_PREFIX)
     ]
-    assert len(lines) == 1
-    assert json.loads(lines[0].split(" ", 1)[1]) == first == second
+    assert len(lines) == int(log_enabled)
+    if log_enabled:
+        assert json.loads(lines[0].split(" ", 1)[1]) == first == second
     assert second["bytes"] == 0
 
 

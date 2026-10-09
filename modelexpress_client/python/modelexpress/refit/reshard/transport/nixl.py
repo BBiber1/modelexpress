@@ -29,6 +29,7 @@ import os
 from collections import defaultdict
 from typing import Any
 
+from modelexpress import telemetry
 from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_MEM_TYPES
 
 logger = logging.getLogger("modelexpress.refit.reshard.transport.nixl")
@@ -112,48 +113,51 @@ class NixlReshardTransport:
             for session, group in by_session.items()
         ]
 
-        if _serial_reads_enabled():
-            for agent, ranges, memory_type in batches:
-                total_bytes, num_reads, _duration = self._manager.execute_read_batch(
-                    remote_agent_name=agent,
-                    ranges=ranges,
-                    mem_type=memory_type,
-                    timeout_seconds=self._timeout,
-                    local_mem_type=self._local_mem_type,
-                )
-                self.bytes_moved += total_bytes
-                self.reads_issued += num_reads
-            return []
+        with telemetry._NixlBatch().posting():
+            if _serial_reads_enabled():
+                for agent, ranges, memory_type in batches:
+                    total_bytes, num_reads, _duration = (
+                        self._manager.execute_read_batch(
+                            remote_agent_name=agent,
+                            ranges=ranges,
+                            mem_type=memory_type,
+                            timeout_seconds=self._timeout,
+                            local_mem_type=self._local_mem_type,
+                        )
+                    )
+                    self.bytes_moved += total_bytes
+                    self.reads_issued += num_reads
+                return []
 
-        posted: list = []
-        try:
-            for agent, ranges, memory_type in batches:
-                posted.append(
-                    self._manager.post_read_batch(
-                        remote_agent_name=agent,
-                        ranges=ranges,
-                        mem_type=memory_type,
-                        local_mem_type=self._local_mem_type,
+            posted: list = []
+            try:
+                for agent, ranges, memory_type in batches:
+                    posted.append(
+                        self._manager.post_read_batch(
+                            remote_agent_name=agent,
+                            ranges=ranges,
+                            mem_type=memory_type,
+                            local_mem_type=self._local_mem_type,
+                        )
                     )
-                )
-        except Exception:
-            # Batches posted before the failure are in flight and still own
-            # handles. Drain them so nothing leaks, but never let that cleanup
-            # replace the original error.
-            if posted:
-                try:
-                    self._manager.await_read_batches(
-                        posted, timeout_seconds=self._timeout
-                    )
-                except Exception as exc:  # noqa: BLE001 - cleanup must not mask
-                    logger.warning(
-                        "draining %d posted READ batch(es) after a post failure "
-                        "did not complete cleanly: %r",
-                        len(posted),
-                        exc,
-                    )
-            raise
-        return posted
+            except Exception:
+                # Batches posted before the failure are in flight and still own
+                # handles. Drain them so nothing leaks, but never let that cleanup
+                # replace the original error.
+                if posted:
+                    try:
+                        self._manager.await_read_batches(
+                            posted, timeout_seconds=self._timeout
+                        )
+                    except Exception as exc:  # noqa: BLE001 - cleanup must not mask
+                        logger.warning(
+                            "draining %d posted READ batch(es) after a post failure "
+                            "did not complete cleanly: %r",
+                            len(posted),
+                            exc,
+                        )
+                raise
+            return posted
 
     def await_reads(self, posted: list) -> None:
         """Complete batches returned by :meth:`post_reads` and release them."""

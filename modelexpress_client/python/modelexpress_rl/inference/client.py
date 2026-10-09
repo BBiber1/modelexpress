@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Literal
 
 import grpc
-from modelexpress import auth, envs
+from modelexpress import auth, envs, telemetry
 from modelexpress.client import _get_server_url
 from modelexpress.refit.timing import RefitTimingRecorder, refit_span
 
@@ -340,6 +340,7 @@ class ModelExpressGeneratorClient:
             raise
         return client
 
+    @telemetry.span("mx.refit.streaming_prepare")
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
         """Prepare an exact version without installing it into the live engine.
 
@@ -420,6 +421,7 @@ class ModelExpressGeneratorClient:
             )
             return self._active_handle
 
+    @telemetry.span("mx.refit.streaming_apply")
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
         """Install a prepared update at the caller's safe point."""
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
@@ -504,7 +506,9 @@ class ModelExpressGeneratorClient:
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
         if self._channel is None:
-            self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
+            self._channel = telemetry.refit_channel(
+                auth.with_auth(grpc.insecure_channel(self.server_url))
+            )
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
         if self._stub is None:
             raise RuntimeError("generator refit service is not initialized")
@@ -698,6 +702,7 @@ class ModelExpressGeneratorClient:
             timeout=self._rpc_timeout_seconds,
         )
 
+    @telemetry.span("mx.refit.streaming_release")
     def _release_staged(self, staged: StagedWeightHandle) -> None:
         """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:
