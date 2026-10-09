@@ -447,3 +447,30 @@ def test_digest_warm_bindings_use_current_manifest_digests(
     harness.sources["exact"].add_(1)
     with pytest.raises(RuntimeError, match="digest"):
         harness.collect(prepared)
+
+
+@pytest.mark.parametrize("setting", ["max_staging_bytes", "staging_buffers"])
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5])
+def test_streaming_prepare_rejects_invalid_budget_settings_and_recovers(
+    harness, setting, invalid
+) -> None:
+    settings = {"max_staging_bytes": 1024, "staging_buffers": 1}
+    settings[setting] = invalid
+    with pytest.raises(ValueError, match=f"{setting} must be a positive integer"):
+        harness.transfer.prepare_streaming(
+            manifests=harness.manifests(),
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+            capture_layout=harness.capture_layout,
+            staging_device="cpu",
+            **settings,
+        )
+    assert not harness.transports
+    prepared = harness.prepare()
+    _check_values(harness, harness.collect(prepared)[1])
+
+
+def test_closed_transfer_rejects_streaming_preparation(harness) -> None:
+    harness.transfer.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        harness.prepare()
+    assert not harness.transports

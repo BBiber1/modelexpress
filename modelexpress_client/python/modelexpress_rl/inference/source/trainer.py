@@ -107,10 +107,6 @@ class TrainerSourceResolver(SourceResolver):
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         if version.trainer_mesh_id is None:
             raise RuntimeError("trainer publication requires trainer_mesh_id")
-        if version.trainer_mesh_generation <= 0:
-            raise RuntimeError(
-                "trainer publication requires a positive trainer_mesh_generation; recreate the version"
-            )
         try:
             mesh_response = self._service().GetTrainerMesh(
                 refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),

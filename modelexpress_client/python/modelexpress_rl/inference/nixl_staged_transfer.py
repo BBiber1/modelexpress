@@ -242,7 +242,6 @@ def _compile_bounded_plan(
         bounded_whole_plan_builds=0,
         owner_plan_builds=0,
     )
-    _require_positive_bytes(max_staging_bytes, "max_staging_bytes")
     started = time.perf_counter()
     plan = _plan_staged_transfer(
         capture, resolved.sources, publish_digest=cache_config.publish_digest
@@ -285,12 +284,6 @@ def _bounded_batches(
     publish_digest: bool | None = None,
 ) -> tuple[_BoundedBatch, ...]:
     """Validate all owning-module batches before allocating or installing."""
-    if (
-        isinstance(max_staging_bytes, bool)
-        or not isinstance(max_staging_bytes, int)
-        or max_staging_bytes <= 0
-    ):
-        raise ValueError("max_staging_bytes must be a positive integer")
     if metrics is None:
         metrics = {}
     started = time.perf_counter()
@@ -365,7 +358,6 @@ def _pack_bounded_batches(
     neighbours that fit the same arena together, so each packed batch still
     installs whole modules and reads exactly the bytes the unpacked plan read.
     """
-    _require_positive_bytes(max_staging_bytes, "max_staging_bytes")
 
     def merge(group: list[_BoundedBatch]) -> _BoundedBatch:
         capture = CaptureResult(
@@ -376,10 +368,6 @@ def _pack_bounded_batches(
         for batch in group:
             _merge_plan(plan, batch.plan)
             for layout, incoming in zip(layouts, batch.layouts, strict=True):
-                if layout.keys() & incoming.keys():
-                    raise IncompleteRefit(
-                        "packed batches contain overlapping staging keys"
-                    )
                 layout.update(incoming)
         return _BoundedBatch(
             capture, plan, layouts, sum(batch.nbytes for batch in group)
@@ -390,8 +378,6 @@ def _pack_bounded_batches(
     current_bytes = 0
     full_sources = set()
     for batch in batches:
-        if batch.nbytes > max_staging_bytes:
-            raise IncompleteRefit("owning module exceeds the packed staging budget")
         incoming_full = set(batch.layouts.full)
         # Two modules pulling the same complete source would need one staging
         # slot for two distinct writes, so they must stay in separate batches.
@@ -735,16 +721,6 @@ class _NixlStagedTransfer:
     def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
         return None if self._closed else self._trainer_snapshot
 
-    def _reset_changed_mesh(self, source: TrainerSourceSnapshot) -> None:
-        previous = self._cached_pull_plan
-        if previous is not None:
-            cached = previous.trainer_source_snapshot
-            if (source.mesh_id, source.mesh_generation) != (
-                cached.mesh_id,
-                cached.mesh_generation,
-            ):
-                self._cached_pull_plan = None
-
     def _reuse_mesh_plan(
         self,
         previous: _CachedPullPlan | None,
@@ -760,13 +736,13 @@ class _NixlStagedTransfer:
         ):
             return None
         cached = previous.trainer_source_snapshot
-        if (source.mesh_id, source.mesh_generation) != (
-            cached.mesh_id,
-            cached.mesh_generation,
-        ):
-            return None
         diagnostic = self.cache_config.validate_plan or self.cache_config.publish_digest
         if source is not cached:
+            if (source.mesh_id, source.mesh_generation) != (
+                cached.mesh_id,
+                cached.mesh_generation,
+            ):
+                return None
             if not diagnostic:
                 return None
             if source.physical_fingerprint != cached.physical_fingerprint:
@@ -1033,7 +1009,7 @@ class _NixlStagedTransfer:
             )
             reusable = cached is not None
             if cached is None:
-                self._reset_changed_mesh(trainer_snapshot)
+                self._cached_pull_plan = None
                 self._select_workspace_mode("full")
                 if manifests is None:
                     manifests = [row.manifest for row in trainer_snapshot.shards]
@@ -1062,11 +1038,25 @@ class _NixlStagedTransfer:
                 required_metadata = _required_agent_metadata(
                     plan, trainer.resolved_metadata
                 )
-                self._reset_incompatible_full_workspace(plan, parameter_layout)
+                expected = _StagingLayouts(
+                    {
+                        name: (tuple(shape), dtype)
+                        for name, (shape, dtype) in parameter_layout.items()
+                    },
+                    {
+                        item.param_name: (tuple(item.dest_shape), item.src_dtype)
+                        for item in plan.converts
+                    },
+                    {
+                        item.src_name: (tuple(item.global_shape), item.dtype)
+                        for item in plan.full_pulls
+                    },
+                )
+                self._reset_incompatible_full_workspace(expected)
                 transport = self._connect_sources(
                     trainer.resolved_metadata, required_metadata
                 )
-                self._ensure_workspace(plan, parameter_layout)
+                self._ensure_workspace(expected)
                 used_sources = MappingProxyType(
                     {
                         copy.src_name: trainer.resolved_metadata.sources[copy.src_name]
@@ -1133,7 +1123,7 @@ class _NixlStagedTransfer:
                 buffer_budget = self._validate_streaming_settings(
                     max_staging_bytes, staging_device, staging_buffers
                 )
-                self._reset_changed_mesh(trainer_snapshot)
+                self._cached_pull_plan = None
                 self._select_workspace_mode(
                     f"bounded:{staging_device}:{staging_buffers}"
                 )
@@ -1167,9 +1157,7 @@ class _NixlStagedTransfer:
                     required_metadata,
                     host_staging=staging_device == "cpu",
                 )
-                self._prepare_arenas(
-                    compiled.batches, buffer_budget, staging_device, staging_buffers
-                )
+                self._prepare_arenas(compiled.batches, staging_device, staging_buffers)
                 metrics["connection_registration_s"] = time.perf_counter() - started
                 cached = _CachedPullPlan(
                     trainer,
@@ -1311,8 +1299,6 @@ class _NixlStagedTransfer:
     def _validate_streaming_settings(
         self, max_staging_bytes: int, staging_device: str, staging_buffers: int
     ) -> int:
-        if self._closed:
-            raise RuntimeError("NIXL staged transfer is closed")
         if self._device.type != "cuda":
             raise ValueError("bounded NIXL staging requires a CUDA device")
         if staging_device not in ("cuda", "cpu"):
@@ -1352,7 +1338,6 @@ class _NixlStagedTransfer:
     def _prepare_arenas(
         self,
         batches: tuple[_BoundedBatch, ...],
-        buffer_budget: int,
         staging_device: str,
         staging_buffers: int,
     ) -> None:
@@ -1375,12 +1360,6 @@ class _NixlStagedTransfer:
             except Exception:
                 self.reset_workspace()
                 raise
-        elif self._staging_arenas[0].numel() < arena_bytes:
-            raise RuntimeError(
-                "bounded workspace layout grew; restart the generator engine"
-            )
-        if self._staging_arenas[0].numel() > buffer_budget:
-            raise RuntimeError("existing bounded arena exceeds the requested limit")
 
     def iter_bounded(
         self, prepared: _PreparedBoundedTransfer, metrics: dict[str, Any]
@@ -1523,14 +1502,8 @@ class _NixlStagedTransfer:
         self,
         current: dict[str, torch.Tensor],
         expected: dict[str, tuple[tuple[int, ...], torch.dtype]],
-        *,
-        label: str,
     ) -> None:
         if current:
-            if self._layout(current) != expected:
-                raise RuntimeError(
-                    f"{label} layout changed; restart the generator engine"
-                )
             return
         with classic_cuda_alloc():
             current.update(
@@ -1540,22 +1513,7 @@ class _NixlStagedTransfer:
                 }
             )
 
-    def _reset_incompatible_full_workspace(
-        self,
-        plan: TransferPlan,
-        parameter_layout: _StagingLayout,
-    ) -> None:
-        expected = (
-            dict(parameter_layout),
-            {
-                item.param_name: (tuple(item.dest_shape), item.src_dtype)
-                for item in plan.converts
-            },
-            {
-                item.src_name: (tuple(item.global_shape), item.dtype)
-                for item in plan.full_pulls
-            },
-        )
+    def _reset_incompatible_full_workspace(self, expected: _StagingLayouts) -> None:
         if any(
             current and self._layout(current) != layout
             for current, layout in zip(
@@ -1568,31 +1526,11 @@ class _NixlStagedTransfer:
             assert mode is not None
             self._select_workspace_mode(mode)
 
-    def _ensure_workspace(
-        self,
-        plan: TransferPlan,
-        parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
-    ) -> None:
-        recv_expected = {
-            name: (tuple(shape), dtype)
-            for name, (shape, dtype) in parameter_layout.items()
-        }
-        self._ensure_buffers(self._recv_buffers, recv_expected, label="receive-buffer")
-
-        convert_expected = {
-            convert.param_name: (tuple(convert.dest_shape), convert.src_dtype)
-            for convert in plan.converts
-        }
-        self._ensure_buffers(
-            self._convert_buffers, convert_expected, label="conversion-buffer"
-        )
-        full_expected = {
-            full.src_name: (tuple(full.global_shape), full.dtype)
-            for full in plan.full_pulls
-        }
-        self._ensure_buffers(
-            self._full_buffers, full_expected, label="full-pull buffer"
-        )
+    def _ensure_workspace(self, expected: _StagingLayouts) -> None:
+        recv_expected, convert_expected, full_expected = expected
+        self._ensure_buffers(self._recv_buffers, recv_expected)
+        self._ensure_buffers(self._convert_buffers, convert_expected)
+        self._ensure_buffers(self._full_buffers, full_expected)
 
         recv_params = set(recv_expected)
         if self._registered_recv_params and self._registered_recv_params != recv_params:

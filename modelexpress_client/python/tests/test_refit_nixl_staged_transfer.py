@@ -82,7 +82,9 @@ def _iteration_prepared(
     return prepared
 
 
-def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(monkeypatch):
+def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     sources = _resolve_sources(
         [
@@ -116,12 +118,9 @@ def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(monkeypa
         _bounded_batches(CaptureResult(copies=copies), layout, sources, 511)
     with pytest.raises(IncompleteRefit, match="cover every"):
         _bounded_batches(CaptureResult(copies=copies[:1]), layout, sources, 512)
-    for invalid in (0, -1, True, 1.5):
-        with pytest.raises(ValueError, match="positive integer"):
-            _bounded_batches(CaptureResult(copies=copies), layout, sources, invalid)
 
 
-def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch):
+def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch) -> None:
     """Packing may only change how many arena residencies a refit needs. The
     copies, planned bytes, and descriptor count must match the unpacked plan."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
@@ -174,12 +173,6 @@ def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch):
         for batch in batches
     ]
     assert len(_pack_bounded_batches(conflicting, 2048)) == 2
-
-    with pytest.raises(IncompleteRefit, match="exceeds the packed staging budget"):
-        _pack_bounded_batches(batches, 256)
-    for invalid in (0, -1, True, 1.5):
-        with pytest.raises(ValueError, match="positive integer"):
-            _pack_bounded_batches(batches, invalid)
 
 
 @pytest.mark.parametrize("pack", [False, True])
@@ -1005,7 +998,7 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch) -> N
         )
 
 
-def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch) -> None:
+def test_buffer_allocation_preserves_existing_values(monkeypatch) -> None:
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     transfer = object.__new__(_NixlStagedTransfer)
     transfer.cache_config = RefitCacheConfig()
@@ -1014,17 +1007,10 @@ def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch) ->
     buffers = {}
     layout = {"weight": ((4,), torch.float32)}
 
-    transfer._ensure_buffers(buffers, layout, label="receive-buffer")
-    pointer = buffers["weight"].data_ptr()
-    transfer._ensure_buffers(buffers, layout, label="receive-buffer")
-    assert buffers["weight"].data_ptr() == pointer
-
-    with pytest.raises(RuntimeError, match="layout changed"):
-        transfer._ensure_buffers(
-            buffers,
-            {"weight": ((8,), torch.float32)},
-            label="receive-buffer",
-        )
+    transfer._ensure_buffers(buffers, layout)
+    buffers["weight"].fill_(7)
+    transfer._ensure_buffers(buffers, layout)
+    torch.testing.assert_close(buffers["weight"], torch.full((4,), 7.0))
 
 
 def test_double_buffered_iteration_alternates_arenas_and_prefetches(

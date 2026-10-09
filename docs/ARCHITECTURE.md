@@ -1726,6 +1726,10 @@ changes to unrelated owners that a later callback could otherwise hide.
 This path adds no native extension or CPython-internal dependency.
 
 The staging limit bounds receive, conversion and transfer scratch allocations.
+Preparation validates staging settings before compilation; owning-module batches
+validate their required capacity, and packing enforces the combined arena limit.
+Workspace compatibility is checked before connecting sources, with registration
+performed after any connection recovery that resets the owned manager.
 Engine-owned materialized destinations and post-load workspaces consume
 additional memory, as do the live model and runtime state. The staging limit is
 therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
