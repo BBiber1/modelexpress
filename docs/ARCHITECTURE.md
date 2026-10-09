@@ -1779,3 +1779,9 @@ created before this field must be recreated; missing or zero mesh generations
 fail explicitly. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
 generation differs from the current trainer mesh fails source resolution.
+
+Any trainer mesh update that changes its generation is rejected while a linked
+weight version has an active consumer lease, including additive replicas that
+leave existing publications intact. An update with unchanged membership remains a no-op.
+After readers release their leases, membership may advance and new weight
+versions capture the new generation; old version stamps are never changed.
