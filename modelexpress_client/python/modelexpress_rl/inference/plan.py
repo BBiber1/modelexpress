@@ -12,14 +12,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
+import grpc
 from modelexpress import p2p_pb2
+from modelexpress.adapter import StrategyRecoveryError
+from modelexpress.types import ManifestMismatchError
 
 from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
 from ..train import WeightPayloadFormat
-from .adapter import GeneratorTransferInputs
+from .adapter import TrainerSourceShard
 
 if TYPE_CHECKING:
+    from .nixl_staged_transfer import _ResolvedSources
     from .receiver import PreparedCheckpoint
 
 
@@ -77,15 +81,39 @@ class GeneratorPeerUpdateSource:
 
 
 @dataclass(frozen=True)
-class TrainerUpdateSource:
-    """Trainer manifests for one complete full-tensor update."""
+class TrainerSourceSnapshot:
+    """Selected trainer shards and the mesh identity they belong to."""
 
-    inputs: GeneratorTransferInputs
+    mesh_id: str
+    mesh_generation: int
+    shards: tuple[TrainerSourceShard, ...]
+    resolved_metadata: _ResolvedSources | None = field(
+        default=None, compare=False, repr=False
+    )
     kind = WeightSource.TRAINER
+    payload_format = WeightPayloadFormat.FULL_TENSOR
+
+    def __post_init__(self) -> None:
+        if (
+            not self.mesh_id
+            or type(self.mesh_generation) is not int
+            or self.mesh_generation <= 0
+        ):
+            raise ValueError(
+                "trainer source requires a mesh ID and positive generation"
+            )
+        object.__setattr__(self, "shards", tuple(self.shards))
 
     @property
-    def payload_format(self) -> WeightPayloadFormat:
-        return self.inputs.payload_format
+    def physical_fingerprint(self) -> tuple:
+        return (
+            self.mesh_id,
+            self.mesh_generation,
+            tuple(
+                (shard.source_slot_id, shard.worker_id, shard.physical_fingerprint)
+                for shard in self.shards
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -98,7 +126,7 @@ class ObjectStorageUpdateSource:
 
 
 ResolvedSource = (
-    GeneratorPeerUpdateSource | TrainerUpdateSource | ObjectStorageUpdateSource
+    GeneratorPeerUpdateSource | TrainerSourceSnapshot | ObjectStorageUpdateSource
 )
 
 
@@ -324,15 +352,27 @@ class WeightUpdatePlanner:
         version: WeightVersion,
         *,
         source_kind: WeightSource | None = None,
-    ):
+    ) -> Iterator[WeightUpdatePlan]:
+        discovery_error: BaseException | None = None
+        yielded = False
         for resolver in self._resolvers:
             if source_kind is not None and resolver.kind is not source_kind:
                 continue
             if not resolver.supports(version):
                 continue
             resolved_plans = []
-            for attempt, source in enumerate(resolver.candidates(version)):
-                if attempt >= self._max_transfer_attempts:
+            candidates = None
+            for _ in range(self._max_transfer_attempts):
+                try:
+                    if candidates is None:
+                        candidates = iter(resolver.candidates(version))
+                    source = next(candidates)
+                except StopIteration:
+                    break
+                except StrategyRecoveryError:
+                    raise
+                except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
+                    discovery_error = error
                     break
                 for method in self._methods:
                     if not method.supports(source=source):
@@ -354,6 +394,7 @@ class WeightUpdatePlanner:
                         installer=self._installer,
                     )
                     resolved_plans.append(plan)
+                    yielded = True
                     yield plan
                     break
             # Trainer and object-storage transfers may fail transiently even
@@ -363,6 +404,8 @@ class WeightUpdatePlanner:
             if resolver.kind is not WeightSource.GENERATOR and len(resolved_plans) == 1:
                 for _ in range(1, self._max_transfer_attempts):
                     yield resolved_plans[0]
+        if not yielded and discovery_error is not None:
+            raise discovery_error
 
     def validate(
         self,
@@ -410,7 +453,7 @@ __all__ = [
     "PreparedRuntimeTensors",
     "ResolvedSource",
     "StagedEngineTensors",
-    "TrainerUpdateSource",
+    "TrainerSourceSnapshot",
     "UpdateMethod",
     "WeightSource",
     "SourceResolver",

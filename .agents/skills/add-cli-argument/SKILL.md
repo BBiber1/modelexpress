@@ -20,3 +20,15 @@ Client CLI arguments are defined in a shared struct to avoid duplication:
    - Only add CLI-specific arguments there (e.g., `--format`, `--verbose`)
 
 4. **Add tests** in the `tests` module of `client_config.rs`
+
+For Python-only refit environment controls, register the type and getter in
+`modelexpress/envs.py` and document the default and lifetime in
+`docs/DEPLOYMENT.md`. Load-time refit cache and diagnostic settings are captured
+once in `RefitCacheConfig` and shared by the transfer and trainer resolver; tests
+must create a new client to change them. Keep independent cache controls scoped
+to their owned resources.
+
+The load-time READ descriptor control belongs to the compiled pull plan. Keep
+`MX_REFIT_CACHE_DESCRIPTORS` independent of plan and generator-layout retention;
+`MX_REFIT_DEBUG_VALIDATE_WORKSPACE` enables registration diagnostics only. Do not
+conflate them with the separate receiver `MX_RESHARD_CACHE_DESCRIPTORS` control.

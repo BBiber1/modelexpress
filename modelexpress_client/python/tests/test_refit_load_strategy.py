@@ -28,6 +28,8 @@ from modelexpress_rl.inference.load_strategy import (
     RLLoadStrategyChain,
     _resolve_s3_replay_chain,
 )
+
+
 def _context():
     """Build a default load context for cold-start strategy tests."""
     ctx = MagicMock()
@@ -63,8 +65,9 @@ def _version(
     base=None,
     model_name="test-model",
     state=WeightVersionState.READY,
-):
+) -> WeightVersion:
     return WeightVersion(
+        trainer_mesh_generation=0,
         version_id=uid,
         model_name=model_name,
         payload_format=payload_format,

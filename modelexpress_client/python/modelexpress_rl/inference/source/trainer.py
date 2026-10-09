@@ -9,14 +9,16 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import grpc
+from modelexpress import envs
 from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
 from ...train import WeightPayloadFormat
-from ..adapter import GeneratorSource, GeneratorTransferInputs, NixlGeneratorSource
-from ..plan import ResolvedSource, SourceResolver, TrainerUpdateSource, WeightSource
+from .._cache_config import RefitCacheConfig
+from ..adapter import TrainerSourceShard
+from ..plan import ResolvedSource, SourceResolver, TrainerSourceSnapshot, WeightSource
 
 logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 
@@ -41,14 +43,14 @@ class _SlotReplicas:
         self,
         slot_id: str,
         shards: list[refit_pb2.WeightVersionShard],
-        resolve: Callable[[refit_pb2.WeightVersionShard], GeneratorSource],
+        resolve: Callable[[refit_pb2.WeightVersionShard], TrainerSourceShard],
     ) -> None:
         self.slot_id = slot_id
         self._pending = list(shards)
         self._resolve = resolve
-        self._usable: list[GeneratorSource] = []
+        self._usable: list[TrainerSourceShard] = []
 
-    def usable(self, index: int) -> GeneratorSource | None:
+    def usable(self, index: int) -> TrainerSourceShard | None:
         """Return the index-th usable replica, resolving no further than needed."""
         while len(self._usable) <= index and self._pending:
             shard = self._pending.pop(0)
@@ -84,10 +86,13 @@ class TrainerSourceResolver(SourceResolver):
         *,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
+        cached_source: Callable[[], TrainerSourceSnapshot | None] | None = None,
+        cache_config: RefitCacheConfig | None = None,
     ) -> None:
+        self._cache_config = cache_config or RefitCacheConfig()
         self._service = service
         self._rpc_timeout_seconds = rpc_timeout_seconds
-        self._manifest_cache: dict[tuple[str, str], tuple[str, str, bytes, str]] = {}
+        self._cached_source = cached_source
 
     @property
     def kind(self) -> WeightSource:
@@ -116,11 +121,29 @@ class TrainerSourceResolver(SourceResolver):
             return
         if not mesh_response.HasField("mesh"):
             raise RuntimeError("MX GetTrainerMesh response is missing mesh")
+        mesh = mesh_response.mesh
+        if mesh.mesh_id != version.trainer_mesh_id:
+            raise RuntimeError("MX GetTrainerMesh returned a different mesh ID")
+        if mesh.generation != version.trainer_mesh_generation:
+            raise RuntimeError(
+                "weight version trainer mesh generation differs from the current mesh"
+            )
+        cached = self._cached_source() if self._cached_source is not None else None
+        same_mesh = cached is not None and (mesh.mesh_id, mesh.generation) == (
+            cached.mesh_id,
+            cached.mesh_generation,
+        )
+        diagnostic = (
+            self._cache_config.validate_plan or self._cache_config.publish_digest
+        )
+        if same_mesh and self._cache_config.cache_plan and not diagnostic:
+            yield cached
+            # A resumed candidate means preparation failed: discover fresh replicas.
         expected_slots = tuple(sorted({
             metadata.logical_shard_id for metadata in mesh_response.mesh.workers.values()
         }))
         mesh_workers = mesh_response.mesh.workers
-        mesh_generation = mesh_response.mesh.generation
+        mesh_generation = version.trainer_mesh_generation
         try:
             with refit_span(
                 "source_preparation",
@@ -149,6 +172,7 @@ class TrainerSourceResolver(SourceResolver):
                 continue
             published[shard.logical_shard_id].append(shard)
 
+        counters: dict[str, int | float] = {}
         slots = []
         for source_slot_id in expected_slots:
             ordered = sorted(
@@ -160,26 +184,42 @@ class TrainerSourceResolver(SourceResolver):
                     source_slot_id,
                 )
                 return
-            slots.append(_SlotReplicas(source_slot_id, ordered, self._resolve_source))
+            slots.append(
+                _SlotReplicas(
+                    source_slot_id,
+                    ordered,
+                    lambda shard: self._resolve_source(shard, counters),
+                )
+            )
 
         seen: set[tuple[tuple[str, str], ...]] = set()
         offset = 0
         while True:
-            selected = []
-            for slot in slots:
-                source = slot.usable(offset)
-                if source is None:
-                    if not slot.usable_count:
-                        logger.warning(
-                            "no usable trainer source for required slot %s",
-                            slot.slot_id,
-                        )
-                        return
-                    # Exhausted and shorter than the candidate index, so cycle
-                    # its healthy replicas rather than give up on a slot that
-                    # simply has fewer of them.
-                    source = slot.usable(offset % slot.usable_count)
-                selected.append(source)
+            with refit_span(
+                "source_preparation",
+                metadata={
+                    "manifest_fetch_count": 0,
+                    "manifest_fetch_bytes": 0,
+                    "manifest_bytes": 0,
+                },
+                accumulate_metadata=True,
+                duration_key="source_resolution_s",
+            ) as counters:
+                selected = []
+                for slot in slots:
+                    source = slot.usable(offset)
+                    if source is None:
+                        if not slot.usable_count:
+                            logger.warning(
+                                "no usable trainer source for required slot %s",
+                                slot.slot_id,
+                            )
+                            return
+                        # Exhausted and shorter than the candidate index, so cycle
+                        # its healthy replicas rather than give up on a slot that
+                        # simply has fewer of them.
+                        source = slot.usable(offset % slot.usable_count)
+                    selected.append(source)
             selection = tuple(
                 (source.source_slot_id, source.worker_id) for source in selected
             )
@@ -189,19 +229,17 @@ class TrainerSourceResolver(SourceResolver):
                     refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
                     timeout=self._rpc_timeout_seconds,
                 )
-                if not current.HasField("mesh") or current.mesh.generation != mesh_generation:
+                if (
+                    not current.HasField("mesh")
+                    or current.mesh.mesh_id != version.trainer_mesh_id
+                    or current.mesh.generation != mesh_generation
+                ):
                     raise RuntimeError("trainer mesh generation changed during source resolution")
                 seen.add(selection)
-                yield TrainerUpdateSource(
-                    inputs=GeneratorTransferInputs(
-                        version_id=version.version_id,
-                        base_version_id=version.base_version_id,
-                        layout_signature=version.layout_signature,
-                        payload_format=version.payload_format,
-                        sources=tuple(selected),
-                        trainer_mesh_id=version.trainer_mesh_id,
-                        trainer_mesh_generation=mesh_generation,
-                    )
+                yield TrainerSourceSnapshot(
+                    mesh_id=version.trainer_mesh_id,
+                    mesh_generation=mesh_generation,
+                    shards=tuple(selected),
                 )
             deepest = max((slot.usable_count for slot in slots), default=1)
             if all(slot.exhausted for slot in slots) and offset + 1 >= deepest:
@@ -209,54 +247,25 @@ class TrainerSourceResolver(SourceResolver):
             offset += 1
 
     def _resolve_source(
-        self, shard: refit_pb2.WeightVersionShard
-    ) -> GeneratorSource:
+        self, shard: refit_pb2.WeightVersionShard, counters: dict[str, int | float]
+    ) -> TrainerSourceShard:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
             raise RuntimeError("source is missing its manifest digest")
-        key = (shard.logical_shard_id, shard.worker_id)
-        cached = self._manifest_cache.get(key)
-        reusable = (
-            cached is not None
-            and cached[0] == shard.manifest_endpoint
-            and cached[1] == shard.manifest_digest
-        )
-        with refit_span(
-            "source_preparation",
-            metadata={
-                "manifest_cache_hits": int(reusable),
-                "manifest_cache_misses": int(not reusable),
-            },
-            accumulate_metadata=True,
-        ) as counters:
-            if reusable:
-                # These bytes hashed to this digest when they were stored, so
-                # verifying them again would be checking them against
-                # themselves.
-                assert cached is not None
-                manifest = cached[2]
-                structure_digest = cached[3]
-            else:
-                manifest, structure_digest = self._fetch_manifest(shard)
-                self._manifest_cache[key] = (
-                    shard.manifest_endpoint,
-                    shard.manifest_digest,
-                    manifest,
-                    structure_digest,
-                )
-                counters["manifest_fetch_bytes"] = len(manifest)
-                counters["manifest_fetch_count"] = 1
-            counters["manifest_bytes"] = len(manifest)
-        return GeneratorSource(
+        counters["manifest_fetch_count"] = counters.get("manifest_fetch_count", 0) + 1
+        manifest, structure_digest = self._fetch_manifest(shard)
+        counters["manifest_fetch_bytes"] = counters.get(
+            "manifest_fetch_bytes", 0
+        ) + len(manifest)
+        counters["manifest_bytes"] = counters.get("manifest_bytes", 0) + len(manifest)
+        return TrainerSourceShard(
             source_slot_id=shard.logical_shard_id,
             worker_id=shard.worker_id,
             manifest_digest=shard.manifest_digest,
-            transport=NixlGeneratorSource(
-                manifest_endpoint=shard.manifest_endpoint,
-                manifest=manifest,
-                structural_digest=structure_digest,
-            ),
+            manifest_endpoint=shard.manifest_endpoint,
+            manifest=manifest,
+            structural_digest=structure_digest,
         )
 
     def _fetch_manifest(

@@ -6,7 +6,6 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -31,7 +30,6 @@ from modelexpress_rl import (
     WeightVersionRef,
     WeightVersionState,
 )
-from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import checkpoint_store as checkpoint_store_module
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.methods import (
@@ -39,6 +37,7 @@ from modelexpress_rl.inference.methods import (
     RuntimeTensorNixlUpdateMethod,
 )
 import modelexpress_rl.inference.methods.canonical_delta as canonical_delta_module
+from modelexpress_rl.inference.receiver import PreparedCheckpoint
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -193,8 +192,9 @@ class _Adapter:
     def _checkpoint(self):
         return self._method._checkpoint
 
-    def stage_weight(self, inputs):
+    def stage_weight(self, inputs) -> PreparedCheckpoint:
         version = WeightVersion(
+            trainer_mesh_generation=0,
             version_id=inputs.version_id,
             model_name="test/model",
             payload_format=inputs.payload_format,
@@ -213,10 +213,11 @@ class _Adapter:
         )
         return self._active.checkpoint
 
-    def stage_chain(self, inputs):
+    def stage_chain(self, inputs) -> PreparedCheckpoint:
         chain = []
         for item in inputs:
             version = WeightVersion(
+                trainer_mesh_generation=0,
                 version_id=item.version_id,
                 model_name="test/model",
                 payload_format=item.payload_format,
@@ -464,10 +465,10 @@ def _inputs(
     version="target-a",
     version_label=1,
     uri=None,
-):
+) -> SimpleNamespace:
     if uri is None:
         uri = f"s3://weights/test/v{version_label}/model.safetensors.index.json"
-    return GeneratorTransferInputs(
+    return SimpleNamespace(
         version_id=version,
         base_version_id=base_version,
         layout_signature="",
@@ -516,16 +517,11 @@ def _full_artifact(tensor, *, version_label=2):
     }
 
 
-def _full_inputs(*, version="full-a", version_label=2):
-    return replace(
-        _inputs(
-            None,
-            version=version,
-            version_label=version_label,
-        ),
-        base_version_id=None,
-        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
-    )
+def _full_inputs(*, version="full-a", version_label=2) -> SimpleNamespace:
+    inputs = _inputs(None, version=version, version_label=version_label)
+    inputs.base_version_id = None
+    inputs.payload_format = WeightPayloadFormat.FULL_HF_CHECKPOINT
+    return inputs
 
 
 @pytest.mark.parametrize("reported_size_gb", [None, 600])
@@ -1119,14 +1115,12 @@ def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path)
 def test_canonical_s3_rejects_non_s3_source_before_storage_access(
     monkeypatch,
     tmp_path,
-):
+) -> None:
     adapter, storage = _build(monkeypatch, tmp_path, {})
-    inputs = replace(
-        _inputs(None),
-        object_storage=ObjectStorageSource(
-            storage_type=ObjectStorageType.GCS,
-            uri="gs://weights/test/v1/model.safetensors.index.json",
-        ),
+    inputs = _inputs(None)
+    inputs.object_storage = ObjectStorageSource(
+        storage_type=ObjectStorageType.GCS,
+        uri="gs://weights/test/v1/model.safetensors.index.json",
     )
 
     with pytest.raises(ValueError, match="requires S3 object storage"):
@@ -1975,7 +1969,7 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
 @pytest.mark.parametrize("aliased_manifest_ids", [False, True])
 def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids, startup_seed
-):
+) -> None:
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
     objects = _full_artifact(tensors[0], version_label=0)
     inputs = [_full_inputs(version="base-a", version_label=0)]
@@ -2003,6 +1997,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         )
     versions = {
         item.version_id: WeightVersion(
+            trainer_mesh_generation=0,
             version_id=item.version_id,
             model_name="test/model",
             payload_format=item.payload_format,
@@ -2042,9 +2037,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
-    generator._staging_buffer_bytes = None
-    generator._staging_buffers_count = 1
-    generator._staging_device = "cuda"
+    generator._streaming = None
     monkeypatch.setattr(
         generator,
         "_fetch_ready_version",
