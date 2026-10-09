@@ -97,6 +97,7 @@ def test_cold_shards_aggregate_fetch_counts(monkeypatch, count) -> None:
         assert len(resolved.shards) == count
         assert all(shard.manifest == b'{"tensors": []}' for shard in resolved.shards)
         stage = recorder.as_dict()["stages"]["source_preparation"]
+        assert "mesh_lookup_s" in stage["metadata"]
         assert stage["metadata"]["manifest_fetch_count"] == count
         assert stage["metadata"]["manifest_bytes"] == count * size
         assert "source_resolution_s" in stage["metadata"]

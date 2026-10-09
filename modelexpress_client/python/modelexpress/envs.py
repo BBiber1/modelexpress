@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
     MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
+    MX_REFIT_TRACE_DETAIL: bool
     MX_REFIT_STAGE_RECORD: bool
     MX_REFIT_PACK_MODULES: bool
     MX_REFIT_CACHE_GENERATOR_LAYOUT: bool
@@ -331,6 +332,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # One JSON stage record per refit. On by default: the timings are already
     # computed, and at INFO they were never captured by a benchmark run.
+    "MX_REFIT_TRACE_DETAIL": lambda: _env_bool("MX_REFIT_TRACE_DETAIL", False),
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
     "MX_REFIT_CACHE_GENERATOR_LAYOUT": lambda: _env_bool(
         "MX_REFIT_CACHE_GENERATOR_LAYOUT", True

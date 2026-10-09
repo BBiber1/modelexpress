@@ -82,6 +82,7 @@ def _create(command: Callable[..., str], uid: str, *, mesh_id: str = "mesh") -> 
             "123",
             mesh_id,
             "",
+            "{}",
         ],
     )
 
