@@ -1534,6 +1534,8 @@ it does not establish a stable configuration API.
 | --- | --- | --- |
 | `MX_REFIT_CACHE_PLAN` | `1` | Retain trainer metadata and compiled pull plans for the current mesh. Disable to fetch trainer manifests and compile each preparation. |
 | `MX_REFIT_CACHE_GENERATOR_LAYOUT` | `1` | Retain the owned generator capture across compatible trainer meshes. Disable to capture and compile each preparation while trainer metadata may remain cached. |
+| `MX_REFIT_CACHE_DESCRIPTORS` | `1` | Retain READ bindings in the compiled plan. Disable to bind descriptors each preparation without disabling trainer or generator-layout caches. |
+| `MX_REFIT_DEBUG_VALIDATE_WORKSPACE` | `0` | Check retained registration identity and geometry before preparation and READ posts, including between bounded yields; fail on drift. |
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Fetch current manifests and validate cached source geometry and plan coverage on warm refits. Structural drift under unchanged mesh identity fails preparation. |
 | `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Recapture generator load mappings and parameter layout on warm refits; fail preparation on drift. |
 | `MX_REFIT_PACK_MODULES` | `1` | Pack consecutive owning modules into batches within the staging budget; this controls the batching algorithm, not cache retention. |

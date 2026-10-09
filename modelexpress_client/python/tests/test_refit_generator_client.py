@@ -1815,9 +1815,9 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 raise prepare_error("preparation failure")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
-                ],
+                cached_plan=SimpleNamespace(
+                    parameter_names=frozenset({"a.weight", "b.weight"})
+                ),
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -2389,7 +2389,7 @@ def test_streaming_forwards_staging_options_to_the_method(
             prepare_calls.append(kwargs)
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(layouts=({"a.weight": None},))],
+                cached_plan=SimpleNamespace(parameter_names=frozenset({"a.weight"})),
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -2499,12 +2499,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             events.append("prepare")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(
-                        layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
-                    )
-                    for index in range(2)
-                ],
+                cached_plan=SimpleNamespace(
+                    parameter_names=frozenset({"0.weight", "1.weight"})
+                ),
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -2700,7 +2697,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
                     raise ValueError("injected streaming preparation failure")
                 return SimpleNamespace(
                     metrics={},
-                    batches=[SimpleNamespace(layouts=({"weight": None},))],
+                    cached_plan=SimpleNamespace(parameter_names=frozenset({"weight"})),
                 )
 
         def reset_workspace(self):

@@ -35,7 +35,7 @@ def setup_method(
                 raise RuntimeError("preparation failed")
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(layouts=({"weight": None},))],
+                cached_plan=SimpleNamespace(parameter_names=frozenset({"weight"})),
             )
 
         def iter_bounded(self, prepared, metrics):

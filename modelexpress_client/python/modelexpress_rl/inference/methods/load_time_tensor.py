@@ -115,9 +115,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             metrics = dict(prepared.metrics)
             streamed = PreparedStreamingTensors(
                 batches=lambda: self._transfer.iter_bounded(prepared, metrics),
-                parameter_names=frozenset(
-                    name for batch in prepared.batches for name in batch.layouts[0]
-                ),
+                parameter_names=prepared.cached_plan.parameter_names,
                 transfer_metrics=metrics,
             )
         except Exception:

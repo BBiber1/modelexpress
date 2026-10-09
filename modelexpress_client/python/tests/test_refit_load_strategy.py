@@ -28,6 +28,8 @@ from modelexpress_rl.inference.load_strategy import (
     RLLoadStrategyChain,
     _resolve_s3_replay_chain,
 )
+
+
 def _context():
     """Build a default load context for cold-start strategy tests."""
     ctx = MagicMock()
