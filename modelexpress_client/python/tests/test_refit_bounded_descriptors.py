@@ -4,18 +4,22 @@
 import ctypes
 import gc
 import weakref
+from collections.abc import Iterator
 from dataclasses import replace
 from types import SimpleNamespace
 
 import modelexpress_rl.inference.nixl_staged_transfer as module
 import pytest
 import torch
+from modelexpress import envs
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
+from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
@@ -24,7 +28,7 @@ from modelexpress.refit.reshard.types import (
 
 
 @pytest.fixture
-def harness(monkeypatch):
+def harness(monkeypatch) -> Iterator[SimpleNamespace]:
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
@@ -123,7 +127,7 @@ def harness(monkeypatch):
         listen_port=None,
     )
 
-    def manifests():
+    def manifests() -> list[bytes]:
         return [
             wrap_rendezvous_blob(
                 b"source",
@@ -142,6 +146,8 @@ def harness(monkeypatch):
                                 addr=tensor.data_ptr(),
                                 shard_offset=(0, 0),
                                 shape=(4, 4),
+                                digest=tensor_digest(tensor)
+                                if envs.MX_RESHARD_PUBLISH_DIGEST else None,
                             )
                         ],
                     )
@@ -154,8 +160,9 @@ def harness(monkeypatch):
         captures.append(manifest)
         return capture, layout
 
-    def prepare(**kwargs):
-        return transfer.prepare(
+    def prepare(**kwargs) -> module._PreparedBoundedTransfer:
+        return transfer.prepare_streaming(
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
             manifests=manifests(),
             capture_layout=capture_layout,
             **{"max_staging_bytes": 1024, "staging_device": "cpu", **kwargs},
@@ -406,3 +413,29 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     assert now[0] == 400
     assert cold["wire_s"] == warm["wire_s"] == 0
     assert warm["descriptor_builds"] == 0
+
+
+@pytest.mark.parametrize("tensor_indices", [False, True])
+def test_prepared_list_indexing_replays_selected_rows_after_caller_mutation(
+    harness, monkeypatch, tensor_indices
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    indices = torch.tensor([0, 2]) if tensor_indices else [0, 2]
+    copy = harness.capture.copies[1]
+    copy.op_chain = (("__getitem__", (indices,), ()),)
+    copy.dest_shape = (2, 4)
+    copy.dest_stride = (4, 1)
+    prepared = harness.prepare()
+    indices[:] = torch.tensor([1, 3]) if tensor_indices else [1, 3]
+    _, installed = harness.collect(prepared)
+    expected = torch.zeros(20, dtype=torch.float32)
+    expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
+    assert torch.equal(installed["b.weight"], expected)
+    fresh_indices = torch.tensor([0, 2]) if tensor_indices else [0, 2]
+    copy.op_chain = (("__getitem__", (fresh_indices,), ()),)
+    _, installed = harness.collect(harness.prepare())
+    assert torch.equal(installed["b.weight"], expected)
+    harness.sources["full"].add_(5)
+    _, installed = harness.collect(harness.prepare())
+    expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
+    assert torch.equal(installed["b.weight"], expected)

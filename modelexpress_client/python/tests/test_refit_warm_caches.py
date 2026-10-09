@@ -452,6 +452,8 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
     assert metrics["plan_cache_misses"] == 1
 
 
+
+
 @pytest.mark.parametrize("invalid", [0, -1, True, 512.0])
 def test_bounded_plan_cache_rejects_bad_budget_even_when_numerically_equal(
     monkeypatch, invalid

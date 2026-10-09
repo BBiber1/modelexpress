@@ -1786,7 +1786,14 @@ leave existing publications intact. An update with unchanged membership remains 
 After readers release their leases, membership may advance and new weight
 versions capture the new generation; old version stamps are never changed.
 
-Full-copy and bounded updates enter one session staging flow. Frozen streaming
-settings select the bounded method while the version lease remains held through
-installation or release. Preparation retry and recovery behavior stays scoped
-to the selected update strategy; failures after a possible write fence the engine.
+Preparation uses a required trainer snapshot containing its mesh identity and
+selected immutable shards. The transfer's cached plan owns the parsed trainer
+metadata, an owned copy of the existing generator `CaptureResult`, and the full
+destination layout. Full-copy and bounded preparation share failure cleanup,
+source connection and publication helpers; their physical allocation and transfer
+algorithms remain separate. Client staging settings enter the same session
+staging flow, which retains the version lease through installation or release.
+Static staging inputs are validated at preparation; compilation and packing
+consume that validated budget while retaining coverage and aggregate-capacity
+checks. The existing structural plan/source caches and lazy descriptor bindings
+remain in use at this layer.

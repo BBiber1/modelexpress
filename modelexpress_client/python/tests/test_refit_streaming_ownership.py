@@ -7,15 +7,19 @@ import pytest
 import torch
 from modelexpress_rl.inference import runtime
 from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
+    TrainerSourceShard,
 )
-from modelexpress_rl.inference.plan import PreparedStreamingTensors, TrainerUpdateSource
+from modelexpress_rl.inference.plan import (
+    PreparedStreamingTensors,
+    TrainerSourceSnapshot,
+)
+from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def setup_method(monkeypatch):
+def setup_method(
+    monkeypatch,
+) -> tuple[LoadTimeTensorNixlUpdateMethod, TrainerSourceSnapshot, list, torch.Tensor]:
     events = []
     arena = torch.ones(2, 2)
 
@@ -25,15 +29,13 @@ def setup_method(monkeypatch):
         def __init__(self, **kwargs):
             self.arena = arena
 
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             events.append(("prepare", kwargs))
             if self.fail_prepare:
                 raise RuntimeError("preparation failed")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(layouts=({"weight": ((2, 2), torch.float32)},))
-                ],
+                batches=[SimpleNamespace(layouts=({"weight": None},))],
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -53,21 +55,19 @@ def setup_method(monkeypatch):
         capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=None),
         worker_id="receiver",
     )
-    source = TrainerUpdateSource(
-        GeneratorTransferInputs(
-            version_id="v:1",
-            base_version_id=None,
-            layout_signature="",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            sources=(
-                GeneratorSource(
-                    "slot",
-                    "trainer",
-                    "digest",
-                    NixlGeneratorSource("trainer:19000", b"manifest", "structure"),
-                ),
+    source = TrainerSourceSnapshot(
+        mesh_id="mesh",
+        mesh_generation=1,
+        shards=(
+            TrainerSourceShard(
+                source_slot_id="slot",
+                worker_id="trainer",
+                manifest_digest="digest",
+                manifest_endpoint="trainer:19000",
+                manifest=b"manifest",
+                structural_digest="structure",
             ),
-        )
+        ),
     )
     return method, source, events, arena
 
@@ -166,18 +166,14 @@ def test_foreign_or_released_stream_cannot_enter_or_release_active_source(monkey
     assert method._transfer.arena is None
 
 
-def test_failed_unread_preparation_resets_workspace_and_allows_retry(monkeypatch):
+def test_failed_unread_preparation_resets_workspace_and_allows_retry(
+    monkeypatch,
+) -> None:
     method, source, events, _ = setup_method(monkeypatch)
-    method._active_plan = object()
-    method._active_fingerprint = ("old",)
-    method._active_manifest_digests = ("old",)
     method._transfer.fail_prepare = True
     with pytest.raises(RuntimeError, match="preparation failed"):
         prepare(method, source)
     assert method._active_streamed is None
-    assert method._active_plan is None
-    assert method._active_fingerprint is None
-    assert method._active_manifest_digests == ()
     assert [name for name, _ in events] == ["prepare", "reset"]
     method._transfer.fail_prepare = False
     prepared = prepare(method, source)
