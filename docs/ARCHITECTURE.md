@@ -1796,9 +1796,8 @@ staging flow, which retains the version lease through installation or release.
 Static staging inputs are validated at preparation; compilation and packing
 consume that validated budget while retaining coverage and aggregate-capacity
 checks. Trainer metadata and compiled plans are reused for an unchanged mesh.
-Cache and diagnostic controls are fixed when the client is created. Default warm
-source discovery only checks current mesh identity and generation; debug or digest
-modes fetch current manifests. Cold preparation captures through the engine
-callback; existing workspace compatibility and owned-reset checks still apply.
-Descriptor bindings
-remain lazy at this layer.
+The independently owned generator capture survives compatible mesh and workspace
+changes; a changed logical source schema requires recapture. Cache and diagnostic
+controls are fixed when the client is created. Default warm source discovery only
+checks current mesh identity and generation; debug or digest modes fetch current
+manifests. Descriptor bindings remain lazy at this layer.

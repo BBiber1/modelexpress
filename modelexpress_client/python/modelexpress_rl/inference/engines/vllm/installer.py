@@ -13,7 +13,6 @@ by compiled CUDA graphs.
 from __future__ import annotations
 
 import copy
-import hashlib
 import logging
 import time
 from collections import OrderedDict
@@ -37,7 +36,6 @@ from modelexpress.refit.reshard.geometry import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
-from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -576,7 +574,6 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
-        self._capture_cache = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
     @cached_property
@@ -590,55 +587,6 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
         return _get_original_loader
-
-    def _capture_key(self, manifest):
-        original_loader = self._original_loader
-
-        def function_identity(function):
-            return (
-                id(getattr(function, "__func__", function)),
-                id(function.__self__) if hasattr(function, "__self__") else None,
-            )
-
-        parameters = tuple(
-            (
-                name,
-                id(parameter),
-                parameter.data_ptr(),
-                tuple(parameter.shape),
-                tuple(parameter.stride()),
-                parameter.dtype,
-                parameter.device,
-                function_identity(original_loader(parameter)),
-            )
-            for name, parameter in self._model.named_parameters(remove_duplicate=False)
-        )
-        modules = tuple(
-            (name, id(module), function_identity(getattr(module, "load_weights", None)))
-            for name, module in self._model.named_modules()
-        )
-        routing_buffers = tuple(
-            (
-                name,
-                id(buffer),
-                buffer.data_ptr(),
-                tuple(buffer.shape),
-                hashlib.sha256(
-                    buffer.detach().cpu().contiguous().numpy().tobytes()
-                ).digest()
-                if buffer.is_inference()
-                else buffer._version,
-            )
-            for name, buffer in self._model.named_buffers()
-            if not buffer.is_floating_point() and not buffer.is_complex()
-        )
-        return (
-            tuple(manifest),
-            parameters,
-            modules,
-            routing_buffers,
-            id(self._convert_native_to_hf),
-        )
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -787,20 +735,6 @@ class _VllmInstaller(EngineInstaller):
         afterward without finalizing (finalizing would commit the empty skeletons
         and corrupt the live params).
         """
-        if not self._is_quantized and self._capture_cache is not None:
-            key, result = self._capture_cache
-            current_key = self._capture_key(manifest)
-            if key == current_key:
-                copies = (
-                    result.indices
-                    if type(result) is _CaptureSnapshot
-                    else result[0].copies
-                )
-                logger.info("reusing cached vLLM load layout (%d copies)", len(copies))
-                if type(result) is _CaptureSnapshot:
-                    return result.clone()
-                return copy.deepcopy(result)
-        self._capture_cache = None
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -852,15 +786,6 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
-        if (
-            not self._is_quantized
-            and not capture.unsupported
-            and not capture.unattributed
-        ):
-            self._capture_cache = (
-                self._capture_key(manifest),
-                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
-            )
         return capture, param_layout
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:

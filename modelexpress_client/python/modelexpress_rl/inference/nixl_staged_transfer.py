@@ -601,6 +601,9 @@ class _NixlStagedTransfer:
         cache_config: RefitCacheConfig | None = None,
     ) -> None:
         self.cache_config = cache_config or RefitCacheConfig()
+        self._generator_layout: tuple[tuple, CaptureResult, MappingProxyType] | None = (
+            None
+        )
         self._trainer_snapshot: TrainerSourceSnapshot | None = None
         self._verify_trainer_mesh = verify_trainer_mesh
         self._transport: NixlReshardTransport | None = None
@@ -747,7 +750,9 @@ class _NixlStagedTransfer:
     ) -> _CachedPullPlan | None:
         if previous is None:
             return None
-        if not self.cache_config.cache_plan:
+        if not (
+            self.cache_config.cache_plan and self.cache_config.cache_generator_layout
+        ):
             return None
         cached = previous.trainer_source_snapshot
         diagnostic = self.cache_config.validate_plan or self.cache_config.publish_digest
@@ -776,7 +781,7 @@ class _NixlStagedTransfer:
             source_cache_misses=0,
             source_manifest_bytes=0,
         )
-        if not diagnostic:
+        if not (diagnostic or self.cache_config.validate_generator_layout):
             return previous
         trainer = cached
         if diagnostic:
@@ -802,6 +807,18 @@ class _NixlStagedTransfer:
             )
         capture = previous.generator_capture_snapshot
         parameter_layout = previous.parameter_layout
+        if self.cache_config.validate_generator_layout:
+            resolved = trainer.resolved_metadata
+            manifest = [
+                (name, row.dtype, tuple(row.global_shape))
+                for name, row in resolved.sources.items()
+            ]
+            current_capture, current_layout = capture_layout(manifest)
+            if not _layout_values_match(
+                (capture, dict(parameter_layout)),
+                (current_capture, current_layout),
+            ):
+                raise ValueError("generator layout changed while reusing cached plan")
         if self.cache_config.validate_plan:
             compiled = previous.compiled
             plan = (
@@ -882,10 +899,30 @@ class _NixlStagedTransfer:
             for name, source in resolved.sources.items()
         )
         metrics["source_metadata_s"] = time.perf_counter() - started
+        retained = self._generator_layout
+        if (
+            self.cache_config.cache_generator_layout
+            and retained is not None
+            and retained[0] == manifest
+        ):
+            if self.cache_config.validate_generator_layout:
+                current = capture_layout(list(manifest))
+                if not _layout_values_match((retained[1], dict(retained[2])), current):
+                    raise ValueError(
+                        "generator layout changed while reusing cached layout"
+                    )
+            metrics["layout_capture_s"] = 0.0
+            return trainer, retained[1], retained[2]
         started = time.perf_counter()
         capture, parameter_layout = deepcopy(capture_layout(list(manifest)))
+        parameter_layout = MappingProxyType(parameter_layout)
+        self._generator_layout = (
+            (manifest, capture, parameter_layout)
+            if self.cache_config.cache_generator_layout
+            else None
+        )
         metrics["layout_capture_s"] = time.perf_counter() - started
-        return trainer, capture, MappingProxyType(parameter_layout)
+        return trainer, capture, parameter_layout
 
     def _connect_sources(
         self,
@@ -899,14 +936,24 @@ class _NixlStagedTransfer:
             for agent, metadata in required_metadata.items()
             if self._loaded_agent_metadata.get(agent) != metadata
         }
-        conflicting = sorted(
-            agent for agent in changed if agent in self._loaded_agent_metadata
-        )
-        if conflicting:
+        obsolete = [
+            agent
+            for agent, metadata in self._loaded_agent_metadata.items()
+            if required_metadata.get(agent) != metadata
+        ]
+        if obsolete and not self._owns_manager:
             raise RuntimeError(
-                "NIXL metadata changed for an already connected source agent: "
-                f"{conflicting[:10]}"
+                "cannot replace source agents on a borrowed NIXL manager"
             )
+        for agent in obsolete:
+            if not self._manager.remove_remote_agent(agent):
+                mode = self._workspace_mode
+                self.reset_workspace()
+                assert mode is not None
+                self._select_workspace_mode(mode)
+                changed = required_metadata
+                break
+            del self._loaded_agent_metadata[agent]
         _load_agent_metadata(self._manager, changed)
         self._loaded_agent_metadata.update(changed)
         return NixlReshardTransport(
@@ -922,9 +969,11 @@ class _NixlStagedTransfer:
     def _preparing(self) -> Iterator[None]:
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
+        previous_layout = self._generator_layout
         try:
             yield
         except Exception:
+            self._generator_layout = previous_layout
             self._trainer_snapshot = None
             self._cached_pull_plan = None
             self._full_copy_descriptors = None
@@ -1792,6 +1841,7 @@ class _NixlStagedTransfer:
             return
         self._invalidate_descriptors()
         self._cached_pull_plan = None
+        self._generator_layout = None
         self._trainer_snapshot = None
         self._full_copy_descriptors = None
         self._transport = None
