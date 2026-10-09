@@ -1768,3 +1768,10 @@ be qualified with changing weights, shared parameters, graph-bound addresses,
 post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
+
+Mesh-backed weight versions include the trainer mesh generation captured atomically
+by the server at creation. Idempotent retries return the original generation.
+Shard publication, including the final READY transition and repeated publications,
+rejects a changed generation before writing. Stored mesh versions without a
+positive generation must be recreated. Versions without a trainer mesh carry
+generation zero.
