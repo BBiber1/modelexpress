@@ -1785,3 +1785,8 @@ weight version has an active consumer lease, including additive replicas that
 leave existing publications intact. An update with unchanged membership remains a no-op.
 After readers release their leases, membership may advance and new weight
 versions capture the new generation; old version stamps are never changed.
+
+Full-copy and bounded updates enter one session staging flow. Frozen streaming
+settings select the bounded method while the version lease remains held through
+installation or release. Preparation retry and recovery behavior stays scoped
+to the selected update strategy; failures after a possible write fence the engine.
