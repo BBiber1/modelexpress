@@ -16,7 +16,7 @@ import copy
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from inspect import getattr_static
