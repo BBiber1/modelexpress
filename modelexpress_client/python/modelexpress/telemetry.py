@@ -62,6 +62,15 @@ def refit_metadata(
     return attributes
 
 
+def refit_rank(fallback: int | None = None) -> int:
+    """Resolve the current global rank, preferring trace context over process env."""
+    if (rank := _refit_attributes.get().get("rank")) is not None:
+        return int(rank)
+    if (rank := os.environ.get("RANK")) is not None:
+        return int(rank)
+    return int(fallback) if fallback is not None else 0
+
+
 def _metric_dimensions(attributes: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in attributes.items() if key in ("role", "rank", "experiment", "staging_mode")}
 
@@ -525,12 +534,18 @@ class _NixlBatch:
     """Private asynchronous batch lifetime; no context stays attached while waiting."""
 
     def __init__(self) -> None:
+        self._start_ns = time.time_ns()
+        self._parent_context = None
+        self._attributes: dict[str, Any] = {}
+        if enabled() and recording():
+            from opentelemetry import context
+
+            self._parent_context = context.get_current()
+            self._attributes = dict(_refit_attributes.get())
         self._span: Any | None = None
         self._requests: dict[Any, dict[str, Any]] = {}
         self._posting = False
         self._error: BaseException | None = None
-        self._start_ns = 0
-        self._attributes: dict[str, Any] = {}
 
     @contextlib.contextmanager
     def posting(self) -> Iterator[None]:
@@ -555,12 +570,12 @@ class _NixlBatch:
         if not recording():
             return None
         if self._span is None:
-            self._start_ns = time.time_ns()
             self._span = _process_tracer().start_span(
-                "mx.refit.nixl_batch", start_time=self._start_ns
+                "mx.refit.nixl_batch",
+                context=self._parent_context,
+                start_time=self._start_ns,
             )
             if self._span.is_recording():
-                self._attributes = dict(_refit_attributes.get())
                 self._span.set_attributes(self._attributes)
         if not self._span.is_recording():
             return None
@@ -614,7 +629,7 @@ class _NixlBatch:
                     duration(
                         "mx_refit_nixl_"
                         + (
-                            "batch_duration"
+                            "observed_batch_duration"
                             if name == "batch_duration_s"
                             else kind + "_" + name.removesuffix("_s")
                         ),
@@ -686,7 +701,7 @@ class _NixlBatch:
                 ),
                 "nixl.telemetry_count": len(samples),
                 "nixl.telemetry.complete": len(samples) == len(self._requests),
-                "nixl.batch_duration_s": elapsed,
+                "nixl.observed_batch_duration_s": elapsed,
             }
         )
         if samples:
@@ -708,7 +723,9 @@ class _NixlBatch:
                 and len(samples) == len(self._requests)
                 and self._error is None
             ):
-                attrs["nixl.payload_gbps"] = 8 * values["total_bytes"] / elapsed / 1e9
+                attrs["nixl.observed_payload_gbps"] = (
+                    8 * values["total_bytes"] / elapsed / 1e9
+                )
         self._span.set_attributes(attrs)
         if self._error is not None:
             self._span.set_status(StatusCode.ERROR, str(self._error))

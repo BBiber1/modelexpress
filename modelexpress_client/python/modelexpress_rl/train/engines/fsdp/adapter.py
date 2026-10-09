@@ -283,7 +283,13 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
         if mx_envs.MX_RESHARD_PUBLISH_DIGEST:
             # Host digests must not read buffers before asynchronous copies finish.
-            publish_ready.wait()
+            with refit_span(
+                "source_preparation",
+                metadata={"staging_syncs": 1},
+                accumulate_metadata=True,
+                duration_key="staging_sync_s",
+            ):
+                publish_ready.wait()
         return self._staged(shards, publish_ready)
 
     def _snapshot_into_arenas(self, shards: list[LocalTensorShard]) -> CompletionFence:

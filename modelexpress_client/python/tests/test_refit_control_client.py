@@ -103,7 +103,7 @@ def test_weight_version_required_fields_precede_optional_fields():
 
     optional_seen = False
     for field in fields(control_module.WeightVersion):
-        if field.default is MISSING:
+        if field.default is MISSING and field.default_factory is MISSING:
             assert not optional_seen
         else:
             optional_seen = True
@@ -118,6 +118,7 @@ def test_weight_version_required_fields_precede_optional_fields():
     assert version.base_version_id is None
     assert version.object_storage is None
     assert version.trainer_mesh_id is None
+    assert version.trace_context == {}
     assert version.version_number is None
 
 

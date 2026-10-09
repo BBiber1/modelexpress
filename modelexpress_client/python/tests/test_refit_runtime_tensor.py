@@ -54,7 +54,7 @@ class _Transfer:
         if self.fail_before_start:
             raise RuntimeError("peer disappeared before transfer")
         on_transfer_start()
-        return {"bytes_received": 16, "wire_s": 0.25}
+        return {"bytes_received": 16, "wire_host_s": 0.25}
 
     def close(self):
         self.closed = True

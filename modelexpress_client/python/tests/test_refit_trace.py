@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
+import logging
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,6 +43,54 @@ def _by_name(exporter):
 
 def _baggage(carrier):
     return dict(part.split("=", 1) for part in carrier["baggage"].split(","))
+
+
+def test_refit_rank_prefers_active_rank_then_global_env_then_fallback(monkeypatch):
+    monkeypatch.setenv("RANK", "8")
+    assert telemetry.refit_rank(fallback=0) == 8
+
+    with telemetry.refit_attributes({"role": "trainer", "rank": 3}):
+        assert telemetry.refit_rank(fallback=0) == 3
+
+    monkeypatch.delenv("RANK")
+    assert telemetry.refit_rank(fallback=3) == 3
+    assert telemetry.refit_rank() == 0
+
+
+def test_trainer_e2e_span_and_timing_record_use_global_rank(
+    recording, monkeypatch, caplog
+):
+    from modelexpress_rl.train.runtime import TrainerRuntime
+
+    class Method:
+        def stage(self, **_kwargs):
+            return object()
+
+        def publish(self, **_kwargs):
+            pass
+
+    class Runtime(TrainerRuntime):
+        def _full_tensor(self):
+            return self.method
+
+    monkeypatch.setenv("RANK", "8")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("MX_REFIT_TIMING", "1")
+    runtime = Runtime(method=Method(), resources=None)
+    runtime._bound_tensors = {"weight": object()}
+
+    with caplog.at_level(logging.INFO, logger="modelexpress_rl.train.runtime"):
+        runtime.publish_bound(version=SimpleNamespace(version_id="v1"))
+
+    span = _by_name(recording)["mx.refit.trainer_refit_e2e"]
+    assert span.attributes["rank"] == 8
+    payloads = [
+        json.loads(record.message.split(" ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("MX_REFIT_TIMING ")
+    ]
+    assert len(payloads) == 1
+    assert payloads[0]["rank"] == 8
 
 
 def test_rank_zero_trainer_owns_root_and_trainer_group(recording):

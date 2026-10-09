@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
 import torch
-from modelexpress import envs, p2p_pb2
+from modelexpress import envs, p2p_pb2, telemetry
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -932,16 +932,18 @@ class _NixlStagedTransfer:
             raise ValueError("staging_buffers must be a positive integer")
         phase_started = time.perf_counter()
         metrics = {}
-        resolved = self._source_cache.resolve(
-            manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
-        )
-        manifest = [
-            (name, source.dtype, tuple(source.global_shape))
-            for name, source in resolved.sources.items()
-        ]
+        with telemetry.span("mx.refit.source_metadata"):
+            resolved = self._source_cache.resolve(
+                manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
+            )
+            manifest = [
+                (name, source.dtype, tuple(source.global_shape))
+                for name, source in resolved.sources.items()
+            ]
         metrics["source_metadata_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
-        capture, parameter_layout = capture_layout(manifest)
+        with telemetry.span("mx.refit.layout_capture"):
+            capture, parameter_layout = capture_layout(manifest)
         metrics["layout_capture_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         batches = None
@@ -959,23 +961,25 @@ class _NixlStagedTransfer:
                 raise ValueError(
                     "max_staging_bytes must cover at least one byte per staging buffer"
                 )
-            compiled = self._plan_cache.compile(
-                manifests=manifests,
-                resolved=resolved,
-                capture=capture,
-                parameter_layout=parameter_layout,
-                max_staging_bytes=buffer_budget,
-                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-                metrics=metrics,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=max_staging_bytes,
-                source_snapshot=self._source_cache._snapshot,
-            )
+            with telemetry.span("mx.refit.transfer_planning"):
+                compiled = self._plan_cache.compile(
+                    manifests=manifests,
+                    resolved=resolved,
+                    capture=capture,
+                    parameter_layout=parameter_layout,
+                    max_staging_bytes=buffer_budget,
+                    enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
+                    metrics=metrics,
+                    staging_device=staging_device,
+                    staging_buffers=staging_buffers,
+                    total_staging_bytes=max_staging_bytes,
+                    source_snapshot=self._source_cache._snapshot,
+                )
             plan, batches = compiled.plan, compiled.batches
         else:
             self._plan_cache.clear()
-            plan = _plan_staged_transfer(capture, resolved.sources)
+            with telemetry.span("mx.refit.transfer_planning"):
+                plan = _plan_staged_transfer(capture, resolved.sources)
             metrics["initial_whole_plan_s"] = time.perf_counter() - phase_started
             validation_started = time.perf_counter()
             self._validate_complete(capture, parameter_layout, plan)
@@ -1190,9 +1194,13 @@ class _NixlStagedTransfer:
                 descriptors(index, recv, full, convert),
                 prepared.transport,
             )
-            started = time.perf_counter()
-            posted = prepared.transport.post_reads(list(chunk.descriptors))
-            return chunk, (recv, convert, full), posted, started
+            batch = telemetry._NixlBatch()
+            with batch.posting():
+                started = time.perf_counter()
+                with telemetry.span("mx.refit.wire_post"):
+                    posted = prepared.transport.post_reads(list(chunk.descriptors))
+                post_seconds = time.perf_counter() - started
+            return chunk, (recv, convert, full), posted, post_seconds
 
         pending = None
         unwinding = False
@@ -1200,11 +1208,11 @@ class _NixlStagedTransfer:
         try:
             pending = post(0)
             for index in range(len(batches)):
-                chunk, buffers, posted, started = pending
+                chunk, buffers, posted, post_seconds = pending
                 pending = None
                 self._recv_buffers, self._convert_buffers, self._full_buffers = buffers
                 self._active = chunk
-                staged = self._complete_stage(chunk, posted, started)
+                staged = self._complete_stage(chunk, posted, post_seconds)
                 if len(arenas) > 1 and index + 1 < len(batches):
                     # The other arena's previous batch was committed and
                     # synchronized one iteration ago, so it is free to refill.
@@ -1415,47 +1423,53 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL staged transfer is closed")
         if prepared is not self._active:
             raise RuntimeError("NIXL transfer plan is no longer active")
-        started = time.perf_counter()
-        posted = prepared.transport.post_reads(list(prepared.descriptors))
-        return self._complete_stage(prepared, posted, started)
+        batch = telemetry._NixlBatch()
+        with batch.posting():
+            started = time.perf_counter()
+            with telemetry.span("mx.refit.wire_post"):
+                posted = prepared.transport.post_reads(list(prepared.descriptors))
+            post_seconds = time.perf_counter() - started
+        return self._complete_stage(prepared, posted, post_seconds)
 
     @torch.no_grad()
     def _complete_stage(
-        self, prepared: _PreparedNixlTransfer, posted: list, started: float
+        self, prepared: _PreparedNixlTransfer, posted: list, post_seconds: float
     ) -> _StagedNixlWeights:
         """Wait for posted READs, then reconstruct, convert, and verify."""
         wait_started = time.perf_counter()
-        prepared.transport.await_reads(posted)
+        with telemetry.span("mx.refit.wire_wait"):
+            prepared.transport.await_reads(posted)
         wire_wait_seconds = time.perf_counter() - wait_started
-        wire_seconds = time.perf_counter() - started
+        wire_seconds = post_seconds + wire_wait_seconds
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.plan.full_pulls:
-            source = self._full_buffers[full.src_name]
-            for copy in full.copies:
-                destination = self._recv_buffers[copy.param_name].as_strided(
+        with telemetry.span("mx.refit.reconstruct"):
+            for full in prepared.plan.full_pulls:
+                source = self._full_buffers[full.src_name]
+                for copy in full.copies:
+                    destination = self._recv_buffers[copy.param_name].as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        self._recv_buffers[copy.param_name].storage_offset()
+                        + copy.dest_offset,
+                    )
+                    destination.copy_(_replay_ops(source, copy.op_chain))
+            converted = {convert.param_name for convert in prepared.plan.converts}
+            conversion_copies = {
+                copy.param_name: copy
+                for copy in prepared.capture.copies
+                if copy.param_name in converted
+            }
+            for convert in prepared.plan.converts:
+                copy = conversion_copies[convert.param_name]
+                target = self._recv_buffers[convert.param_name]
+                destination = target.as_strided(
                     copy.dest_shape,
                     copy.dest_stride,
-                    self._recv_buffers[copy.param_name].storage_offset()
-                    + copy.dest_offset,
+                    target.storage_offset() + copy.dest_offset,
                 )
-                destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.plan.converts}
-        conversion_copies = {
-            copy.param_name: copy
-            for copy in prepared.capture.copies
-            if copy.param_name in converted
-        }
-        for convert in prepared.plan.converts:
-            copy = conversion_copies[convert.param_name]
-            target = self._recv_buffers[convert.param_name]
-            destination = target.as_strided(
-                copy.dest_shape,
-                copy.dest_stride,
-                target.storage_offset() + copy.dest_offset,
-            )
-            destination.copy_(self._convert_buffers[convert.param_name])
-        torch.cuda.synchronize(self._device)
+                destination.copy_(self._convert_buffers[convert.param_name])
+            torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
@@ -1488,7 +1502,7 @@ class _NixlStagedTransfer:
             metrics={
                 "bytes_received": bytes_received,
                 "segments": len(prepared.descriptors),
-                "wire_s": wire_seconds,
+                "wire_host_s": wire_seconds,
                 "wire_wait_s": wire_wait_seconds,
                 "reconstruct_s": reconstruct_seconds,
                 "full_pull_sources": len(prepared.plan.full_pulls),
@@ -1593,11 +1607,12 @@ class _NixlStagedTransfer:
         remote_agent_name: str | None = None
         started = time.perf_counter()
         manifest = tensor_read.manifest
-        source_tensors = self._validate_peer_manifest(
-            manifest,
-            destination_tensors,
-        )
-        host, port, remote_agent_name = self._peer_endpoint(manifest)
+        with telemetry.span("mx.refit.peer_metadata"):
+            source_tensors = self._validate_peer_manifest(
+                manifest,
+                destination_tensors,
+            )
+            host, port, remote_agent_name = self._peer_endpoint(manifest)
         try:
             self._manager.fetch_remote_and_wait(
                 remote_agent_name=remote_agent_name,
@@ -1605,17 +1620,19 @@ class _NixlStagedTransfer:
                 port=port,
                 timeout_seconds=self._timeout,
             )
-            bytes_received, tensor_count, wire_seconds = (
-                self._manager.receive_from_source(
-                    source_metadata=b"",
-                    source_tensors=source_tensors,
-                    timeout_seconds=self._timeout,
-                    remote_agent_name=remote_agent_name,
-                    require_exact_match=True,
-                    destination_tensors=destination_tensors,
-                    on_transfer_start=on_transfer_start,
-                )
-            )
+            with telemetry._NixlBatch().posting():
+                with telemetry.span("mx.refit.direct_peer_read"):
+                    bytes_received, tensor_count, wire_seconds = (
+                        self._manager.receive_from_source(
+                            source_metadata=b"",
+                            source_tensors=source_tensors,
+                            timeout_seconds=self._timeout,
+                            remote_agent_name=remote_agent_name,
+                            require_exact_match=True,
+                            destination_tensors=destination_tensors,
+                            on_transfer_start=on_transfer_start,
+                        )
+                    )
         finally:
             if remote_agent_name is not None:
                 self._manager.remove_remote_agent(remote_agent_name)
@@ -1629,7 +1646,7 @@ class _NixlStagedTransfer:
         return {
             "bytes_received": bytes_received,
             "segments": tensor_count,
-            "wire_s": round(wire_seconds, 6),
+            "wire_host_s": round(wire_seconds, 6),
             "peer_s": round(time.perf_counter() - started, 6),
         }
 

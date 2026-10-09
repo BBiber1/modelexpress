@@ -340,7 +340,7 @@ class ModelExpressGeneratorClient:
             raise
         return client
 
-    @telemetry.span("mx.refit.streaming_prepare")
+    @telemetry.span("mx.refit.stage_weight")
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
         """Prepare an exact version without installing it into the live engine.
 
@@ -421,7 +421,7 @@ class ModelExpressGeneratorClient:
             )
             return self._active_handle
 
-    @telemetry.span("mx.refit.streaming_apply")
+    @telemetry.span("mx.refit.apply_weight")
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
         """Install a prepared update at the caller's safe point."""
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
@@ -702,7 +702,7 @@ class ModelExpressGeneratorClient:
             timeout=self._rpc_timeout_seconds,
         )
 
-    @telemetry.span("mx.refit.streaming_release")
+    @telemetry.span("mx.refit.release_weight")
     def _release_staged(self, staged: StagedWeightHandle) -> None:
         """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:

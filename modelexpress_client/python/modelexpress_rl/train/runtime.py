@@ -238,16 +238,17 @@ class TrainerRuntime:
         if self._bound_tensors is None:
             raise RuntimeError("bind_tensors() must be called before publish_version()")
         method = self._full_tensor()
+        rank = telemetry.refit_rank(fallback=rl_envs.LOCAL_RANK)
         recorder = timing.start_cycle(
             version_id=version.version_id,
-            rank=rl_envs.LOCAL_RANK,
+            rank=rank,
             backend="rl_trainer",
         )
         with telemetry.span(
             "mx.refit.trainer_refit_e2e",
             {
                 "role": "trainer",
-                "rank": rl_envs.LOCAL_RANK,
+                "rank": rank,
                 "version_uid": version.version_id,
             },
         ):

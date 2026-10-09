@@ -24,6 +24,7 @@ the one-peer-at-a-time behavior (baseline A/B only).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections import defaultdict
@@ -113,7 +114,13 @@ class NixlReshardTransport:
             for session, group in by_session.items()
         ]
 
-        with telemetry._NixlBatch().posting():
+        batch = telemetry._nixl_batch.get()
+        posting = (
+            contextlib.nullcontext()
+            if batch is not None
+            else telemetry._NixlBatch().posting()
+        )
+        with posting:
             if _serial_reads_enabled():
                 for agent, ranges, memory_type in batches:
                     total_bytes, num_reads, _duration = (

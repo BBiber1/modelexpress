@@ -95,7 +95,8 @@ def test_batch_encloses_distinct_completions_and_aggregates(
     assert parent.attributes["nixl.xfer_duration_median_s"] == pytest.approx(0.96)
     assert parent.attributes["nixl.xfer_duration_p95_s"] == pytest.approx(1.248)
     assert parent.attributes["nixl.telemetry.complete"]
-    assert parent.attributes["nixl.payload_gbps"] > 0
+    assert parent.attributes["nixl.observed_batch_duration_s"] > 0
+    assert parent.attributes["nixl.observed_payload_gbps"] > 0
 
 
 @pytest.mark.parametrize("failure", ["unavailable", "transfer"])
@@ -127,7 +128,7 @@ def test_incomplete_native_coverage_and_failure(recording, failure) -> None:
     )
     assert parent.attributes["nixl.total_bytes"] == 64
     assert not parent.attributes["nixl.telemetry.complete"]
-    assert "nixl.payload_gbps" not in parent.attributes
+    assert "nixl.observed_payload_gbps" not in parent.attributes
     assert (parent.status.status_code == trace.StatusCode.ERROR) == (
         failure == "transfer"
     )
@@ -263,7 +264,7 @@ def test_native_metric_units_and_request_span_exemplars(recording, monkeypatch) 
             ("mx_refit_nixl_request_total_bytes", child, "By"),
             ("mx_refit_nixl_request_xfer_duration", child, "s"),
             ("mx_refit_nixl_batch_total_bytes", parent, "By"),
-            ("mx_refit_nixl_batch_duration", parent, "s"),
+            ("mx_refit_nixl_observed_batch_duration", parent, "s"),
         ):
             metric = values[name]
             assert metric.unit == unit
@@ -282,6 +283,24 @@ def test_native_metric_units_and_request_span_exemplars(recording, monkeypatch) 
         provider.shutdown()
         telemetry._value_histogram.cache_clear()
         telemetry._histogram.cache_clear()
+
+
+def test_batch_parent_is_captured_before_wire_post(recording) -> None:
+    agent = SimpleNamespace(get_xfer_telemetry=lambda _handle: sample())
+    with telemetry.span("mx.refit.stage") as stage:
+        batch = telemetry._NixlBatch()
+        with batch.posting():
+            with telemetry.span("mx.refit.wire_post") as post:
+                request = batch.post("trainer")
+        batch.complete(request, agent, object())
+        batch._finish()
+
+    spans = recording.get_finished_spans()
+    parent = next(s for s in spans if s.name == "mx.refit.nixl_batch")
+    post = next(s for s in spans if s.name == "mx.refit.wire_post")
+    assert parent.parent.span_id == stage.get_span_context().span_id
+    assert parent.parent.span_id != post.context.span_id
+    assert parent.end_time >= post.end_time
 
 
 def test_completed_wait_preserves_timestamp_parent_and_worker_identity(
