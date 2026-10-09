@@ -27,3 +27,8 @@ For Python-only refit environment controls, register the type and getter in
 once in `RefitCacheConfig` and shared by the transfer and trainer resolver; tests
 must create a new client to change them. Keep independent cache controls scoped
 to their owned resources.
+
+The load-time READ descriptor control belongs to the compiled pull plan. Keep
+`MX_REFIT_CACHE_DESCRIPTORS` independent of plan and generator-layout retention;
+`MX_REFIT_DEBUG_VALIDATE_WORKSPACE` enables registration diagnostics only. Do not
+conflate them with the separate receiver `MX_RESHARD_CACHE_DESCRIPTORS` control.

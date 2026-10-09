@@ -534,10 +534,10 @@ The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
 Full-tensor trainers reuse manifest bytes while registrations, addresses, and
 tensor geometry remain stable and content digests are disabled. Generators
-cache each selected worker manifest by endpoint and digest. A changed endpoint,
-registration metadata,
-address, dtype, shape, or sharding changes the structural fingerprint and
-rebuilds the transfer plan. Content-only digest changes refresh verification
+retain selected worker manifests in the physical plan. A changed trainer
+mesh generation invalidates the transfer plan. Changes to registration,
+address, dtype, shape, or sharding require a mesh update; optional debug checks
+detect unannounced source drift. Content-only digest changes refresh verification
 metadata without rebuilding that plan. Releasing a trainer shard evicts its
 worker-local version entry only after the central service accepts the deletion;
 the service rejects deletion while a version lease is active.
@@ -1726,33 +1726,137 @@ changes to unrelated owners that a later callback could otherwise hide.
 This path adds no native extension or CPython-internal dependency.
 
 The staging limit bounds receive, conversion and transfer scratch allocations.
+Preparation validates staging settings before compilation; owning-module batches
+validate their required capacity, and packing enforces the combined arena limit.
+Workspace compatibility is checked before connecting sources, with registration
+performed after any connection recovery that resets the owned manager.
 Engine-owned materialized destinations and post-load workspaces consume
 additional memory, as do the live model and runtime state. The staging limit is
 therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
-Bounded transfer can reuse immutable READ addresses and sizes for the currently
-validated compiled plan. The one-entry cache checks the workspace generation and
-the identity, order and geometry of all receive arenas before every batch. It
-holds only weak arena references; source leases, tensor views and transport
-handles remain owned by the update. Preparation still validates current source
-metadata and coverage, and every batch still creates views, zeroes padding,
-posts fresh READs and completes the existing fences. Failed preparation,
-incomplete iteration and workspace teardown discard the descriptors. Private
-transfer counters report hits, misses and builds; descriptor work stays outside
-the wire timer on both cold and warm updates.
+Staging follows four ownership boundaries: the client validates the exact version
+and manages the active handle; the session selects sources and protects revision
+leases; the update method creates an installable artifact; the transfer owns
+physical plans, connections and reusable receive storage. The client constructs
+immutable streaming settings during initialization. Its `stage_weight` validates
+the requested version and calls the session's single `stage` entry point, which
+selects bounded trainer streaming or the configured ordinary source order.
+Object-storage replay resolves and validates its chain before preparation, and
+generator-peer staging reserves a read lease without writing live weights.
 
-The manifest-byte cache owns an immutable snapshot of ordinary parsed source
-and shard rows. A warm bounded-plan lookup reuses its structural key only while
-the resolved source table is the snapshot's table. All other resolved fields
-and maps keep their original schema and ownership. The snapshot contains only
-host metadata; it owns no tensors, transport handles or source leases. Custom
-or mutable source rows retain the original field-by-field checks. Ordered
-manifest bytes, agent and device maps,
-captured layouts and the staging configuration still participate in invalidation,
-and current source coverage is checked before transfer. Snapshot construction is
-charged to source preparation on a cache miss.
+Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
+The unchanged creation API supplies a mesh ID; the server reads and stamps its
+generation atomically while creating the version. Idempotent retries return the
+original stamp. Shard publication, including the final READY transition and
+repeated publications, rejects a changed mesh generation before writing. Trainer
+resolution compares the recorded generation with the current mesh and cached
+trainer snapshot. Versions created before this field must be recreated; missing
+or zero mesh generations fail explicitly. Versions without a trainer mesh,
+including object-storage versions, carry generation zero.
+
+Any trainer mesh update that changes its generation is rejected while a linked
+weight version has an active consumer lease, including additive replicas that
+leave existing publications intact. An update with unchanged membership remains a no-op.
+After readers release their leases, membership may advance and new weight
+versions capture the new generation; old version stamps are never changed.
+
+Trainer resolution checks the requested mesh generation before and after manifest
+discovery. Consumers retain an active version lease through transfer and
+installation or release, so the atomic update fence prevents mesh changes during
+that round. An expired lease no longer blocks mesh updates. A rejected stale
+round releases its lease; the same client can install a later valid publication.
+
+Trainer resolution produces a `TrainerSourceSnapshot`: mesh ID and generation
+plus immutable selected-shard records containing worker, endpoint, manifest and
+structural/content digests. Version identity stays in the requested
+`WeightVersion`. Each reusable physical plan contains this trainer snapshot and
+an owned deep copy of the existing `CaptureResult` and a separate full destination
+parameter-layout map. Recorded regions do not describe the complete destination
+layout. The capture snapshot preserves operation argument containers and does not
+alias mutable engine-capture results. These snapshots contain no leases,
+iterators, metrics or installation state.
+
+The transfer has explicit `prepare_full_copy` and `prepare_streaming` entry points
+and owns one cached pull plan for either mode. That entry contains the trainer
+snapshot with immutable resolved source metadata, the generator snapshot used by
+planning and replay, and the compiled transfer. The update method creates fresh
+version-scoped artifacts and attributes transfer metrics; it owns no physical
+plan cache. Both modes reuse the plan and generator layout by default when the requested
+trainer mesh ID and generation match the cached trainer snapshot. Warm source
+resolution performs one mesh lookup and skips shard listing and manifest fetches.
+Warm preparation skips source parsing, structural keys, capture, coverage checks
+and required-agent traversal. A different mesh identity or replacement candidate
+creates and validates a new plan. Trainer metadata and compiled plans have one
+mesh-bound lifetime. Generator capture has a separate lifetime: cold preparation
+compares source names, dtypes and global shapes, and retains the owned capture
+when that logical schema is compatible. Disabling plan reuse refreshes trainer
+metadata and recompiles while allowing generator capture reuse. Disabling layout
+reuse captures and recompiles while allowing trainer metadata reuse.
+
+`MX_REFIT_DEBUG_VALIDATE_PLAN` fetches current manifests and checks source geometry
+and plan coverage; `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` recaptures and checks
+the load layout. Both default to false, and detected drift fails preparation.
+Digest verification also fetches current manifests and refreshes only the used
+source digests, so it verifies the current weight version.
+
+Workspace mode changes invalidate the containing plan before source resolution.
+Connections, receive buffers, arenas and cached descriptors remain transfer-owned.
+Mesh changes retain compatible registered storage. Cold preparation disconnects
+changed or obsolete owned remote agents and retains exact unchanged metadata;
+failed removal resets the owned manager and rebinds storage and sources. Borrowed
+peer managers are never reset or disconnected by load-time preparation.
+A replacement plan is retained only after connection, allocation, registration and
+descriptor setup succeeds and a final mesh lookup confirms the original identity;
+preparation failure leaves no reusable entry. Each
+prepared transfer carries its own metrics and current source metadata. Both
+preparation entry points share source/layout resolution, connection setup, a
+failure guard that discards incomplete cache entries, and final plan publication.
+Full-copy destinations and bounded receive arenas keep their separate setup.
+Bounded preparation validates capacity, resolves sources, captures the engine
+layout, compiles a plan, connects required agents, prepares receive
+arenas and descriptors, and returns deferred batch reads. Full-copy preparation
+creates independent destinations for the eager staged transfer. Both retain the
+same artifact interfaces consumed by application.
+
+A compiled plan stores the immutable union of required source agents. Warm
+preparation reuses its established transport without traversing the whole plan
+and every batch again. Connected agents with changed metadata are replaced
+on validated preparation after the previous update has quiesced. The plan owns no transport resources.
+
+Trainer source resolution records one timing span per candidate-selection
+attempt. Each cold shard updates aggregate fetch and byte counters; mesh warm hits
+skip manifest fetches and create no per-shard spans. Cold and diagnostic lookups
+retain fetch, hash and fingerprint timing,
+and resolution timing ends before yielding the candidate for preparation.
+
+Full and bounded compiled plans contain eagerly bound immutable READ addresses,
+per-batch source selections, conversion mappings, payload totals and parameter
+names. Descriptor reuse is independent of trainer and generator-layout caching:
+disabling it rebuilds bindings each preparation while retaining a compatible
+compiled plan and registered storage. Normal warm preparation and iteration do
+not inspect workspace geometry or rebuild descriptors. Each batch creates the
+needed tensor views, zeroes padding, posts fresh READ handles and completes the
+existing fences. Incomplete iteration invalidates its plan; uncertain drains
+retain the existing transport quarantine behavior.
+
+`MX_REFIT_DEBUG_VALIDATE_WORKSPACE` checks the previous registered binding before
+preparation, even if another cache is disabled, and before READ posts and between
+batch yields. It compares registration generation, tensor identity and geometry;
+drift fails before new reads. Binding snapshots contain weak references and own
+no registered storage. Workspace reset releases registrations only after the
+existing completion guards. Per-version transfer metrics remain fresh, including
+descriptor hits, misses and builds; binding work remains outside the wire timer.
+
+The trainer snapshot owns immutable copies of parsed source rows, session and
+agent metadata maps. It contains host metadata and owns no tensors, transport
+handles or source leases. The transfer owns one generator capture and complete destination layout, shared
+by plans and retained across compatible mesh or workspace changes. Its captured
+operation arguments preserve Python container semantics for replay. Engine
+capture callbacks always perform a fresh capture; there is no hidden vLLM capture
+cache that can mask diagnostic drift.
+Snapshot construction is charged to source preparation on a cache miss.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back
@@ -1768,50 +1872,3 @@ be qualified with changing weights, shared parameters, graph-bound addresses,
 post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
-
-Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
-The unchanged creation API supplies a mesh ID; the server reads and stamps its
-generation atomically while creating the version. Idempotent retries return the
-original stamp. Shard publication, including the final READY transition and
-repeated publications, rejects a changed mesh generation before writing. Trainer
-resolution compares the recorded generation with the current mesh. Versions
-created before this field must be recreated; missing or zero mesh generations
-fail explicitly. Versions without a trainer mesh, including object-storage
-versions, carry generation zero. A requested version whose recorded mesh
-generation differs from the current trainer mesh fails source resolution.
-
-Any trainer mesh update that changes its generation is rejected while a linked
-weight version has an active consumer lease, including additive replicas that
-leave existing publications intact. An update with unchanged membership remains a no-op.
-After readers release their leases, membership may advance and new weight
-versions capture the new generation; old version stamps are never changed.
-
-Trainer resolution checks the requested mesh generation before and after manifest
-discovery. Consumers retain an active version lease through transfer and
-installation or release, so the atomic update fence prevents mesh changes during
-that round. An expired lease no longer blocks mesh updates. A rejected stale
-round releases its lease; the same client can install a later valid publication.
-
-Preparation uses a required trainer snapshot containing its mesh identity and
-selected immutable shards. The transfer's cached plan owns the parsed trainer
-metadata, an owned copy of the existing generator `CaptureResult`, and the full
-destination layout. Full-copy and bounded preparation share failure cleanup,
-source connection and publication helpers; their physical allocation and transfer
-algorithms remain separate. Client staging settings enter the same session
-staging flow, which retains the version lease through installation or release.
-Static staging inputs are validated at preparation; compilation and packing
-consume that validated budget while retaining coverage and aggregate-capacity
-checks. Trainer metadata and compiled plans are reused for an unchanged mesh.
-The independently owned generator capture survives compatible mesh and workspace
-changes; a changed logical source schema requires recapture. Cache and diagnostic
-controls are fixed when the client is created. Default warm source discovery only
-checks current mesh identity and generation; debug or digest modes fetch current
-manifests. Descriptor bindings remain lazy at this layer.
-
-Compiled refit plans retain parameter names, per-batch source selections and
-conversion mappings, READ byte totals and allocated staging bytes. Each version
-retains its own transport handles and metrics. Descriptor bindings for every
-batch are created during preparation and retained on the compiled plan. Normal
-warm preparation reuses them directly, while disabling descriptor retention
-rebuilds bindings each version. Tensor views and fresh READ handles remain owned
-by execution; padding, fences and prefetch drain behavior are unchanged.

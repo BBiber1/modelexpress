@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -115,6 +116,8 @@ class _CachedPullPlan:
     parameter_names: frozenset[str] = frozenset()
     staging_bytes: int = 0
     conversion_copies: MappingProxyType | None = None
+    workspace_generation: int = 0
+    workspace_binding: tuple[tuple[str, weakref.ReferenceType, tuple], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -209,6 +212,16 @@ class _BoundedReadDescriptor(NamedTuple):
     nbytes: int
 
 
+def _arena_geometry(arena: torch.Tensor) -> tuple:
+    return (
+        arena.data_ptr(),
+        arena.untyped_storage().nbytes(),
+        arena.dtype,
+        arena.device,
+        tuple(arena.shape),
+        tuple(arena.stride()),
+        arena.storage_offset(),
+    )
 
 
 def _compile_bounded_plan(
@@ -940,6 +953,16 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL staged transfer is closed")
         previous_layout = self._generator_layout
         try:
+            if (
+                self.cache_config.validate_workspace
+                and self._cached_pull_plan is not None
+            ):
+                try:
+                    self._check_workspace(self._cached_pull_plan)
+                except ValueError:
+                    if self._owns_manager:
+                        self.reset_workspace()
+                    raise
             yield
         except Exception:
             self._generator_layout = previous_layout
@@ -1169,7 +1192,39 @@ class _NixlStagedTransfer:
             buffers.append(tensors)
         return tuple(buffers)
 
+    def _workspace_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
+        if self._staging_arenas:
+            yield from (
+                (f"arena:{index}", arena)
+                for index, arena in enumerate(self._staging_arenas)
+            )
+        else:
+            for kind, buffers in (
+                ("recv", self._recv_buffers),
+                ("convert", self._convert_buffers),
+                ("full", self._full_buffers),
+            ):
+                yield from (
+                    (f"{kind}:{name}", tensor) for name, tensor in buffers.items()
+                )
 
+    def _check_workspace(self, cached: _CachedPullPlan | None) -> None:
+        if cached is None:
+            raise ValueError("registered workspace changed while reusing cached plan")
+        current = tuple(self._workspace_tensors())
+        if (
+            cached.workspace_generation != self._workspace_generation
+            or len(current) != len(cached.workspace_binding)
+            or any(
+                name != expected_name
+                or ref() is not tensor
+                or geometry != _arena_geometry(tensor)
+                for (name, tensor), (expected_name, ref, geometry) in zip(
+                    current, cached.workspace_binding
+                )
+            )
+        ):
+            raise ValueError("registered workspace changed while reusing cached plan")
 
     def _bind_descriptors(
         self, cached: _CachedPullPlan, metrics: dict[str, Any], *, reusable: bool
@@ -1206,6 +1261,14 @@ class _NixlStagedTransfer:
                     for item in self._descriptors(compiled)
                 ),
             )
+        binding = (
+            tuple(
+                (name, weakref.ref(tensor), _arena_geometry(tensor))
+                for name, tensor in self._workspace_tensors()
+            )
+            if self.cache_config.validate_workspace
+            else ()
+        )
         metrics.update(
             descriptor_cache_hits=0,
             descriptor_cache_misses=len(descriptors),
@@ -1218,6 +1281,8 @@ class _NixlStagedTransfer:
                 sum(item.nbytes for item in batch) for batch in descriptors
             ),
             staging_bytes=sum(arena.numel() for arena in self._staging_arenas),
+            workspace_generation=self._workspace_generation,
+            workspace_binding=binding,
         )
 
     def _validate_streaming_settings(
@@ -1314,6 +1379,8 @@ class _NixlStagedTransfer:
 
         def post(index: int) -> tuple:
             batch = batches[index]
+            if self.cache_config.validate_workspace:
+                self._check_workspace(prepared.cached_plan)
             recv, convert, full = self._arena_views(batch, arenas[index % len(arenas)])
             # Captured loaders may leave padding untouched. Reused arenas must
             # reproduce the zero-filled load layout before the NIC writes it.
@@ -1341,6 +1408,8 @@ class _NixlStagedTransfer:
         try:
             pending = post(0)
             for index in range(len(batches)):
+                if self.cache_config.validate_workspace:
+                    self._check_workspace(prepared.cached_plan)
                 chunk, buffers, posted, started = pending
                 pending = None
                 self._recv_buffers, self._convert_buffers, self._full_buffers = buffers
@@ -1522,6 +1591,8 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL staged transfer is closed")
         if prepared is not self._active:
             raise RuntimeError("NIXL transfer plan is no longer active")
+        if self.cache_config.validate_workspace:
+            self._check_workspace(self._cached_pull_plan)
         started = time.perf_counter()
         posted = prepared.transport.post_reads(list(prepared.descriptors))
         return self._complete_stage(prepared, posted, started)

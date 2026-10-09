@@ -322,8 +322,47 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
     assert metrics["descriptor_builds"] == second.metrics["batches"]
 
 
+@pytest.mark.parametrize("descriptors", [False, True])
+@pytest.mark.parametrize("plan,layout", [(True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("change", ["storage", "resize"])
+def test_workspace_diagnostic_rejects_drift_before_reads(
+    harness, monkeypatch, descriptors, plan, layout, change
+) -> None:
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_WORKSPACE", "1")
+    monkeypatch.setenv("MX_REFIT_CACHE_PLAN", str(int(plan)))
+    monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", str(int(layout)))
+    monkeypatch.setenv("MX_REFIT_CACHE_DESCRIPTORS", str(int(descriptors)))
+    harness.new_transfer()
+    harness.collect(harness.prepare(staging_buffers=2))
+    arena = harness.allocated_tensors[-1]
+    if change == "storage":
+        arena.set_(torch.empty_like(arena))
+    else:
+        arena.resize_(arena.numel() + 256)
+    posts = harness.events.count("post")
+    with pytest.raises(ValueError, match="registered workspace changed"):
+        prepared = harness.prepare(staging_buffers=2)
+        harness.collect(prepared)
+    assert harness.events.count("post") == posts
+    _, installed = harness.collect(harness.prepare(staging_buffers=2))
+    _check_values(harness, installed)
 
 
+@pytest.mark.parametrize("buffers", [1, 2])
+def test_workspace_diagnostic_between_yields_drains_without_posting_again(
+    harness, monkeypatch, buffers
+) -> None:
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_WORKSPACE", "1")
+    harness.new_transfer()
+    prepared = harness.prepare(staging_buffers=buffers)
+    iterator = harness.transfer.iter_bounded(prepared, {})
+    next(iterator)
+    posts = len(prepared.transport.posted)
+    harness.allocated_tensors[0].resize_(harness.allocated_tensors[0].numel() + 256)
+    with pytest.raises(ValueError, match="registered workspace changed"):
+        next(iterator)
+    assert len(prepared.transport.posted) == posts
+    assert prepared.transport.awaited == prepared.transport.posted
 
 
 @pytest.mark.parametrize("failure", ["coverage", "transport", "registration"])
