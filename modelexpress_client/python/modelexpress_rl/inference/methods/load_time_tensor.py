@@ -15,6 +15,8 @@ from modelexpress.refit.timing import (
     set_refit_cold,
 )
 
+from modelexpress_rl.inference._cache_config import RefitCacheConfig
+
 from ...train import WeightPayloadFormat
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
@@ -47,6 +49,13 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._active_streamed: PreparedStreamingTensors | None = None
 
     @property
+    def cache_config(self) -> RefitCacheConfig:
+        return self._transfer.cache_config
+
+    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
+        return self._transfer.cached_trainer_source()
+
+    @property
     def capabilities(self) -> MethodCapabilities:
         return MethodCapabilities(
             payload_formats=frozenset({WeightPayloadFormat.FULL_TENSOR}),
@@ -59,7 +68,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release staged weight before staging another version")
         if not isinstance(source, TrainerSourceSnapshot):
             raise TypeError("load-time tensor method requires a trainer source")
-        manifests = [item.manifest for item in source.shards]
+        manifests = (
+            None
+            if source.resolved_metadata is not None
+            else [item.manifest for item in source.shards]
+        )
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare_full_copy(
                 manifests=manifests,
@@ -88,7 +101,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise ValueError("bounded staging requires NIXL trainer sources")
         try:
             prepared = self._transfer.prepare_streaming(
-                manifests=[item.manifest for item in source.shards],
+                manifests=(
+                    None
+                    if source.resolved_metadata is not None
+                    else [item.manifest for item in source.shards]
+                ),
                 trainer_snapshot=source,
                 capture_layout=self._capture_layout,
                 max_staging_bytes=max_staging_bytes,
@@ -138,6 +155,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         if prepared.staged is not self._active_staged:
             raise RuntimeError("load-time staged weight is no longer active")
         self._active_staged = None
+
+    def preparation_failed(self) -> None:
+        self._transfer.reset_workspace()
 
     def validate_close(self) -> None:
         if (

@@ -11,6 +11,7 @@ import pytest
 import torch
 from modelexpress import p2p_pb2
 from modelexpress_rl import ObjectStorageType, WeightPayloadFormat, WeightSource
+from modelexpress_rl.inference._cache_config import RefitCacheConfig
 from modelexpress_rl.inference.adapter import GeneratorEngineContext
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
@@ -292,29 +293,31 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     runtime.close()
 
 
-def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
+def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch) -> None:
     context = GeneratorEngineContext()
     monkeypatch.setattr(
         engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
     )
     transfer_kwargs = {}
 
-    def create_transfer(**kwargs):
+    def create_transfer(**kwargs) -> SimpleNamespace:
         transfer_kwargs.update(kwargs)
-        return object()
+        return SimpleNamespace(cache_config=RefitCacheConfig())
 
     monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
-    full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     method_kwargs = {}
 
-    def create_method(**kwargs):
-        method_kwargs.update(kwargs)
-        return full_tensor
+    class LoadTimeMethod(_Method):
+        def __init__(self, **kwargs) -> None:
+            method_kwargs.update(kwargs)
+            super().__init__({WeightSource.TRAINER})
+            self.cache_config = kwargs["transfer"].cache_config
+
+        def cached_trainer_source(self) -> None:
+            return None
 
     monkeypatch.setattr(
-        runtime_module,
-        "LoadTimeTensorNixlUpdateMethod",
-        create_method,
+        runtime_module, "LoadTimeTensorNixlUpdateMethod", LoadTimeMethod
     )
 
     runtime = initialize_generator_runtime(
