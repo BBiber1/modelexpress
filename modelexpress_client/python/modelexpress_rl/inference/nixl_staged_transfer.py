@@ -184,6 +184,7 @@ class _CompiledBoundedPlan:
     plan: TransferPlan
     module_batches: tuple[_BoundedBatch, ...]
     batches: tuple[_BoundedBatch, ...]
+    required_agents: frozenset[str]
 
 
 class _BoundedReadDescriptor(NamedTuple):
@@ -274,7 +275,12 @@ def _compile_bounded_plan(
         if cache_config.pack_modules
         else modules
     )
-    return _CompiledBoundedPlan(plan, modules, batches)
+    required_agents = frozenset(
+        agent
+        for transfer_plan in (plan, *(batch.plan for batch in batches))
+        for agent in _required_agent_metadata(transfer_plan, resolved)
+    )
+    return _CompiledBoundedPlan(plan, modules, batches, required_agents)
 
 
 def _bounded_batches(
@@ -1151,9 +1157,11 @@ class _NixlStagedTransfer:
             metrics["plan_cache_enabled"] = int(self.cache_config.cache_plan)
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(compiled.plan, resolved)
-            for batch in compiled.batches:
-                required_metadata.update(_required_agent_metadata(batch.plan, resolved))
+            required_metadata = {
+                agent: metadata
+                for agent, metadata in resolved.agent_metadata.items()
+                if agent in compiled.required_agents
+            }
             self._reset_incompatible_arenas(
                 compiled.batches, buffer_budget, staging_device, staging_buffers
             )
@@ -1178,7 +1186,7 @@ class _NixlStagedTransfer:
                 MappingProxyType(parameter_layout),
                 compiled,
                 tuple(manifests),
-                frozenset(required_metadata),
+                compiled.required_agents,
             )
             self._publish_prepared(cached, prepared, reusable=False)
             self._descriptor_cache = descriptors
