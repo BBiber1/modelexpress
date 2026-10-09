@@ -273,8 +273,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
             base_version_id=f"v{index - 1}" if index else None,
             payload_format=(
                 WeightPayloadFormat.XOR_DELTA
-                if index
-                else WeightPayloadFormat.FULL_HF_CHECKPOINT
+                if index else WeightPayloadFormat.FULL_HF_CHECKPOINT
             ),
             object_storage=object(),
             layout_signature="",

@@ -45,7 +45,9 @@ class _Transfer:
         )()
         return self.lease
 
-    def receive_peer(self, *, tensor_read, destination_tensors, on_transfer_start):
+    def receive_peer(
+        self, *, tensor_read, destination_tensors, on_transfer_start
+    ):
         assert tensor_read is self.lease
         self.received_leases.append(tensor_read)
         self.receive_tensors = destination_tensors

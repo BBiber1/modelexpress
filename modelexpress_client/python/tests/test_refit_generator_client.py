@@ -137,9 +137,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             mesh=refit_pb2.TrainerMesh(
                 mesh_id="mesh-a",
                 model_name="test/model",
-                generation=1
-                if self.mesh_calls == 1
-                else self.mesh_generation_on_recheck,
+                generation=1 if self.mesh_calls == 1 else self.mesh_generation_on_recheck,
                 workers={
                     shard.worker_id: refit_pb2.TrainerTensorsMetadata(
                         logical_shard_id=shard.logical_shard_id,

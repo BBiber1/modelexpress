@@ -259,9 +259,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
         "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
     ),
-    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get(
-        "MODEL_EXPRESS_LOG_LEVEL", ""
-    ).upper(),
+    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MX_MODEL_NAME_OVERRIDE": lambda: os.environ.get("MX_MODEL_NAME_OVERRIDE"),
     # ── Auth (client) ──────────────────────────────────────────────────────
     "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),

@@ -139,14 +139,9 @@ class TrainerSourceResolver(SourceResolver):
         if same_mesh and self._cache_config.cache_plan and not diagnostic:
             yield cached
             # A resumed candidate means preparation failed: discover fresh replicas.
-        expected_slots = tuple(
-            sorted(
-                {
-                    metadata.logical_shard_id
-                    for metadata in mesh_response.mesh.workers.values()
-                }
-            )
-        )
+        expected_slots = tuple(sorted({
+            metadata.logical_shard_id for metadata in mesh_response.mesh.workers.values()
+        }))
         mesh_workers = mesh_response.mesh.workers
         mesh_generation = version.trainer_mesh_generation
         try:
@@ -180,7 +175,9 @@ class TrainerSourceResolver(SourceResolver):
         counters: dict[str, int | float] = {}
         slots = []
         for source_slot_id in expected_slots:
-            ordered = sorted(published[source_slot_id], key=lambda item: item.worker_id)
+            ordered = sorted(
+                published[source_slot_id], key=lambda item: item.worker_id
+            )
             if not ordered:
                 logger.warning(
                     "no trainer source published for required slot %s",
@@ -237,9 +234,7 @@ class TrainerSourceResolver(SourceResolver):
                     or current.mesh.mesh_id != version.trainer_mesh_id
                     or current.mesh.generation != mesh_generation
                 ):
-                    raise RuntimeError(
-                        "trainer mesh generation changed during source resolution"
-                    )
+                    raise RuntimeError("trainer mesh generation changed during source resolution")
                 seen.add(selection)
                 yield TrainerSourceSnapshot(
                     mesh_id=version.trainer_mesh_id,
@@ -273,7 +268,9 @@ class TrainerSourceResolver(SourceResolver):
             structural_digest=structure_digest,
         )
 
-    def _fetch_manifest(self, shard: refit_pb2.WeightVersionShard) -> tuple[bytes, str]:
+    def _fetch_manifest(
+        self, shard: refit_pb2.WeightVersionShard
+    ) -> tuple[bytes, str]:
         """Fetch, verify and fingerprint one worker's manifest.
 
         Three spans on one stage rather than one, because the stage total
@@ -281,22 +278,19 @@ class TrainerSourceResolver(SourceResolver):
         CPU, and with digests published these manifests are refetched by
         construction on every version.
         """
-        with (
-            refit_span(
-                "source_preparation",
-                accumulate_metadata=True,
-                duration_key="manifest_fetch_s",
-            ),
-            grpc.insecure_channel(
-                shard.manifest_endpoint,
-                options=[
-                    (
-                        "grpc.max_receive_message_length",
-                        _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
-                    )
-                ],
-            ) as channel,
-        ):
+        with refit_span(
+            "source_preparation",
+            accumulate_metadata=True,
+            duration_key="manifest_fetch_s",
+        ), grpc.insecure_channel(
+            shard.manifest_endpoint,
+            options=[
+                (
+                    "grpc.max_receive_message_length",
+                    _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
+                )
+            ],
+        ) as channel:
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
             ).GetWeightVersionShardManifest(

@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import grpc
-from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.refit.timing import refit_span
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.types import ManifestMismatchError
 
 from ..control import WeightVersion

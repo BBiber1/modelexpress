@@ -2013,18 +2013,14 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         adapter, storage = _build(monkeypatch, tmp_path, objects)
     else:
         storage = _MemoryS3(objects)
-        monkeypatch.setattr(
-            canonical_delta_module, "S3Client", lambda **_kwargs: storage
-        )
+        monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
         store = checkpoint_store_module.LocalCheckpointStore(
             root=tmp_path / "cache", model_name="test/model"
         )
         if startup_seed == "unrecorded":
             seed = store.full_path("base-a")
             seed.mkdir(parents=True)
-            save_file(
-                {"weight": torch.tensor([-1.0, -2.0])}, seed / "model.safetensors"
-            )
+            save_file({"weight": torch.tensor([-1.0, -2.0])}, seed / "model.safetensors")
         adapter = _Adapter(
             model_name="test/model",
             config=ObjectStorageGeneratorConfig(
@@ -2115,8 +2111,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         ]
         assert torch.equal(
             load_file(
-                adapter._checkpoint.local_checkpoint
-                / "model-00001-of-00001.safetensors"
+                adapter._checkpoint.local_checkpoint / "model-00001-of-00001.safetensors"
             )["weight"],
             tensors[-1],
         )

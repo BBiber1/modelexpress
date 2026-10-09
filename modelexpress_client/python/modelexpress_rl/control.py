@@ -163,9 +163,7 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
         trainer_mesh_id=(
             version.trainer_mesh_id if version.HasField("trainer_mesh_id") else None
         ),
-        version_number=version.version_number
-        if version.HasField("version_number")
-        else None,
+        version_number=version.version_number if version.HasField("version_number") else None,
     )
 
 

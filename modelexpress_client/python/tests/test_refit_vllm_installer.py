@@ -2347,9 +2347,7 @@ def test_streaming_alias_plans_preserve_destructor_boundaries(monkeypatch, owner
         assert reused[1] == ["detach", "destructor", "second-yield"]
 
 
-@pytest.mark.parametrize(
-    "case", ["no_alias", "load_time_tie", "runtime_alias", "mixed"]
-)
+@pytest.mark.parametrize("case", ["no_alias", "load_time_tie", "runtime_alias", "mixed"])
 @pytest.mark.parametrize("runtime_first", [False, True])
 def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
     monkeypatch, tmp_path, case, runtime_first
@@ -2398,9 +2396,7 @@ def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
     def finalize(target, _config):
         for name in ("w13", "w2"):
             if case in ("runtime_alias", "mixed"):
-                setattr(
-                    target, f"{name}_weight", getattr(target, f"{name}_weight_packed")
-                )
+                setattr(target, f"{name}_weight", getattr(target, f"{name}_weight_packed"))
         for name, value in originals.items():
             value.data.copy_(getattr(target, name))
         target._parameters = dict(originals)

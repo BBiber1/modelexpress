@@ -27,10 +27,7 @@ from modelexpress_rl.train.adapter import (
     TrainerEngineAdapter,
     WeightVersionShardManifest,
 )
-from modelexpress_rl.train.manifest import (
-    WeightVersionShardManifestService,
-    bound_tensor_manifest,
-)
+from modelexpress_rl.train.manifest import WeightVersionShardManifestService, bound_tensor_manifest
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -79,17 +76,15 @@ class _Manager:
 
 class _Adapter(TrainerEngineAdapter):
     source_slot_id = hashlib.sha256(
-        bound_tensor_manifest(
-            [
-                {
-                    "name": "weight",
-                    "dtype": "torch.bfloat16",
-                    "elsize": 2,
-                    "full_shape": [4],
-                    "shards": [{"shard_offset": [0], "shape": [4]}],
-                }
-            ]
-        )
+        bound_tensor_manifest([
+            {
+                "name": "weight",
+                "dtype": "torch.bfloat16",
+                "elsize": 2,
+                "full_shape": [4],
+                "shards": [{"shard_offset": [0], "shape": [4]}],
+            }
+        ])
     ).hexdigest()
     supported_staging_modes = frozenset({TrainerStagingMode.COPY_TO_DEVICE})
     supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
