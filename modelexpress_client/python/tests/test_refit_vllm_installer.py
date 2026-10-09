@@ -2148,7 +2148,7 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(
 
 def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     monkeypatch,
-):
+) -> None:
     """install_streaming abandons the transfer with close(), not throw().
 
     The generator therefore sees GeneratorExit even while an install error is
@@ -2206,6 +2206,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         planned, {"w": source}, Transport()
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
+    transfer.cache_config = transfer_module.RefitCacheConfig()
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False

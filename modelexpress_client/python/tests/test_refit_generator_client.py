@@ -747,7 +747,7 @@ def test_generator_stages_applies_and_releases_across_versions(monkeypatch) -> N
     assert len(adapter.publish_calls) == 1
     assert len(adapter.release_calls) == 2
     assert adapter.close_calls == 1
-    assert len(service.worker.requests) == 2
+    assert len(service.worker.requests) == 4
     assert [source.source_slot_id for source in adapter.stage_calls[0].sources] == [
         "rank:0",
         "rank:1",
