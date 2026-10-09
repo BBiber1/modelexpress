@@ -112,6 +112,11 @@ class _CachedPullPlan:
     manifests: tuple[bytes, ...]
     required_agents: frozenset[str] = frozenset()
     used_sources: MappingProxyType | None = None
+    batch_sources: tuple[MappingProxyType, ...] = ()
+    wire_bytes: tuple[int, ...] = ()
+    parameter_names: frozenset[str] = frozenset()
+    staging_bytes: int = 0
+    conversion_copies: MappingProxyType | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +128,8 @@ class _PreparedNixlTransfer:
     sources: dict
     descriptors: tuple[ReadDescriptor | _BoundedReadDescriptor, ...]
     transport: NixlReshardTransport
+    conversion_copies: MappingProxyType
+    wire_bytes: int
     metrics: dict[str, float] = field(default_factory=dict)
 
 
@@ -156,6 +163,8 @@ class _BoundedBatch:
     layouts: _StagingLayouts
     nbytes: int
 
+    conversion_copies: MappingProxyType = field(init=False)
+
     def __post_init__(self) -> None:
         # Readers reach these views both by name and by position, and
         # dataclasses.replace or a plain 3-tuple would satisfy only the second.
@@ -163,11 +172,23 @@ class _BoundedBatch:
         if not isinstance(self.layouts, _StagingLayouts):
             object.__setattr__(self, "layouts", _StagingLayouts(*self.layouts))
 
+        converted = {item.param_name for item in self.plan.converts}
+        object.__setattr__(
+            self,
+            "conversion_copies",
+            MappingProxyType(
+                {
+                    copy.param_name: copy
+                    for copy in self.capture.copies
+                    if copy.param_name in converted
+                }
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class _PreparedBoundedTransfer:
-    batches: tuple[_BoundedBatch, ...]
-    sources: dict
+    cached_plan: _CachedPullPlan
     transport: NixlReshardTransport
     metrics: dict[str, float] = field(default_factory=dict)
 
@@ -841,8 +862,17 @@ class _NixlStagedTransfer:
             used_sources = MappingProxyType(
                 {name: trainer.resolved_metadata.sources[name] for name in used_sources}
             )
+        batch_sources = previous.batch_sources
+        if diagnostic and batch_sources:
+            batch_sources = tuple(
+                MappingProxyType(
+                    {name: trainer.resolved_metadata.sources[name] for name in sources}
+                )
+                for sources in batch_sources
+            )
         return replace(
             previous,
+            batch_sources=batch_sources,
             trainer_source_snapshot=trainer,
             manifests=tuple(manifests) if manifests is not None else previous.manifests,
             used_sources=used_sources,
@@ -1063,15 +1093,8 @@ class _NixlStagedTransfer:
                         for copy in capture.copies
                     }
                 )
+                converted = {item.param_name for item in plan.converts}
             assert transport is not None
-            prepared = _PreparedNixlTransfer(
-                plan,
-                capture,
-                used_sources,
-                self._full_copy_descriptors,
-                transport,
-                metrics,
-            )
             cached = (
                 warm
                 if reusable
@@ -1080,10 +1103,29 @@ class _NixlStagedTransfer:
                     capture,
                     MappingProxyType(parameter_layout),
                     plan,
-                    tuple(manifests) if manifests is not None else warm.manifests,
+                    tuple(manifests),
                     required_agents,
                     used_sources,
+                    wire_bytes=(plan.bytes_planned(),),
+                    parameter_names=frozenset(parameter_layout),
+                    conversion_copies=MappingProxyType(
+                        {
+                            copy.param_name: copy
+                            for copy in capture.copies
+                            if copy.param_name in converted
+                        }
+                    ),
                 )
+            )
+            prepared = _PreparedNixlTransfer(
+                plan,
+                capture,
+                cached.used_sources,
+                self._full_copy_descriptors,
+                transport,
+                cached.conversion_copies,
+                cached.wire_bytes[0],
+                metrics,
             )
             self._publish_prepared(cached, prepared)
             return prepared
@@ -1109,12 +1151,8 @@ class _NixlStagedTransfer:
             if warm is not None and isinstance(warm.compiled, _CompiledBoundedPlan):
                 assert self._transport is not None
                 compiled = warm.compiled
-                prepared = _PreparedBoundedTransfer(
-                    compiled.batches,
-                    warm.trainer_source_snapshot.resolved_metadata.sources,
-                    self._transport,
-                    metrics,
-                )
+                metrics["batches"] = len(compiled.batches)
+                prepared = _PreparedBoundedTransfer(warm, self._transport, metrics)
                 self._descriptor_cache = self._prepare_bounded_descriptors(
                     compiled, previous_descriptors, enabled=True
                 )
@@ -1166,9 +1204,6 @@ class _NixlStagedTransfer:
                 previous_descriptors,
                 enabled=bool(metrics["plan_cache_enabled"]),
             )
-            prepared = _PreparedBoundedTransfer(
-                compiled.batches, resolved.sources, transport, metrics
-            )
             cached = _CachedPullPlan(
                 trainer,
                 capture,
@@ -1176,7 +1211,21 @@ class _NixlStagedTransfer:
                 compiled,
                 tuple(manifests),
                 compiled.required_agents,
+                batch_sources=tuple(
+                    MappingProxyType(
+                        {
+                            copy.src_name: resolved.sources[copy.src_name]
+                            for copy in batch.capture.copies
+                        }
+                    )
+                    for batch in compiled.batches
+                ),
+                wire_bytes=tuple(batch.plan.bytes_planned() for batch in compiled.batches),
+                parameter_names=frozenset(parameter_layout),
+                staging_bytes=sum(arena.numel() for arena in self._staging_arenas),
             )
+            metrics["batches"] = len(compiled.batches)
+            prepared = _PreparedBoundedTransfer(cached, transport, metrics)
             self._publish_prepared(cached, prepared)
             self._descriptor_cache = descriptors
             return prepared
@@ -1291,10 +1340,10 @@ class _NixlStagedTransfer:
             raise RuntimeError("bounded NIXL transfer is no longer active")
         arenas = self._staging_arenas
         assert arenas
-        metrics["staging_peak_bytes"] = sum(a.numel() for a in arenas)
+        metrics["staging_peak_bytes"] = prepared.cached_plan.staging_bytes
         metrics["staging_buffers"] = len(arenas)
-        metrics["batches"] = len(prepared.batches)
-        batches = prepared.batches
+        metrics["batches"] = len(prepared.cached_plan.compiled.batches)
+        batches = prepared.cached_plan.compiled.batches
         metrics.update(
             descriptor_cache_hits=0, descriptor_cache_misses=0, descriptor_builds=0
         )
@@ -1367,15 +1416,15 @@ class _NixlStagedTransfer:
                     tensor.zero_()
             if arenas[index % len(arenas)].device.type == "cuda":
                 torch.cuda.synchronize(self._device)
-            sources = {
-                c.src_name: prepared.sources[c.src_name] for c in batch.capture.copies
-            }
+            sources = prepared.cached_plan.batch_sources[index]
             chunk = _PreparedNixlTransfer(
                 batch.plan,
                 batch.capture,
                 sources,
                 descriptors(index, recv, full, convert),
                 prepared.transport,
+                batch.conversion_copies,
+                prepared.cached_plan.wire_bytes[index],
             )
             started = time.perf_counter()
             posted = prepared.transport.post_reads(list(chunk.descriptors))
@@ -1593,14 +1642,8 @@ class _NixlStagedTransfer:
                     + copy.dest_offset,
                 )
                 destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.plan.converts}
-        conversion_copies = {
-            copy.param_name: copy
-            for copy in prepared.capture.copies
-            if copy.param_name in converted
-        }
         for convert in prepared.plan.converts:
-            copy = conversion_copies[convert.param_name]
+            copy = prepared.conversion_copies[convert.param_name]
             target = self._recv_buffers[convert.param_name]
             destination = target.as_strided(
                 copy.dest_shape,
@@ -1614,7 +1657,7 @@ class _NixlStagedTransfer:
         if self.cache_config.publish_digest:
             self._verify(prepared)
 
-        bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        bytes_received = prepared.wire_bytes
         # This is the path the FSDP trainer refits over, and the path the 20x
         # collapse was measured on, so it is the one the floor most needs to cover.
         throughput.warn_if_below_floor(

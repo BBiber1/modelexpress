@@ -290,10 +290,10 @@ def test_warm_descriptors_still_transfer_new_values(
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
     assert len(harness.captures) == 1
-    assert warm["descriptor_cache_hits"] == len(second.batches)
+    assert warm["descriptor_cache_hits"] == second.metrics["batches"]
     assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
     assert len(harness.transports) == 1
-    assert len(second.transport.posts) == 2 * len(second.batches)
+    assert len(second.transport.posts) == 2 * second.metrics["batches"]
     assert second.transport.mem_type == ("DRAM" if device == "cpu" else "VRAM")
     assert second.transport.awaited == second.transport.posted
 
@@ -319,7 +319,7 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
     else:
         _check_values(harness, installed)
     assert metrics["descriptor_cache_hits"] == 0
-    assert metrics["descriptor_builds"] == len(second.batches)
+    assert metrics["descriptor_builds"] == second.metrics["batches"]
 
 
 

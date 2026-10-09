@@ -18,17 +18,16 @@ import json
 import logging
 from contextlib import nullcontext
 
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
-
-from modelexpress_rl.inference._cache_config import RefitCacheConfig
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.inference._cache_config import RefitCacheConfig
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
@@ -116,10 +115,14 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),
         transport=_Transport(),
+        conversion_copies={},
+        wire_bytes=nbytes,
     )
 
 
-def _stage(monkeypatch, *, nbytes: int, wire_s: float) -> transfer_module._StagedNixlWeights:
+def _stage(
+    monkeypatch, *, nbytes: int, wire_s: float
+) -> transfer_module._StagedNixlWeights:
     """Run stage() to completion on CPU with a scripted wire duration."""
     monkeypatch.setattr(
         transfer_module,

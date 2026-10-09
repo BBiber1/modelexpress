@@ -1807,3 +1807,8 @@ changes; a changed logical source schema requires recapture. Cache and diagnosti
 controls are fixed when the client is created. Default warm source discovery only
 checks current mesh identity and generation; debug or digest modes fetch current
 manifests. Descriptor bindings remain lazy at this layer.
+
+Compiled refit plans retain parameter names, per-batch source selections and
+conversion mappings, planned READ byte totals and allocated staging bytes. Each
+version retains its own transport handles and metrics. Bounded descriptor bindings
+still use the existing lazy cache; this metadata does not retain tensor views.
