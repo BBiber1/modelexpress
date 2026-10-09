@@ -1769,15 +1769,13 @@ post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
-Mesh-backed weight versions include the trainer mesh generation captured atomically
-by the server at creation. Idempotent retries return the original generation.
-Shard publication, including the final READY transition and repeated publications,
-rejects a changed generation before writing. Stored mesh versions without a
-positive generation must be recreated. Versions without a trainer mesh carry
-generation zero.
-
-The Python weight-version contract requires the recorded generation. Mesh-backed
-versions require a positive uint64 value, while versions without a trainer mesh
-require zero. The unchanged creation API returns the server-assigned generation;
-clients and trainer producers retain it instead of inferring a mutable current
-mesh generation.
+Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
+The unchanged creation API supplies a mesh ID; the server reads and stamps its
+generation atomically while creating the version. Idempotent retries return the
+original stamp. Shard publication, including the final READY transition and
+repeated publications, rejects a changed mesh generation before writing. Trainer
+resolution compares the recorded generation with the current mesh. Versions
+created before this field must be recreated; missing or zero mesh generations
+fail explicitly. Versions without a trainer mesh, including object-storage
+versions, carry generation zero. A requested version whose recorded mesh
+generation differs from the current trainer mesh fails source resolution.
