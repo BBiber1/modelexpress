@@ -225,11 +225,6 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
             installed.update({name: value.clone() for name, value in tensors.items()})
         return metrics, installed
 
-    def use_transfer(replacement) -> None:
-        nonlocal transfer
-        transfer = replacement
-        state.transfer = transfer
-
     def new_transfer() -> None:
         nonlocal transfer
         transfer.close()
@@ -239,7 +234,6 @@ def harness(monkeypatch) -> Iterator[SimpleNamespace]:
     state = SimpleNamespace(
         transfer=transfer,
         new_transfer=new_transfer,
-        use_transfer=use_transfer,
         managers=managers,
         added_agents=added_agents,
         source_agents=source_agents,

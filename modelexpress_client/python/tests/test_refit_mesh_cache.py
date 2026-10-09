@@ -123,39 +123,6 @@ def test_replacing_candidate_under_same_mesh_rebuilds(harness) -> None:
     _check_values(harness, harness.collect(replacement)[1])
 
 
-def test_mesh_change_during_setup_rejects_then_rebuilds(harness) -> None:
-    from types import SimpleNamespace
-
-    from modelexpress_rl import refit_pb2
-    from modelexpress_rl.inference.runtime import _create_load_time_tensor_method
-
-    current = refit_pb2.TrainerMesh(mesh_id="mesh", generation=2)
-    service = SimpleNamespace(
-        GetTrainerMesh=lambda *args, **kwargs: refit_pb2.GetTrainerMeshResponse(
-            mesh=current
-        )
-    )
-    method = _create_load_time_tensor_method(
-        capability=SimpleNamespace(
-            device_id=0,
-            device=torch.device("cuda:0"),
-            capture_layout=harness.capture_layout,
-        ),
-        worker_id="target",
-        service=lambda: service,
-    )
-    harness.transfer.close()
-    # Use the runtime-created transfer so the real mesh RPC check runs during setup.
-    harness.use_transfer(method._transfer)
-    with pytest.raises(RuntimeError, match="mesh identity changed"):
-        harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()))
-    recovered = harness.prepare(trainer_snapshot=TrainerSourceSnapshot("mesh", 2, ()))
-    _check_values(harness, harness.collect(recovered)[1])
-    for tensor in harness.sources.values():
-        tensor.add_(4)
-    _check_values(harness, harness.collect(prepare_warm(harness))[1])
-
-
 def test_debug_layout_compares_tensor_index_arguments_before_transfer(
     harness, monkeypatch
 ) -> None:

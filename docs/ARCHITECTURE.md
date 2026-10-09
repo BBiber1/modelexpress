@@ -1786,6 +1786,12 @@ leave existing publications intact. An update with unchanged membership remains 
 After readers release their leases, membership may advance and new weight
 versions capture the new generation; old version stamps are never changed.
 
+Trainer resolution checks the requested mesh generation before and after manifest
+discovery. Consumers retain an active version lease through transfer and
+installation or release, so the atomic update fence prevents mesh changes during
+that round. An expired lease no longer blocks mesh updates. A rejected stale
+round releases its lease; the same client can install a later valid publication.
+
 Preparation uses a required trainer snapshot containing its mesh identity and
 selected immutable shards. The transfer's cached plan owns the parsed trainer
 metadata, an owned copy of the existing generator `CaptureResult`, and the full

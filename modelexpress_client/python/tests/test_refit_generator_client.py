@@ -795,16 +795,41 @@ def test_trainer_source_allows_fallback_when_initial_mesh_lookup_fails(
         server.stop(grace=None).wait()
 
 
-def test_generator_rejects_mesh_change_during_source_resolution(monkeypatch) -> None:
+@pytest.mark.parametrize("mismatch", ["initial", "post_manifest"])
+def test_generator_rejects_mesh_change_during_source_resolution(
+    monkeypatch, mismatch
+) -> None:
     server, endpoint, service = _start_server()
     service.version.trainer_mesh_id = "mesh-a"
+    if mismatch == "initial":
+        service.version.trainer_mesh_generation = 2
     service.mesh_generation_on_recheck = 2
+    _add_generator_peer(service)
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR),
+    )
     try:
-        with pytest.raises(RuntimeError, match="trainer mesh generation changed"):
+        with pytest.raises(RuntimeError, match="mesh generation"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
         assert adapter.stage_calls == []
+        assert adapter.peer_stage_calls == []
+        assert service.lease_registrations == service.lease_deletions == 1
+        assert not service.active_leases
+        service.version.uid = "version-b"
+        service.version.trainer_mesh_generation = 2
+        for shard in service.shards:
+            shard.version_id = "version-b"
+        staged = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert generator.apply_weight(staged) == "installed"
+        staged.release()
+        assert len(adapter.stage_calls) == len(adapter.apply_calls) == 1
+        assert adapter.stage_calls[0].version_id == "version-b"
+        assert adapter.peer_stage_calls == []
+        assert service.lease_registrations == service.lease_deletions == 2
         assert not service.active_leases
     finally:
         generator.close()

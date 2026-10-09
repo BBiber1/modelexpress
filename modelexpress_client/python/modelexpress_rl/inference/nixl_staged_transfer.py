@@ -603,7 +603,6 @@ class _NixlStagedTransfer:
         listen_port: int | None = None,
         timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
-        verify_trainer_mesh: Callable[[TrainerSourceSnapshot], None] | None = None,
         cache_config: RefitCacheConfig | None = None,
     ) -> None:
         self.cache_config = cache_config or RefitCacheConfig()
@@ -611,7 +610,6 @@ class _NixlStagedTransfer:
             None
         )
         self._trainer_snapshot: TrainerSourceSnapshot | None = None
-        self._verify_trainer_mesh = verify_trainer_mesh
         self._transport: NixlReshardTransport | None = None
         self._device_id = device_id
         self._device = device
@@ -850,12 +848,6 @@ class _NixlStagedTransfer:
             used_sources=used_sources,
         )
 
-    def _verify_completed_plan(
-        self, trainer: TrainerSourceSnapshot, *, reusable: bool
-    ) -> None:
-        if not reusable and self._verify_trainer_mesh is not None:
-            self._verify_trainer_mesh(trainer)
-
     def _resolve_metadata(
         self, manifests: list[bytes], metrics: dict[str, Any]
     ) -> _ResolvedSources:
@@ -990,10 +982,7 @@ class _NixlStagedTransfer:
         self,
         cached: _CachedPullPlan,
         prepared: _PreparedNixlTransfer | _PreparedBoundedTransfer,
-        *,
-        reusable: bool,
     ) -> None:
-        self._verify_completed_plan(cached.trainer_source_snapshot, reusable=reusable)
         self._transport = prepared.transport
         self._cached_pull_plan = cached
         self._trainer_snapshot = cached.trainer_source_snapshot
@@ -1096,7 +1085,7 @@ class _NixlStagedTransfer:
                     used_sources,
                 )
             )
-            self._publish_prepared(cached, prepared, reusable=reusable)
+            self._publish_prepared(cached, prepared)
             return prepared
 
     def prepare_streaming(
@@ -1129,7 +1118,7 @@ class _NixlStagedTransfer:
                 self._descriptor_cache = self._prepare_bounded_descriptors(
                     compiled, previous_descriptors, enabled=True
                 )
-                self._publish_prepared(warm, prepared, reusable=True)
+                self._publish_prepared(warm, prepared)
                 return prepared
             buffer_budget = self._validate_streaming_settings(
                 max_staging_bytes, staging_device, staging_buffers
@@ -1188,7 +1177,7 @@ class _NixlStagedTransfer:
                 tuple(manifests),
                 compiled.required_agents,
             )
-            self._publish_prepared(cached, prepared, reusable=False)
+            self._publish_prepared(cached, prepared)
             self._descriptor_cache = descriptors
             return prepared
 
