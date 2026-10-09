@@ -1240,6 +1240,12 @@ def test_prepare_rejects_invalid_staging_options() -> None:
             trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
             manifests=[], capture_layout=None, max_staging_bytes=1, staging_buffers=0
         )
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            transfer.prepare_streaming(
+                trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+                manifests=[], capture_layout=None, max_staging_bytes=invalid,
+            )
 
 
 def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):

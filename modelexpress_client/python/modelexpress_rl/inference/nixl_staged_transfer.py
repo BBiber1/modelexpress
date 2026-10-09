@@ -326,12 +326,6 @@ class _BoundedPlanCache:
             owner_validation_s=0.0,
             owner_plan_builds=0,
         )
-        if (
-            isinstance(max_staging_bytes, bool)
-            or not isinstance(max_staging_bytes, int)
-            or max_staging_bytes <= 0
-        ):
-            raise ValueError("max_staging_bytes must be a positive integer")
         pack = envs.MX_REFIT_PACK_MODULES
         reuse_complete = envs.MX_REFIT_REUSE_COMPLETE_PLAN
         key = None
@@ -440,12 +434,6 @@ def _bounded_batches(
     staging_buffers=1,
 ) -> tuple[_BoundedBatch, ...]:
     """Validate all owning-module batches before allocating or installing."""
-    if (
-        isinstance(max_staging_bytes, bool)
-        or not isinstance(max_staging_bytes, int)
-        or max_staging_bytes <= 0
-    ):
-        raise ValueError("max_staging_bytes must be a positive integer")
     if metrics is None:
         metrics = {}
     started = time.perf_counter()
@@ -518,7 +506,6 @@ def _pack_bounded_batches(
     neighbours that fit the same arena together, so each packed batch still
     installs whole modules and reads exactly the bytes the unpacked plan read.
     """
-    _require_positive_bytes(max_staging_bytes, "max_staging_bytes")
 
     def merge(group: list[_BoundedBatch]) -> _BoundedBatch:
         capture = CaptureResult(
@@ -529,10 +516,6 @@ def _pack_bounded_batches(
         for batch in group:
             _merge_plan(plan, batch.plan)
             for layout, incoming in zip(layouts, batch.layouts, strict=True):
-                if layout.keys() & incoming.keys():
-                    raise IncompleteRefit(
-                        "packed batches contain overlapping staging keys"
-                    )
                 layout.update(incoming)
         return _BoundedBatch(
             capture, plan, layouts, sum(batch.nbytes for batch in group)
@@ -543,8 +526,6 @@ def _pack_bounded_batches(
     current_bytes = 0
     full_sources = set()
     for batch in batches:
-        if batch.nbytes > max_staging_bytes:
-            raise IncompleteRefit("owning module exceeds the packed staging budget")
         incoming_full = set(batch.layouts.full)
         # Two modules pulling the same complete source would need one staging
         # slot for two distinct writes, so they must stay in separate batches.
