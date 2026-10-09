@@ -172,6 +172,7 @@ class TrainerSourceResolver(SourceResolver):
                 continue
             published[shard.logical_shard_id].append(shard)
 
+        counters: dict[str, int | float] = {}
         slots = []
         for source_slot_id in expected_slots:
             ordered = sorted(
@@ -183,26 +184,42 @@ class TrainerSourceResolver(SourceResolver):
                     source_slot_id,
                 )
                 return
-            slots.append(_SlotReplicas(source_slot_id, ordered, self._resolve_source))
+            slots.append(
+                _SlotReplicas(
+                    source_slot_id,
+                    ordered,
+                    lambda shard: self._resolve_source(shard, counters),
+                )
+            )
 
         seen: set[tuple[tuple[str, str], ...]] = set()
         offset = 0
         while True:
-            selected = []
-            for slot in slots:
-                source = slot.usable(offset)
-                if source is None:
-                    if not slot.usable_count:
-                        logger.warning(
-                            "no usable trainer source for required slot %s",
-                            slot.slot_id,
-                        )
-                        return
-                    # Exhausted and shorter than the candidate index, so cycle
-                    # its healthy replicas rather than give up on a slot that
-                    # simply has fewer of them.
-                    source = slot.usable(offset % slot.usable_count)
-                selected.append(source)
+            with refit_span(
+                "source_preparation",
+                metadata={
+                    "manifest_fetch_count": 0,
+                    "manifest_fetch_bytes": 0,
+                    "manifest_bytes": 0,
+                },
+                accumulate_metadata=True,
+                duration_key="source_resolution_s",
+            ) as counters:
+                selected = []
+                for slot in slots:
+                    source = slot.usable(offset)
+                    if source is None:
+                        if not slot.usable_count:
+                            logger.warning(
+                                "no usable trainer source for required slot %s",
+                                slot.slot_id,
+                            )
+                            return
+                        # Exhausted and shorter than the candidate index, so cycle
+                        # its healthy replicas rather than give up on a slot that
+                        # simply has fewer of them.
+                        source = slot.usable(offset % slot.usable_count)
+                    selected.append(source)
             selection = tuple(
                 (source.source_slot_id, source.worker_id) for source in selected
             )
@@ -230,17 +247,18 @@ class TrainerSourceResolver(SourceResolver):
             offset += 1
 
     def _resolve_source(
-        self, shard: refit_pb2.WeightVersionShard
+        self, shard: refit_pb2.WeightVersionShard, counters: dict[str, int | float]
     ) -> TrainerSourceShard:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
             raise RuntimeError("source is missing its manifest digest")
-        with refit_span("source_preparation", accumulate_metadata=True) as counters:
-            manifest, structure_digest = self._fetch_manifest(shard)
-            counters["manifest_fetch_bytes"] = len(manifest)
-            counters["manifest_fetch_count"] = 1
-            counters["manifest_bytes"] = len(manifest)
+        counters["manifest_fetch_count"] = counters.get("manifest_fetch_count", 0) + 1
+        manifest, structure_digest = self._fetch_manifest(shard)
+        counters["manifest_fetch_bytes"] = counters.get(
+            "manifest_fetch_bytes", 0
+        ) + len(manifest)
+        counters["manifest_bytes"] = counters.get("manifest_bytes", 0) + len(manifest)
         return TrainerSourceShard(
             source_slot_id=shard.logical_shard_id,
             worker_id=shard.worker_id,

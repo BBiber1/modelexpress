@@ -87,7 +87,45 @@ def sources(
     return resolver, version, fetched, len(manifest), service
 
 
+@pytest.mark.parametrize("count", [1, 256])
+def test_cold_shards_aggregate_fetch_counts(monkeypatch, count) -> None:
+    resolver, version, fetched, size, service = sources(monkeypatch, count)
+    recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
+    with use_refit_timing(recorder):
+        candidates = resolver.candidates(version)
+        resolved = next(candidates)
+        assert len(resolved.shards) == count
+        assert all(shard.manifest == b'{"tensors": []}' for shard in resolved.shards)
+        stage = recorder.as_dict()["stages"]["source_preparation"]
+        assert stage["metadata"]["manifest_fetch_count"] == count
+        assert stage["metadata"]["manifest_bytes"] == count * size
+        assert "source_resolution_s" in stage["metadata"]
+        before = dict(stage["metadata"])
+        candidates.close()
+        assert recorder.as_dict()["stages"]["source_preparation"]["metadata"] == before
+    assert fetched == [
+        f"worker-{index}"
+        for index in sorted(range(count), key=lambda index: f"slot-{index}")
+    ]
 
+
+def test_mixed_shards_count_failed_fetches_and_successful_bytes(monkeypatch) -> None:
+    resolver, version, fetched, size, service = sources(
+        monkeypatch, 3, failed_replica=True
+    )
+    recorder = RefitTimingRecorder(backend="rl_generator", version="v1", rank=0)
+    with use_refit_timing(recorder):
+        candidates = resolver.candidates(version)
+        assert len(next(candidates).shards) == 3
+        candidates.close()
+    metadata = recorder.as_dict()["stages"]["source_preparation"]["metadata"]
+    assert metadata["manifest_fetch_count"] == 4
+    assert metadata["manifest_fetch_bytes"] == 3 * size
+    assert metadata["manifest_bytes"] == 3 * size
+    assert "manifest_fetch_s" in metadata
+    assert "manifest_hash_s" in metadata
+    assert "manifest_fingerprint_s" in metadata
+    assert fetched == ["a-failed", "worker-0", "worker-1", "worker-2"]
 
 
 def test_warm_resolution_without_timing(monkeypatch) -> None:
