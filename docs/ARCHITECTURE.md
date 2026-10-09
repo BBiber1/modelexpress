@@ -1809,6 +1809,9 @@ checks current mesh identity and generation; debug or digest modes fetch current
 manifests. Descriptor bindings remain lazy at this layer.
 
 Compiled refit plans retain parameter names, per-batch source selections and
-conversion mappings, planned READ byte totals and allocated staging bytes. Each
-version retains its own transport handles and metrics. Bounded descriptor bindings
-still use the existing lazy cache; this metadata does not retain tensor views.
+conversion mappings, READ byte totals and allocated staging bytes. Each version
+retains its own transport handles and metrics. Descriptor bindings for every
+batch are created during preparation and retained on the compiled plan. Normal
+warm preparation reuses them directly, while disabling descriptor retention
+rebuilds bindings each version. Tensor views and fresh READ handles remain owned
+by execution; padding, fences and prefetch drain behavior are unchanged.

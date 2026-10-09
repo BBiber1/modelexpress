@@ -169,20 +169,26 @@ def test_freeze_sources_isolates_caller_owned_rows(harness) -> None:
 
 @pytest.mark.parametrize("plan_cache", [False, True])
 @pytest.mark.parametrize("layout_cache", [False, True])
+@pytest.mark.parametrize("descriptor_cache", [False, True])
 def test_plan_and_layout_controls_have_independent_lifetimes(
-    harness, monkeypatch, plan_cache, layout_cache
+    harness, monkeypatch, plan_cache, layout_cache, descriptor_cache
 ) -> None:
     monkeypatch.setenv("MX_REFIT_CACHE_PLAN", str(int(plan_cache)))
     monkeypatch.setenv("MX_REFIT_CACHE_GENERATOR_LAYOUT", str(int(layout_cache)))
+    monkeypatch.setenv("MX_REFIT_CACHE_DESCRIPTORS", str(int(descriptor_cache)))
     harness.new_transfer()
     first = harness.prepare()
     _check_values(harness, harness.collect(first)[1])
+    first_descriptors = first.metrics["descriptor_builds"]
     for tensor in harness.sources.values():
         tensor.add_(3)
     second = harness.prepare()
     _check_values(harness, harness.collect(second)[1])
     assert len(harness.captures) == (1 if layout_cache else 2)
     assert second.metrics["plan_cache_hits"] == int(plan_cache and layout_cache)
+    assert second.metrics["descriptor_builds"] == (
+        0 if plan_cache and layout_cache and descriptor_cache else first_descriptors
+    )
     assert len(harness.allocations) == 1
 
 
@@ -326,6 +332,54 @@ def test_registration_failure_retries_with_fully_bound_workspace(
             assert torch.equal(tensors[name][2:18], expected)
 
 
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("descriptors", [False, True])
+def test_warm_execution_only_rebinds_when_descriptors_disabled(
+    harness, monkeypatch, bounded, descriptors
+) -> None:
+    from contextlib import nullcontext
+
+    import modelexpress_rl.inference.nixl_staged_transfer as module
+
+    monkeypatch.setenv("MX_REFIT_CACHE_DESCRIPTORS", str(int(descriptors)))
+    harness.new_transfer()
+    original_empty = torch.empty
+
+    def empty(shape, **kwargs) -> torch.Tensor:
+        kwargs.pop("device", None)
+        return original_empty(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+
+    def prepare() -> module._PreparedBoundedTransfer | module._PreparedNixlTransfer:
+        if bounded:
+            return harness.prepare()
+        return harness.transfer.prepare_full_copy(
+            manifests=harness.manifests(),
+            trainer_snapshot=harness.transfer.cached_trainer_source()
+            or TrainerSourceSnapshot("mesh", 1, ()),
+            capture_layout=harness.capture_layout,
+        )
+
+    def install(prepared) -> dict[str, torch.Tensor]:
+        if bounded:
+            return harness.collect(prepared)[1]
+        return harness.transfer.stage(prepared).tensors
+
+    first = prepare()
+    install(first)
+    cold_builds = first.metrics["descriptor_builds"]
+    for source in harness.sources.values():
+        source.add_(5)
+    prepared = prepare()
+    installed = install(prepared)
+    assert torch.equal(
+        installed["a.weight"][2:18], harness.sources["exact"].reshape(-1)
+    )
+    assert prepared.metrics["descriptor_builds"] == (0 if descriptors else cold_builds)
+    assert prepared.metrics["plan_cache_hits"] == 1
+    assert len(harness.captures) == 1
 
 
 def test_digest_policy_is_fixed_for_the_transfer_lifetime(harness, monkeypatch) -> None:
@@ -354,6 +408,7 @@ def test_digest_warm_bindings_use_current_manifest_digests(
     for source in harness.sources.values():
         source.add_(3)
     prepared = harness.prepare()
+    assert prepared.metrics["descriptor_builds"] == 0
     _check_values(harness, harness.collect(prepared)[1])
     prepared = harness.prepare()
     harness.sources["exact"].add_(1)

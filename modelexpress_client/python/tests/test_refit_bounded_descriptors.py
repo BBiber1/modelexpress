@@ -280,7 +280,7 @@ def test_warm_descriptors_still_transfer_new_values(
     first = prepare()
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
-    assert cold["descriptor_builds"] == cold["batches"]
+    assert cold["descriptor_builds"] == first.metrics["batches"]
     assert cold["descriptor_cache_hits"] == 0
     for values in harness.sources.values():
         values.add_(3)

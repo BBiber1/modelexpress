@@ -73,11 +73,9 @@ def _iteration_prepared(
             for batch in batches
         ),
         parameter_names=frozenset(layout),
-        wire_bytes=tuple(batch.plan.bytes_planned() for batch in batches),
-        staging_bytes=sum(arena.numel() for arena in transfer._staging_arenas),
     )
     metrics = {"batches": len(batches)}
-    transfer._descriptor_cache = None
+    cached = transfer._bind_descriptors(cached, metrics, reusable=False)
     prepared = transfer_module._PreparedBoundedTransfer(cached, transport, metrics)
     transfer._cached_pull_plan = cached
     transfer._active = prepared
@@ -1322,7 +1320,6 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
 def test_prepare_rejects_invalid_staging_options() -> None:
     transfer = object.__new__(_NixlStagedTransfer)
     transfer.cache_config = RefitCacheConfig()
-    transfer._descriptor_cache = None
     transfer._generator_layout = None
     transfer._cached_pull_plan = None
     transfer._workspace_generation = 0

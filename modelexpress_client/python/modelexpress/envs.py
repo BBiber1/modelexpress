@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     MX_REFIT_PACK_MODULES: bool
     MX_REFIT_CACHE_GENERATOR_LAYOUT: bool
     MX_REFIT_CACHE_PLAN: bool
+    MX_REFIT_CACHE_DESCRIPTORS: bool
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
@@ -333,6 +334,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_CACHE_GENERATOR_LAYOUT": lambda: _env_bool(
         "MX_REFIT_CACHE_GENERATOR_LAYOUT", True
     ),
+    "MX_REFIT_CACHE_DESCRIPTORS": lambda: _env_bool("MX_REFIT_CACHE_DESCRIPTORS", True),
     "MX_REFIT_CACHE_PLAN": lambda: _env_bool("MX_REFIT_CACHE_PLAN", True),
     "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: _env_bool(
         "MX_REFIT_DEBUG_VALIDATE_PLAN", False
