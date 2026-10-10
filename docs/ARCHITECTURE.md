@@ -1187,6 +1187,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
+| `telemetry.py` | Optional OpenTelemetry facade for refit spans, duration metrics, and W3C context propagation |
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -1943,3 +1944,69 @@ runtime code, the selected scenario and the vLLM adapter; host rendering and
 Kubernetes lifecycle code are not mounted in workload pods. ConfigMap item paths
 preserve Python packages, and pod commands use `python3 -m` with ordinary package
 imports. Configuration is loaded explicitly when a command starts.
+
+### Native NIXL refit telemetry
+
+
+With MX OpenTelemetry tracing enabled, NIXL agents enable native telemetry capture.
+Each posted group has an `mx.refit.nixl_batch` span from the first request posting
+until the final request completion, with `mx.refit.nixl_transfer` children.
+Telemetry is read at each successful completion before the handle is released.
+Serial and concurrent reshard reads, prefetched reads, and direct reads use the
+same instrumentation. Span attributes carry experiment, step, role, and rank.
+
+Request attributes include `nixl.total_bytes`, `nixl.desc_count`,
+`nixl.start_time_us`, `nixl.post_duration_s`, and `nixl.xfer_duration_s`.
+Native start times use a monotonic clock and are not Unix timestamps. The batch
+records summed bytes, descriptors, posting durations, and min/median/max/p95
+request transfer durations (linear interpolation), plus completion and telemetry
+coverage counts. `nixl.observed_batch_duration_s` measures elapsed time from
+batch creation to the last observed completion, including polling delay and
+time before polling resumes while a consumer commits another batch.
+`nixl.observed_payload_gbps` divides observed payload bytes by that interval
+when native samples are complete and successful. These are observed logical
+payload rates, not NIC link counters or native NIXL durations. Native request
+duration samples include NIXL completion-observation latency. The aggregate
+batch-duration metric is `mx_refit_nixl_observed_batch_duration`. Unavailable
+telemetry does not fail a transfer; incomplete coverage is explicit.
+
+No native exporter configuration is needed for NIXL 0.10.1: capture works with
+`NIXL_TELEMETRY_EXPORTER` and `NIXL_TELEMETRY_DIR` unset. MX exports through the
+existing OTLP trace and metrics endpoints, with request and batch span exemplars.
+Tracing work is skipped when spans are not recording. Public transfer return
+values, device synchronization, timeout, health, and cleanup behavior are retained.
+
+The `modelexpress_rl.RefitTrace` facade owns the `mx.refit.cycle` root, exported
+with `service.name=root`, and the trainer, orchestrator, and generator role
+envelopes. It also owns the
+`mx.refit.trainers` and `mx.refit.generators` groups. Shared version, step,
+experiment, and staging attributes travel in W3C baggage across process
+boundaries; role and rank remain local to each process. Envelope start and end
+times reflect their actual scope lifetime and can include coordination gaps
+between child spans.
+
+Refit cycle context is stored in the weight version's `trace_context` map and
+returned by the existing lifecycle RPCs. Trainer ranks carry the root and
+trainer-group context alongside the version identity in their existing
+broadcast. Operations measured before a parent is discovered retain their
+original start and end times and are emitted after context arrives from that
+broadcast or the version lookup. Telemetry adds no application synchronization
+or ports.
+
+Refit telemetry records `mx.refit.stage_weight`, `mx.refit.apply_weight`, and
+`mx.refit.release_weight` for both transfer modes. Cold preparation exposes
+metadata resolution, fixed-layout binding, physical planning, source connections,
+arena allocation and registration, and descriptor binding. Warm preparation
+reports reuse and current publication counters without repeating cold spans.
+Bounded compilation emits one `mx.refit.bounded_plan_compile` span per rank,
+with aggregate owner planning, validation, cache and batch measurements. It does
+not emit individual owner planning spans. Full-copy preparation retains separate
+`mx.refit.transfer_planning` and `mx.refit.transfer_validation` spans.
+Trainer source discovery emits one completed `mx.refit.source_resolution` span
+per resolution flush when worker metadata RPCs occurred. Counters export once
+through the timing recorder; lazy iterator pauses and consumer work are excluded
+from discovery durations, and no telemetry context remains active across yields.
+Reconstruction spans include the device completion fence. Runtime tensor peer
+publication completes before the apply timing record is emitted. Trainer digest
+staging records its completion fence once before reading checksums, and the
+publication layer skips that already-completed wait.

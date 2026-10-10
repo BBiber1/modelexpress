@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 
 import torch
+from modelexpress import telemetry
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
@@ -173,48 +174,50 @@ def build_fsdp_reshard_manifest(
         raise ValueError("no local shards to publish")
 
     generation_started = time.perf_counter()
-    by_name: dict[str, PublishedTensor] = {}
-    for shard in shards:
-        served = shard.served_tensor
-        if not served.is_contiguous():
-            raise ValueError(f"{shard.name}: served tensor must be contiguous for RDMA")
-        addr = served.data_ptr()
-        if addr <= 0:
-            raise ValueError(f"{shard.name}: shard has invalid address")
-        published_shard = PublishedShard(
-            agent_name=agent_name,
-            device_id=int(served.device.index or 0),
-            addr=addr,
-            shard_offset=tuple(shard.shard_offset),
-            shape=tuple(shard.local_shape),
-            digest=published_digest(served) if include_digests else None,
-            memory_type=(
-                NIXL_DRAM_MEM_TYPE
-                if served.device.type == "cpu"
-                else NIXL_VRAM_MEM_TYPE
-            ),
-        )
-        tensor = by_name.get(shard.name)
-        if tensor is None:
-            by_name[shard.name] = PublishedTensor(
-                name=shard.name,
-                dtype=str(served.dtype),
-                elsize=served.element_size(),
-                full_shape=tuple(shard.global_shape),
-                shards=[published_shard],
+    with telemetry.span("mx.refit.manifest_generation"):
+        by_name: dict[str, PublishedTensor] = {}
+        for shard in shards:
+            served = shard.served_tensor
+            if not served.is_contiguous():
+                raise ValueError(f"{shard.name}: served tensor must be contiguous for RDMA")
+            addr = served.data_ptr()
+            if addr <= 0:
+                raise ValueError(f"{shard.name}: shard has invalid address")
+            published_shard = PublishedShard(
+                agent_name=agent_name,
+                device_id=int(served.device.index or 0),
+                addr=addr,
+                shard_offset=tuple(shard.shard_offset),
+                shape=tuple(shard.local_shape),
+                digest=published_digest(served) if include_digests else None,
+                memory_type=(
+                    NIXL_DRAM_MEM_TYPE
+                    if served.device.type == "cpu"
+                    else NIXL_VRAM_MEM_TYPE
+                ),
             )
-        else:
-            tensor.shards.append(published_shard)
+            tensor = by_name.get(shard.name)
+            if tensor is None:
+                by_name[shard.name] = PublishedTensor(
+                    name=shard.name,
+                    dtype=str(served.dtype),
+                    elsize=served.element_size(),
+                    full_shape=tuple(shard.global_shape),
+                    shards=[published_shard],
+                )
+            else:
+                tensor.shards.append(published_shard)
 
-    published = list(by_name.values())
+        published = list(by_name.values())
     generation_s = time.perf_counter() - generation_started
     serialization_started = time.perf_counter()
-    blob = wrap_rendezvous_blob(
-        manager.nixl_metadata,
-        agent_name,
-        metadata_endpoint,
-        published,
-    )
+    with telemetry.span("mx.refit.manifest_serialization"):
+        blob = wrap_rendezvous_blob(
+            manager.nixl_metadata,
+            agent_name,
+            metadata_endpoint,
+            published,
+        )
     serialization_s = time.perf_counter() - serialization_started
     if metrics is not None:
         metrics.update(

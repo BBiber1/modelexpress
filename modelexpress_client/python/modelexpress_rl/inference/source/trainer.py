@@ -9,10 +9,10 @@ import logging
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping
-from time import perf_counter
+from time import perf_counter, time_ns
 
 import grpc
-from modelexpress import envs
+from modelexpress import envs, telemetry
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress.refit.timing import add_refit_duration, refit_span
 
@@ -183,9 +183,10 @@ class TrainerSourceResolver(SourceResolver):
         counters: dict[str, int | float] = defaultdict(int)
         resolution_seconds = 0.0
         resolution_failed = False
+        resolution_trace_started = None
 
         def flush() -> None:
-            nonlocal resolution_seconds, resolution_failed
+            nonlocal resolution_seconds, resolution_failed, resolution_trace_started
             if counters:
                 add_refit_duration(
                     "source_preparation",
@@ -194,6 +195,14 @@ class TrainerSourceResolver(SourceResolver):
                     metadata=dict(counters),
                     accumulate_metadata=True,
                 )
+                if resolution_trace_started is not None:
+                    telemetry.completed_span(
+                        "mx.refit.source_resolution",
+                        resolution_trace_started,
+                        time_ns(),
+                        {**counters, "status": "error" if resolution_failed else "ok"},
+                    )
+                    resolution_trace_started = None
                 counters.clear()
                 resolution_seconds = 0.0
                 resolution_failed = False
@@ -203,7 +212,13 @@ class TrainerSourceResolver(SourceResolver):
             if identity in round_sources:
                 return round_sources[identity]
             key = (shard.metadata_endpoint, shard.stable_metadata_digest)
-            nonlocal resolution_seconds, resolution_failed
+            nonlocal resolution_seconds, resolution_failed, resolution_trace_started
+            if (
+                resolution_trace_started is None
+                and (key not in stable_sources or verify)
+                and telemetry.recording()
+            ):
+                resolution_trace_started = time_ns()
             started = perf_counter()
             try:
                 source, checksums = self._resolve_source(
