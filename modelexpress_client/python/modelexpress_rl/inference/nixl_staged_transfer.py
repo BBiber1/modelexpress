@@ -67,7 +67,7 @@ from modelexpress_rl.inference._source_snapshot import (
     _SourceSnapshot,
 )
 
-from ..shard_metadata import ShardChecksumKey
+from ..train.manifest import ShardChecksumKey
 from .plan import StreamingSettings
 
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces

@@ -175,18 +175,16 @@ class TrainerShardMetadataPublisher(Protocol):
     def publish_binding(self, manifest: bytes) -> None:
         """Serve immutable tensor coverage before joining a trainer mesh."""
 
-    def publish_metadata(
-        self,
-        *,
-        version_id: str,
-        logical_shard_id: str,
-        metadata: TrainerShardMetadata,
-        version_metadata: refit_pb2.WeightVersionShardMetadata | None = None,
-    ) -> str:
-        """Publish ``manifest`` and return its ready, worker-local endpoint."""
+    def publish_metadata(self, *, metadata: TrainerShardMetadata) -> str:
+        """Publish stable metadata and return its ready worker-local endpoint."""
+
+    def publish_version_metadata(
+        self, metadata: refit_pb2.WeightVersionShardMetadata
+    ) -> None:
+        """Publish immutable version checksums referencing already served metadata."""
 
     def release_version_metadata(self, *, version_id: str, logical_shard_id: str) -> None:
-        """Stop serving a released version's manifest."""
+        """Stop serving a released version's checksums."""
 
 
 __all__ = [

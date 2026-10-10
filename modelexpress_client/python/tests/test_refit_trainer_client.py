@@ -183,7 +183,7 @@ def test_refit_service_uses_named_response_messages():
     )
 
 
-def test_releasing_version_metadata_preserves_stable_metadata() -> None:
+def test_stable_and_version_metadata_have_independent_publication_lifetimes() -> None:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     port = server.add_insecure_port("127.0.0.1:0")
     service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
@@ -201,10 +201,9 @@ def test_releasing_version_metadata_preserves_stable_metadata() -> None:
         stable_metadata_digest=manifest.digest,
         checksums=[refit_pb2.ShardChecksum(tensor_name="weight", digest="digest")],
     )
-    service.publish_metadata(
-        version_id="version-a", logical_shard_id="rank:0", metadata=manifest,
-        version_metadata=version_metadata,
-    )
+    with pytest.raises(ValueError):
+        service.publish_version_metadata(version_metadata)
+    assert service.publish_metadata(metadata=manifest) == service.endpoint
     server.start()
     try:
         with grpc.insecure_channel(service.endpoint) as channel:
@@ -212,14 +211,29 @@ def test_releasing_version_metadata_preserves_stable_metadata() -> None:
             request = refit_pb2.GetWeightVersionShardMetadataRequest(
                 version_id="version-a", logical_shard_id="rank:0",
             )
+            stable_request = refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=manifest.digest,
+            )
+            stable = worker.GetTrainerShardMetadata(stable_request)
+            assert stable.metadata == manifest.data
+            assert stable.metadata_digest == manifest.digest
+            with pytest.raises(grpc.RpcError) as unpublished:
+                worker.GetWeightVersionShardMetadata(request)
+            assert unpublished.value.code() is grpc.StatusCode.NOT_FOUND
+            service.publish_version_metadata(version_metadata)
+            service.publish_version_metadata(metadata=version_metadata)
+            assert worker.GetWeightVersionShardMetadata(request).metadata == version_metadata
+            conflicting = refit_pb2.WeightVersionShardMetadata()
+            conflicting.CopyFrom(version_metadata)
+            conflicting.checksums[0].digest = "different-content"
+            with pytest.raises(ValueError):
+                service.publish_version_metadata(conflicting)
             assert worker.GetWeightVersionShardMetadata(request).metadata == version_metadata
             service.release_version_metadata(version_id="version-a", logical_shard_id="rank:0")
             with pytest.raises(grpc.RpcError) as released:
                 worker.GetWeightVersionShardMetadata(request)
             assert released.value.code() is grpc.StatusCode.NOT_FOUND
-            assert worker.GetTrainerShardMetadata(
-                refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=manifest.digest)
-            ).metadata == manifest.data
+            assert worker.GetTrainerShardMetadata(stable_request) == stable
     finally:
         server.stop(grace=None).wait()
 

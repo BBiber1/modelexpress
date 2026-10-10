@@ -24,7 +24,7 @@ from modelexpress_rl.train.adapter import (
     TrainerShardMetadata,
 )
 from modelexpress_rl.train.manifest import bound_tensor_manifest
-from modelexpress_rl.shard_metadata import stable_metadata_blob
+from modelexpress_rl.train.manifest import stable_metadata_blob
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 from .publisher import build_megatron_reshard_manifest

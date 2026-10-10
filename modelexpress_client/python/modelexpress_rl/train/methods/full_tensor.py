@@ -14,7 +14,7 @@ import grpc
 from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
-from ...shard_metadata import version_metadata, version_metadata_digest
+from ..manifest import version_metadata, version_metadata_digest
 from modelexpress import envs as mx_envs
 from ...version import TrainerTensorsMetadata, WeightVersionRef
 from ..adapter import (
@@ -145,11 +145,10 @@ class FullTensorNixlPublicationMethod:
             duration_key="manifest_publish_s",
         ):
             endpoint = self._manifest_publisher.publish_metadata(
-                version_id=version.version_id,
-                logical_shard_id=logical_shard_id,
                 metadata=staged.metadata,
-                version_metadata=record,
             )
+            if record is not None:
+                self._manifest_publisher.publish_version_metadata(record)
         if not endpoint.strip():
             raise ValueError("metadata_endpoint is required")
         shard = refit_pb2.WeightVersionShard(

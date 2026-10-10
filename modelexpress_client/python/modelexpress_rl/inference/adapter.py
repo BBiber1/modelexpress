@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from ..shard_metadata import ShardChecksumKey
+from ..train.manifest import ShardChecksumKey
 
 
 class GeneratorEngineContext(ABC):

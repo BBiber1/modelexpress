@@ -48,7 +48,7 @@ from modelexpress_rl.train.adapter import (
     TrainerShardMetadata,
 )
 from modelexpress_rl.train.manifest import bound_tensor_manifest
-from modelexpress_rl.shard_metadata import stable_metadata_blob
+from modelexpress_rl.train.manifest import stable_metadata_blob
 from modelexpress.refit.reshard.verify import tensor_digest
 
 from .publisher import (

@@ -583,6 +583,11 @@ The first publication pins each worker/logical-shard stable metadata digest in t
 current mesh generation. Redis rejects a different digest before publishing that
 shard or advancing readiness. Pins survive version release and unchanged or failed
 mesh updates; only a successful generation change clears them.
+The worker publisher serves stable physical metadata without a version ID through
+`publish_metadata()`. It separately publishes a checksum record with
+`publish_version_metadata()` only after the referenced stable metadata is available;
+both stores are ready before central shard advertisement. Canonical metadata helpers
+and the worker service live together in `modelexpress_rl/train/manifest.py`.
 Stable metadata remains available for the worker process lifetime. Releasing a trainer
 shard removes its optional version checksum record only after central deletion succeeds;
 the service rejects deletion while a version lease is active.

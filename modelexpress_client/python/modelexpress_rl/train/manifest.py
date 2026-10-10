@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Worker-local serving for versioned trainer manifests."""
+"""Canonical trainer metadata and worker-local serving."""
 
 from __future__ import annotations
 
@@ -13,7 +13,47 @@ import grpc
 
 from .. import refit_pb2, refit_pb2_grpc
 from .adapter import TrainerShardMetadata
-from ..shard_metadata import version_metadata_digest
+
+
+ShardChecksumKey = tuple[str, str, int, tuple[int, ...], tuple[int, ...]]
+
+
+def stable_metadata_blob(blob: bytes, tensor_count: int, total_bytes: int) -> bytes:
+    payload = json.loads(blob)
+    payload.pop("publisher_step", None)
+    for tensor in payload["tensors"]:
+        for shard in tensor["shards"]:
+            shard.pop("digest", None)
+    payload["tensor_count"] = tensor_count
+    payload["total_bytes"] = total_bytes
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def version_metadata(
+    *,
+    version_id: str,
+    worker_id: str,
+    logical_shard_id: str,
+    stable_metadata_digest: str,
+    checksums: tuple[tuple[str, int, str], ...],
+) -> refit_pb2.WeightVersionShardMetadata:
+    return refit_pb2.WeightVersionShardMetadata(
+        version_id=version_id,
+        worker_id=worker_id,
+        logical_shard_id=logical_shard_id,
+        stable_metadata_digest=stable_metadata_digest,
+        checksums=[
+            refit_pb2.ShardChecksum(tensor_name=name, shard_index=index, digest=digest)
+            for name, index, digest in sorted(checksums)
+        ],
+    )
+
+
+def version_metadata_digest(metadata: refit_pb2.WeightVersionShardMetadata) -> str:
+    keys = [(row.tensor_name, row.shard_index) for row in metadata.checksums]
+    if keys != sorted(keys) or len(set(keys)) != len(keys):
+        raise ValueError("version checksums must have unique canonical tensor/shard keys")
+    return hashlib.sha256(metadata.SerializeToString(deterministic=True)).hexdigest()
 
 
 def bound_tensor_manifest(tensor_coverage: list[dict]) -> bytes:
@@ -58,42 +98,36 @@ class RefitWorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
         with self._lock:
             self._metadata[binding_id] = manifest
 
-    def publish_metadata(
-        self,
-        *,
-        version_id: str,
-        logical_shard_id: str,
-        metadata: TrainerShardMetadata,
-        version_metadata: refit_pb2.WeightVersionShardMetadata | None = None,
-    ) -> str:
-        """Publish stable metadata and optional version checksums before returning."""
-        if not version_id.strip():
-            raise ValueError("version_id is required")
-        if not logical_shard_id.strip():
-            raise ValueError("logical_shard_id is required")
-        encoded = None
-        if version_metadata is not None:
-            if (
-                version_metadata.version_id != version_id
-                or version_metadata.logical_shard_id != logical_shard_id
-                or version_metadata.stable_metadata_digest != metadata.digest
-                or not version_metadata.worker_id
-            ):
-                raise ValueError("version metadata does not identify the published shard")
-            version_metadata_digest(version_metadata)
-            encoded = version_metadata.SerializeToString(deterministic=True)
-        key = (version_id, logical_shard_id)
+    def publish_metadata(self, *, metadata: TrainerShardMetadata) -> str:
+        """Serve immutable physical metadata independently of any weight version."""
         with self._lock:
-            if encoded is not None:
-                existing = self._versions.get(key)
-                if existing is not None and existing != encoded:
-                    raise ValueError(
-                        "different version metadata is already published for "
-                        f"version_id={version_id!r}, logical_shard_id={logical_shard_id!r}"
-                    )
-                self._versions[key] = encoded
-            self._metadata[metadata.digest] = metadata.data
+            self._metadata.setdefault(metadata.digest, metadata.data)
         return self.endpoint
+
+    def publish_version_metadata(
+        self, metadata: refit_pb2.WeightVersionShardMetadata
+    ) -> None:
+        """Serve one version's checksums after its stable metadata is published."""
+        if not metadata.version_id.strip():
+            raise ValueError("version_id is required")
+        if not metadata.logical_shard_id.strip():
+            raise ValueError("logical_shard_id is required")
+        if not metadata.worker_id.strip():
+            raise ValueError("worker_id is required")
+        version_metadata_digest(metadata)
+        encoded = metadata.SerializeToString(deterministic=True)
+        key = (metadata.version_id, metadata.logical_shard_id)
+        with self._lock:
+            if metadata.stable_metadata_digest not in self._metadata:
+                raise ValueError("version metadata references unpublished stable metadata")
+            existing = self._versions.get(key)
+            if existing is not None and existing != encoded:
+                raise ValueError(
+                    "different version metadata is already published for "
+                    f"version_id={metadata.version_id!r}, "
+                    f"logical_shard_id={metadata.logical_shard_id!r}"
+                )
+            self._versions[key] = encoded
 
     def release_version_metadata(self, *, version_id: str, logical_shard_id: str) -> None:
         """Drop version checksums after the protected version is released."""

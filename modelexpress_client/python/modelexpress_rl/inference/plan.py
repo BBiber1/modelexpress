@@ -17,7 +17,7 @@ from modelexpress import p2p_pb2
 
 from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
-from ..shard_metadata import ShardChecksumKey
+from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
 from .adapter import TrainerSourceShard
 

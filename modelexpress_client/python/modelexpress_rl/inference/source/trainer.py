@@ -17,7 +17,7 @@ from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
-from ...shard_metadata import ShardChecksumKey, version_metadata_digest
+from ...train.manifest import ShardChecksumKey, version_metadata_digest
 from ...train import WeightPayloadFormat
 from ..adapter import TrainerSourceShard
 from ..plan import (
