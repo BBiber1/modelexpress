@@ -81,6 +81,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             self.version.trainer_mesh_generation = self.mesh.generation
         if request.HasField("version_number"):
             self.version.version_number = request.version_number
+        self.version.trace_context.update(request.trace_context)
         return refit_pb2.CreateWeightVersionResponse(version=self.version)
 
     def ListWeightVersions(self, request, _context):
@@ -180,6 +181,7 @@ def test_control_client_links_version_to_trainer_mesh():
             payload_format=WeightPayloadFormat.FULL_TENSOR,
             trainer_mesh_id="mesh-a",
             version_number=7,
+            trace_context={"traceparent": "00-abc-123-01"},
         )
         fetched = control.get_weight_version(version.version_id)
         assert control.list_weight_versions(model_name="test/model", trainer_mesh_id="mesh-a") == [version]
@@ -197,6 +199,7 @@ def test_control_client_links_version_to_trainer_mesh():
 
     assert version.trainer_mesh_id == "mesh-a"
     assert version.version_number == 7
+    assert version.trace_context == {"traceparent": "00-abc-123-01"}
     assert fetched == version
 
 

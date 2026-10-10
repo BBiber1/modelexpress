@@ -25,6 +25,7 @@ from types import GetSetDescriptorType
 from typing import TYPE_CHECKING
 
 import torch
+from modelexpress import telemetry
 from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
@@ -193,6 +194,7 @@ def _alias_structure(groups):
     return tuple(result)
 
 
+@telemetry.span("mx.refit.engine_mapping_compile")
 def _compile_parameter_aliases(model, groups, modules) -> _ParameterAliases:
     groups = tuple(groups)
     owners, edges, full_groups, ties, writers, attributes = [], {}, [], [], {}, {}
@@ -633,28 +635,31 @@ class _VllmInstaller(EngineInstaller):
         )
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
-        started = time.perf_counter()
-        metrics = prepared.metrics
-        if isinstance(prepared, PreparedEngineTensors):
-            self.install_tensors(prepared.staged.tensors)
-        elif isinstance(prepared, PreparedStreamingTensors):
-            self.install_streaming(prepared)
-            # install_streaming records into the artifact's own metrics dict;
-            # re-read it so those entries travel with the install timing.
+        with telemetry.span("mx.refit.install"):
+            started = time.perf_counter()
             metrics = prepared.metrics
-            metrics["streaming_apply_s"] = time.perf_counter() - started
-        elif isinstance(prepared, PreparedRuntimeTensors):
-            self.install_runtime_tensors(prepared.staged.tensors)
-        elif isinstance(prepared, PreparedCheckpointArtifact):
-            checkpoint = prepared.checkpoint
-            if not isinstance(checkpoint, PreparedCheckpoint):
-                raise TypeError("checkpoint preparation has an invalid value")
-            self.install_checkpoint(checkpoint.path)
-        else:
-            raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
-        if not isinstance(prepared, PreparedStreamingTensors):
-            metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
-        return metrics
+            if isinstance(prepared, PreparedEngineTensors):
+                self.install_tensors(prepared.staged.tensors)
+            elif isinstance(prepared, PreparedStreamingTensors):
+                self.install_streaming(prepared)
+                # install_streaming records into the artifact's own metrics dict;
+                # re-read it so those entries travel with the install timing.
+                metrics = prepared.metrics
+                metrics["streaming_apply_s"] = time.perf_counter() - started
+            elif isinstance(prepared, PreparedRuntimeTensors):
+                self.install_runtime_tensors(prepared.staged.tensors)
+            elif isinstance(prepared, PreparedCheckpointArtifact):
+                checkpoint = prepared.checkpoint
+                if not isinstance(checkpoint, PreparedCheckpoint):
+                    raise TypeError("checkpoint preparation has an invalid value")
+                self.install_checkpoint(checkpoint.path)
+            else:
+                raise TypeError(
+                    f"unsupported prepared artifact {type(prepared).__name__}"
+                )
+            if not isinstance(prepared, PreparedStreamingTensors):
+                metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
+            return metrics
 
     @property
     def _is_quantized(self) -> bool:
@@ -753,6 +758,7 @@ class _VllmInstaller(EngineInstaller):
                 if not standard or other is not parameter:
                     setattr(module, name, parameter)
 
+    @telemetry.span("mx.refit.engine_mapping_capture")
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
     ) -> tuple[
@@ -879,6 +885,7 @@ class _VllmInstaller(EngineInstaller):
                 ownership.drain_failed = True
                 raise
 
+        @telemetry.span("mx.refit.vllm_streaming_load")
         def load(initial_aliases: _ParameterAliases) -> None:
             nonlocal load_s, commit_s
             load_started = time.perf_counter()
@@ -895,6 +902,7 @@ class _VllmInstaller(EngineInstaller):
                 ownership.source_failed = True
                 raise
             sentinel = object()
+            batch_index = 0
             while True:
                 try:
                     tensors = next(ownership.iterator, sentinel)
@@ -904,37 +912,44 @@ class _VllmInstaller(EngineInstaller):
                     raise
                 if tensors is sentinel:
                     break
-                names = set(tensors)
-                if not names or names - expected or names & installed:
-                    raise IncompleteRefit(
-                        "invalid or repeated streaming parameter batch"
-                    )
-                commit_started = time.perf_counter()
-                received_storages = {
-                    tensor.untyped_storage().data_ptr() for tensor in tensors.values()
-                }
-                if (received_storages & live_storages) - {0}:
-                    raise IncompleteRefit(
-                        "received streaming tensor aliases live storage"
-                    )
-                self._process_and_commit(
-                    tensors,
-                    reload=False,
-                    installed_parameters=installed_parameters,
-                    initial_aliases=initial_aliases,
-                )
-                try:
-                    installed_parameters.update(
-                        (name, self._model.get_parameter(name)) for name in names
-                    )
-                except AttributeError as error:
-                    raise IncompleteRefit(
-                        "installed canonical parameter disappeared"
-                    ) from error
-                installed.update(names)
-                drain()
-                commit_s += time.perf_counter() - commit_started
-                del tensors
+                with telemetry.span("mx.refit.vllm_load_batch") as current:
+                    if current.is_recording():
+                        current.set_attribute("batch.index", batch_index)
+                        current.set_attribute("parameter.count", len(tensors))
+                    names = set(tensors)
+                    if not names or names - expected or names & installed:
+                        raise IncompleteRefit(
+                            "invalid or repeated streaming parameter batch"
+                        )
+                    commit_started = time.perf_counter()
+                    received_storages = {
+                        tensor.untyped_storage().data_ptr()
+                        for tensor in tensors.values()
+                    }
+                    if (received_storages & live_storages) - {0}:
+                        raise IncompleteRefit(
+                            "received streaming tensor aliases live storage"
+                        )
+                    with telemetry.span("mx.refit.install_commit"):
+                        self._process_and_commit(
+                            tensors,
+                            reload=False,
+                            installed_parameters=installed_parameters,
+                            initial_aliases=initial_aliases,
+                        )
+                    try:
+                        installed_parameters.update(
+                            (name, self._model.get_parameter(name)) for name in names
+                        )
+                    except AttributeError as error:
+                        raise IncompleteRefit(
+                            "installed canonical parameter disappeared"
+                        ) from error
+                    installed.update(names)
+                    drain()
+                    commit_s += time.perf_counter() - commit_started
+                    del tensors
+                batch_index += 1
             if installed != expected:
                 raise IncompleteRefit(
                     "streaming transfer ended before every parameter was installed"
@@ -943,7 +958,8 @@ class _VllmInstaller(EngineInstaller):
 
         reload_started = time.perf_counter()
         try:
-            self._reload(load)
+            with telemetry.span("mx.refit.reload"):
+                self._reload(load)
             reload_s = time.perf_counter() - reload_started - load_s
         except BaseException as error:
             primary_error = error
@@ -952,7 +968,10 @@ class _VllmInstaller(EngineInstaller):
             if not ownership.drain_failed:
                 try:
                     sync_started = time.perf_counter()
-                    with refit_span("post_install"):
+                    with (
+                        telemetry.span("mx.refit.post_install_sync"),
+                        refit_span("post_install"),
+                    ):
                         drain()
                     metrics["post_install_sync_s"] = time.perf_counter() - sync_started
                     if ownership.iterator is not None and not ownership.source_failed:
@@ -1057,6 +1076,7 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
+        @telemetry.span("mx.refit.vllm_load")
         def load(_reload_aliases: _ParameterAliases | None = None) -> None:
             # Quantized models expose kernel-packed parameters before layerwise
             # reload and load-time parameters after it. Resolve the captured
@@ -1128,92 +1148,100 @@ class _VllmInstaller(EngineInstaller):
             )
             # Subspans measure host calls; the batch fence completes GPU work.
             for layer, parameters in groups.items():
-                local_aliases = (
-                    aliases if owner_aliases is None else owner_aliases.get(layer)
-                )
+                with telemetry.span("mx.refit.vllm_load_layer") as current:
+                    if current.is_recording():
+                        current.set_attribute("module.name", group_paths[layer])
+                        current.set_attribute("module.type", type(layer).__name__)
+                        current.set_attribute("parameter.count", len(parameters))
+                    local_aliases = (
+                        aliases if owner_aliases is None else owner_aliases.get(layer)
+                    )
 
-                # A packed batch resolves several owning modules before any of
-                # their hooks run, and an earlier hook may replace a later
-                # owner. Committing into the detached module would leave the
-                # live one without the published bytes.
-                if (
-                    not reload
-                    and self._model.get_submodule(group_paths[layer]) is not layer
-                ):
-                    raise IncompleteRefit(
-                        f"a post-load hook replaced module {group_paths[layer]!r} "
-                        "before its parameters were committed"
-                    )
-                info = LAYERWISE_INFO.get(layer)
-                managed = info is not None and info.kernel_tensors is not None
-                if info is not None:
-                    local_materialization = (
-                        owner_aliases is not None
-                        and _materialization_is_local(
-                            layer, info, self._native_parameter_dispatch
-                        )
-                    )
-                    with refit_span(
-                        "installation",
-                        duration_key="materialization_s",
-                        accumulate_metadata=True,
+                    # A packed batch resolves several owning modules before any of
+                    # their hooks run, and an earlier hook may replace a later
+                    # owner. Committing into the detached module would leave the
+                    # live one without the published bytes.
+                    if (
+                        not reload
+                        and self._model.get_submodule(group_paths[layer]) is not layer
                     ):
-                        materialize_layer(layer, info)
-                    if not local_materialization:
-                        self._restore_parameter_aliases(aliases)
-                    elif local_aliases is not None:
-                        self._restore_parameter_aliases(local_aliases)
-                with refit_span(
-                    "installation",
-                    duration_key="receive_copy_s",
-                    accumulate_metadata=True,
-                ):
-                    for full_name, leaf in parameters:
-                        target = getattr(layer, leaf)
-                        source = tensors[full_name]
-                        if (
-                            target.device.type == "meta"
-                            or target.shape != source.shape
-                            or target.dtype != source.dtype
-                        ):
-                            raise IncompleteRefit(
-                                "streaming parameter has no compatible live storage"
-                            )
-                        _copy_received(target, source)
-                if not reload and not managed:
-                    continue
-                deferred = is_deferred_attention_layer(layer)
-                if managed and not deferred:
-                    if getattr(info, "loaded_weights", ()):
                         raise IncompleteRefit(
-                            "engine reload has pending checkpoint-loader calls"
+                            f"a post-load hook replaced module {group_paths[layer]!r} "
+                            "before its parameters were committed"
                         )
+                    info = LAYERWISE_INFO.get(layer)
+                    managed = info is not None and info.kernel_tensors is not None
+                    if info is not None:
+                        local_materialization = (
+                            owner_aliases is not None
+                            and _materialization_is_local(
+                                layer, info, self._native_parameter_dispatch
+                            )
+                        )
+                        with refit_span(
+                            "installation",
+                            duration_key="materialization_s",
+                            accumulate_metadata=True,
+                        ):
+                            materialize_layer(layer, info)
+                        if not local_materialization:
+                            self._restore_parameter_aliases(aliases)
+                        elif local_aliases is not None:
+                            self._restore_parameter_aliases(local_aliases)
                     with refit_span(
                         "installation",
-                        duration_key="post_load_processing_s",
+                        duration_key="receive_copy_s",
                         accumulate_metadata=True,
                     ):
-                        _layerwise_process(layer, info)
-                else:
-                    quant_method = getattr(layer, "quant_method", None)
-                    if isinstance(quant_method, QuantizeMethodBase):
-                        if hasattr(
-                            layer, "_already_called_process_weights_after_loading"
-                        ):
-                            delattr(
-                                layer, "_already_called_process_weights_after_loading"
+                        for full_name, leaf in parameters:
+                            target = getattr(layer, leaf)
+                            source = tensors[full_name]
+                            if (
+                                target.device.type == "meta"
+                                or target.shape != source.shape
+                                or target.dtype != source.dtype
+                            ):
+                                raise IncompleteRefit(
+                                    "streaming parameter has no compatible live storage"
+                                )
+                            _copy_received(target, source)
+                    if not reload and not managed:
+                        continue
+                    deferred = is_deferred_attention_layer(layer)
+                    if managed and not deferred:
+                        if getattr(info, "loaded_weights", ()):
+                            raise IncompleteRefit(
+                                "engine reload has pending checkpoint-loader calls"
                             )
-                        with refit_span("transformation"):
-                            quant_method.process_weights_after_loading(layer)
-                            update_tp = getattr(layer, "update_param_tp_status", None)
-                            if update_tp is not None:
-                                update_tp()
-                    if managed:
-                        with refit_span("installation"):
-                            _copy_and_restore_kernel_tensors(layer, info)
-                    if info is not None and not deferred:
-                        info.reset()
-                self._restore_parameter_aliases(aliases)
+                        with refit_span(
+                            "installation",
+                            duration_key="post_load_processing_s",
+                            accumulate_metadata=True,
+                        ):
+                            _layerwise_process(layer, info)
+                    else:
+                        quant_method = getattr(layer, "quant_method", None)
+                        if isinstance(quant_method, QuantizeMethodBase):
+                            if hasattr(
+                                layer, "_already_called_process_weights_after_loading"
+                            ):
+                                delattr(
+                                    layer,
+                                    "_already_called_process_weights_after_loading",
+                                )
+                            with refit_span("transformation"):
+                                quant_method.process_weights_after_loading(layer)
+                                update_tp = getattr(
+                                    layer, "update_param_tp_status", None
+                                )
+                                if update_tp is not None:
+                                    update_tp()
+                        if managed:
+                            with refit_span("installation"):
+                                _copy_and_restore_kernel_tensors(layer, info)
+                        if info is not None and not deferred:
+                            info.reset()
+                    self._restore_parameter_aliases(aliases)
 
         if reload:
             self._reload(load)

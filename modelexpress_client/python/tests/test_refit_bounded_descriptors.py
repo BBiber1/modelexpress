@@ -419,7 +419,7 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     cold, _ = harness.collect(harness.prepare())
     warm, _ = harness.collect(harness.prepare())
     assert now[0] == 400
-    assert cold["wire_s"] == warm["wire_s"] == 0
+    assert cold["wire_host_s"] == warm["wire_host_s"] == 0
     assert warm["descriptor_builds"] == 0
 
 

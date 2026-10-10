@@ -123,8 +123,8 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     monkeypatch.setattr(
         transfer_module,
         "time",
-        # started, wait_started, wait end, wire end, reconstruct start, reconstruct end
-        _Clock(0.0, 0.0, wire_s, wire_s, wire_s, wire_s),
+        # post start/end, wait start/end, reconstruct start/end
+        _Clock(0.0, 0.0, 0.0, wire_s, wire_s, wire_s),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     tensor = torch.arange(64, dtype=torch.int32)
@@ -277,11 +277,13 @@ def test_the_peer_pull_is_covered_too(monkeypatch, caplog):
     path silent on the failure the floor is for."""
     _floor(monkeypatch, FLOOR_GBPS)
     with caplog.at_level(logging.WARNING):
-        _peer_receive(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
+        metrics = _peer_receive(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
 
     payload = _record(caplog)
     assert payload["phase"] == "receive_peer"
     assert payload["implied_gbps"] == pytest.approx(12.4, abs=0.2)
+    assert metrics["wire_host_s"] == SLOW_WIRE_S
+    assert "wire_s" not in metrics
 
 
 def test_a_healthy_peer_pull_is_silent(monkeypatch, caplog):

@@ -88,6 +88,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             trainer_snapshot=source,
             capture_layout=self._capture_layout,
         )
+        set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
         metrics = dict(prepared.metrics)
         streamed = PreparedStreamingTensors(
             batches=lambda: self._transfer.iter_bounded(prepared, metrics),
@@ -142,8 +143,18 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
 
 def _attribute_transfer(metrics: dict[str, float]) -> None:
     add_refit_bytes(metrics.get("bytes_received", 0))
-    if "wire_s" in metrics:
-        add_refit_duration("wire_transfer", metrics["wire_s"])
+    if "wire_host_s" in metrics:
+        metadata = {
+            key: metrics[key]
+            for key in ("wire_host_s", "wire_wait_s")
+            if key in metrics
+        }
+        add_refit_duration(
+            "wire_transfer",
+            metrics["wire_host_s"],
+            metadata=metadata,
+            accumulate_metadata=True,
+        )
     if "reconstruct_s" in metrics:
         add_refit_duration("receive_sync", metrics["reconstruct_s"])
 
