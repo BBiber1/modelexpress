@@ -842,6 +842,9 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
             def cached_trainer_source(self) -> None:
                 return None
 
+            def cached_trainer_replicas(self, mesh_id, generation) -> tuple:
+                return ()
+
             def prepare_streaming(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
                     metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
@@ -1881,6 +1884,9 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         def cached_trainer_source(self) -> None:
             return None
 
+        def cached_trainer_replicas(self, mesh_id, generation) -> tuple:
+            return ()
+
         def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             prepare_calls.append(kwargs)
@@ -2591,6 +2597,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         def cached_trainer_source(self) -> None:
             return None
 
+        def cached_trainer_replicas(self, mesh_id, generation) -> tuple:
+            return ()
+
         def __init__(self):
             self.arena = arena
 
@@ -2796,6 +2805,9 @@ def test_streaming_creates_and_emits_one_timing_cycle(
     class Transfer:
         def cached_trainer_source(self) -> None:
             return None
+
+        def cached_trainer_replicas(self, mesh_id, generation) -> tuple:
+            return ()
 
         def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             observe_cycle()

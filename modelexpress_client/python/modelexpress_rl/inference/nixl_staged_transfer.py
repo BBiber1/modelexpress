@@ -40,7 +40,7 @@ from modelexpress.refit.reshard.rendezvous import (
     merge_shard_tables,
     unwrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import plan_pull
+from modelexpress.refit.reshard.slice_plan import PullSegment, plan_pull
 from modelexpress.refit.reshard.transfer_plan import (
     FullPullSource,
     TensorTransferPlan,
@@ -59,12 +59,14 @@ from modelexpress.refit.reshard.types import (
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
+from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 from modelexpress_rl.inference._source_snapshot import (
     _freeze_sources,
     _source_structure,
     _SourceSnapshot,
+    _ShardSnapshot,
 )
 
 from ..train.manifest import ShardChecksumKey
@@ -105,12 +107,32 @@ class _ResolvedSources:
     session_to_memory: dict[str, str] = field(default_factory=dict)
 
 
+_SourceGeometry = tuple[str, tuple[int, ...], tuple[int, ...]]
+
+
+@dataclass(frozen=True)
+class _TrainerReplica:
+    source: TrainerSourceShard
+    resolved: _ResolvedSources
+    bindings: Mapping[_SourceGeometry, _ShardSnapshot]
+    geometry: tuple
+
+
+
 @dataclass(frozen=True)
 class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
     generator_capture_snapshot: CaptureResult
-    parameter_layout: MappingProxyType
+    parameter_layout: Mapping
     transfer_plan: TensorTransferPlan | _StreamingSchedule
+    replicas: Mapping[tuple[str, str], _TrainerReplica] = field(default_factory=dict)
+    source_slots: Mapping[_SourceGeometry, str] = field(default_factory=dict)
+    replica_sources: tuple[TrainerSourceShard, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "replica_sources", tuple(record.source for record in self.replicas.values())
+        )
 
 
 @dataclass(frozen=True)
@@ -385,6 +407,87 @@ def _resolve_sources(manifests: list[bytes], *, metrics=None) -> _ResolvedSource
             payload.agent_name: payload.agent_metadata for payload in payloads
         },
     )
+
+
+def _trainer_replica(
+    source: TrainerSourceShard, resolved: _ResolvedSources | None = None
+) -> _TrainerReplica:
+    if resolved is None:
+        resolved = _resolve_sources([source.metadata])
+        frozen = _freeze_sources(resolved.sources)
+        if frozen is None:
+            raise RuntimeError("trainer replica metadata cannot be isolated")
+        resolved = replace(resolved, sources=frozen.sources)
+    resolved = replace(
+        resolved,
+        session_to_agent=MappingProxyType(dict(resolved.session_to_agent)),
+        session_to_device=MappingProxyType(dict(resolved.session_to_device)),
+        session_to_memory=MappingProxyType(dict(resolved.session_to_memory)),
+        agent_metadata=MappingProxyType(dict(resolved.agent_metadata)),
+    )
+    bindings = {}
+    geometry = []
+    for name, tensor in resolved.sources.items():
+        boxes = []
+        for shard in tensor.shards:
+            box = (tuple(shard.shard_offset), tuple(shard.shape))
+            key = (name, *box)
+            if key in bindings:
+                raise RuntimeError(f"trainer replica contains ambiguous geometry for {name!r}")
+            bindings[key] = shard
+            boxes.append(box)
+        geometry.append(
+            (name, tensor.dtype, tuple(tensor.global_shape), tensor.elsize, tuple(sorted(boxes)))
+        )
+    return _TrainerReplica(
+        source, resolved, MappingProxyType(bindings), tuple(sorted(geometry))
+    )
+
+
+def _bind_transfer_plan(
+    plan: TensorTransferPlan,
+    source_slots: Mapping[_SourceGeometry, str],
+    selected: Mapping[str, _TrainerReplica],
+) -> TensorTransferPlan:
+    def bind(segment: PullSegment) -> PullSegment:
+        if segment._source_read is None:
+            raise RuntimeError("transfer read has no source shard provenance")
+        name, offset, shape, relative_offset = segment._source_read
+        key = (name, offset, shape)
+        replica = selected[source_slots[key]]
+        shard = replica.bindings[key]
+        return replace(segment, session=shard.session, src_addr=shard.addr + relative_offset)
+
+    return replace(
+        plan,
+        segments=[bind(segment) for segment in plan.segments],
+        converts=[
+            replace(convert, segments=[bind(segment) for segment in convert.segments])
+            for convert in plan.converts
+        ],
+        full_pulls=[
+            replace(full, segments=[bind(segment) for segment in full.segments])
+            for full in plan.full_pulls
+        ],
+    )
+
+
+def _bind_streaming_schedule(
+    schedule: _StreamingSchedule,
+    source_slots: Mapping[_SourceGeometry, str],
+    selected: Mapping[str, _TrainerReplica],
+) -> _StreamingSchedule:
+    def bind(batch: _StreamingBatch) -> _StreamingBatch:
+        return replace(
+            batch, transfer_plan=_bind_transfer_plan(batch.transfer_plan, source_slots, selected)
+        )
+
+    return _StreamingSchedule(
+        _bind_transfer_plan(schedule.transfer_plan, source_slots, selected),
+        tuple(bind(batch) for batch in schedule.module_batches),
+        tuple(bind(batch) for batch in schedule.batches),
+    )
+
 
 
 def _required_agent_metadata(
@@ -797,6 +900,150 @@ class _NixlStagedTransfer:
             return None
         return plan.trainer_source_snapshot
 
+    def cached_trainer_replicas(
+        self, mesh_id: str, generation: int
+    ) -> tuple[TrainerSourceShard, ...]:
+        plan = self._weight_update_plan
+        if (
+            plan is None
+            or self._closed
+            or plan.trainer_source_snapshot.mesh_id != mesh_id
+            or plan.trainer_source_snapshot.mesh_generation != generation
+        ):
+            return ()
+        return plan.replica_sources
+
+
+    def _retain_plan(
+        self,
+        trainer: TrainerSourceSnapshot,
+        capture: CaptureResult,
+        parameter_layout: Mapping,
+        transfer_plan: TensorTransferPlan | _StreamingSchedule,
+    ) -> _WeightUpdatePlan:
+        previous = self._weight_update_plan
+        replicas = dict(previous.replicas) if (
+            previous is not None
+            and trainer.mesh_id == previous.trainer_source_snapshot.mesh_id
+            and trainer.mesh_generation == previous.trainer_source_snapshot.mesh_generation
+        ) else {}
+        selected = []
+        for source in trainer.shards:
+            identity = (source.source_slot_id, source.worker_id)
+            record = replicas.get(identity)
+            if record is not None:
+                if record.source.physical_fingerprint != source.physical_fingerprint:
+                    raise RuntimeError("known trainer replica metadata changed within a mesh generation")
+            else:
+                record = _trainer_replica(
+                    source, trainer.resolved_metadata if len(trainer.shards) == 1 else None
+                )
+                replicas[identity] = record
+            selected.append(record)
+        source_slots = {}
+        for record in selected:
+            for geometry in record.bindings:
+                source_slots.setdefault(geometry, record.source.source_slot_id)
+        initial = (
+            transfer_plan.transfer_plan
+            if isinstance(transfer_plan, _StreamingSchedule) else transfer_plan
+        )
+        by_slot = {record.source.source_slot_id: record for record in selected}
+        for segment in initial._all_segments():
+            if segment._source_read is None:
+                raise RuntimeError("transfer read has no source shard provenance")
+            name, offset, shape, relative_offset = segment._source_read
+            key = (name, offset, shape)
+            shard = by_slot[source_slots[key]].bindings[key]
+            if segment.session != shard.session or segment.src_addr != shard.addr + relative_offset:
+                raise RuntimeError("transfer read does not match its selected source shard")
+        return _WeightUpdatePlan(
+            trainer, capture, parameter_layout, transfer_plan,
+            MappingProxyType(replicas), MappingProxyType(source_slots),
+        )
+
+
+    def _try_rebind_plan(
+        self,
+        trainer: TrainerSourceSnapshot,
+    ) -> _WeightUpdatePlan | None:
+        previous = self._weight_update_plan
+        if (
+            previous is None
+            or self._debug_validate_plan
+            or self._debug_validate_layout
+            or trainer.mesh_id != previous.trainer_source_snapshot.mesh_id
+            or trainer.mesh_generation != previous.trainer_source_snapshot.mesh_generation
+            or {source.source_slot_id for source in trainer.shards}
+            != {source.source_slot_id for source in previous.trainer_source_snapshot.shards}
+        ):
+            return None
+        replicas = dict(previous.replicas)
+        selected = {}
+        for source in trainer.shards:
+            identity = (source.source_slot_id, source.worker_id)
+            record = replicas.get(identity)
+            if record is not None:
+                if record.source.physical_fingerprint != source.physical_fingerprint:
+                    raise RuntimeError("known trainer replica metadata changed within a mesh generation")
+            else:
+                record = _trainer_replica(source)
+                original = next(
+                    item for item in previous.replicas.values()
+                    if item.source.source_slot_id == source.source_slot_id
+                )
+                if record.geometry != original.geometry:
+                    raise RuntimeError("trainer replica geometry differs from the compiled plan")
+                replicas[identity] = record
+            selected[source.source_slot_id] = record
+        sources = {}
+        session_to_agent, session_to_device, session_to_memory, agent_metadata = {}, {}, {}, {}
+        for slot, record in selected.items():
+            for name, tensor in record.resolved.sources.items():
+                owned = tuple(
+                    shard for shard in tensor.shards
+                    if previous.source_slots[(name, tuple(shard.shard_offset), tuple(shard.shape))] == slot
+                )
+                if not owned:
+                    continue
+                current = sources.get(name)
+                sources[name] = (
+                    tensor._replace(shards=owned) if current is None
+                    else current._replace(shards=current.shards + owned)
+                )
+            if set(agent_metadata) & record.resolved.agent_metadata.keys():
+                raise ValueError("source manifests contain duplicate NIXL agents")
+            for target, incoming in (
+                (session_to_agent, record.resolved.session_to_agent),
+                (session_to_device, record.resolved.session_to_device),
+                (session_to_memory, record.resolved.session_to_memory),
+            ):
+                if any(key in target and target[key] != value for key, value in incoming.items()):
+                    raise RuntimeError("trainer replicas contain conflicting source sessions")
+                target.update(incoming)
+            agent_metadata.update(record.resolved.agent_metadata)
+        sources = {name: sources[name] for name in previous.trainer_source_snapshot.resolved_metadata.sources}
+        resolved = _ResolvedSources(
+            MappingProxyType(sources), MappingProxyType(session_to_agent),
+            MappingProxyType(session_to_device), MappingProxyType(agent_metadata),
+            MappingProxyType(session_to_memory),
+        )
+        trainer = replace(
+            trainer, resolved_metadata=resolved,
+            resolved_structure=tuple((name, _source_structure(source)) for name, source in sources.items()),
+        )
+        plan = previous.transfer_plan
+        bound = (
+            _bind_streaming_schedule(plan, previous.source_slots, selected)
+            if isinstance(plan, _StreamingSchedule)
+            else _bind_transfer_plan(plan, previous.source_slots, selected)
+        )
+        return _WeightUpdatePlan(
+            trainer, previous.generator_capture_snapshot, previous.parameter_layout, bound,
+            MappingProxyType(replicas), previous.source_slots,
+        )
+
+
     def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
         previous = self._weight_update_plan
         return (
@@ -966,9 +1213,10 @@ class _NixlStagedTransfer:
             previous = self._weight_update_plan
             metrics = {}
             warm = self._can_reuse_plan(trainer_snapshot)
+            rebound = None if warm else self._try_rebind_plan(trainer_snapshot)
             layout = (
                 self._resolve_layout(manifests, capture_layout, metrics, trainer_snapshot)
-                if self._debug_validate_layout and not warm else None
+                if self._debug_validate_layout and not warm and rebound is None else None
             )
             reusable = (
                 previous is not None
@@ -983,7 +1231,13 @@ class _NixlStagedTransfer:
             metrics.update(
                 plan_cache_hits=int(reusable), plan_cache_misses=int(not reusable)
             )
-            if reusable:
+            if rebound is not None:
+                trainer = rebound.trainer_source_snapshot
+                capture = rebound.generator_capture_snapshot
+                parameter_layout = rebound.parameter_layout
+                plan = rebound.transfer_plan
+                metrics.update(plan_cache_hits=1, plan_cache_misses=0, replica_rebindings=1)
+            elif reusable:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.generator_capture_snapshot
                 parameter_layout = previous.parameter_layout
@@ -1036,12 +1290,12 @@ class _NixlStagedTransfer:
                 metrics["transfer_planning_s"] = time.perf_counter() - started
             resolved = trainer.resolved_metadata
             required_metadata = _required_agent_metadata(plan, resolved)
-            cached = previous if warm else _WeightUpdatePlan(
+            cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, plan
-            )
+            ))
             transport = self._connect_sources(resolved, required_metadata)
             self._ensure_workspace(plan, parameter_layout)
-            if not reusable or self._full_copy_descriptors is None:
+            if rebound is not None or not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
             prepared = _PreparedNixlTransfer(
                 transfer_plan=plan,
@@ -1058,6 +1312,7 @@ class _NixlStagedTransfer:
             )
             self._publish_prepared(cached, prepared)
             return prepared
+
 
     def prepare_streaming(
         self,
@@ -1082,8 +1337,15 @@ class _NixlStagedTransfer:
                 and isinstance(previous.transfer_plan, _StreamingSchedule)
                 and self._can_reuse_plan(trainer_snapshot)
             )
+            rebound = None if warm else self._try_rebind_plan(trainer_snapshot)
             started = time.perf_counter()
-            if warm:
+            if rebound is not None:
+                trainer = rebound.trainer_source_snapshot
+                capture = rebound.generator_capture_snapshot
+                parameter_layout = rebound.parameter_layout
+                compiled = rebound.transfer_plan
+                metrics.update(plan_cache_enabled=1, plan_cache_hits=1, plan_cache_misses=0, replica_rebindings=1)
+            elif warm:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.generator_capture_snapshot
                 parameter_layout = previous.parameter_layout
@@ -1112,9 +1374,9 @@ class _NixlStagedTransfer:
                 required_metadata.update(
                     _required_agent_metadata(batch.transfer_plan, resolved)
                 )
-            cached = previous if warm else _WeightUpdatePlan(
+            cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, compiled
-            )
+            ))
             transport = self._connect_sources(
                 resolved, required_metadata, host_staging=staging_device == "cpu"
             )
@@ -1135,6 +1397,7 @@ class _NixlStagedTransfer:
             self._publish_prepared(cached, prepared)
             self._descriptor_cache = descriptors
             return prepared
+
 
     def _prepare_arenas(
         self,

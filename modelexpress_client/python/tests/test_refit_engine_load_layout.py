@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+import ctypes
+import hashlib
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -164,3 +167,63 @@ def test_incomplete_initial_capture_can_be_retried(capture_installer) -> None:
     model.load_weights = loader
     capture, layout = installer.capture([("weight", torch.float32, (4, 4))])
     assert capture.copies and layout == {"weight": ((2, 2), torch.float32)}
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_fixed_engine_owner_transfers_alternate_replicas_without_recapture(
+    capture_installer, monkeypatch, quantized
+) -> None:
+    from modelexpress.refit.reshard.rendezvous import PublishedShard, PublishedTensor, wrap_rendezvous_blob
+    from modelexpress_rl.inference import nixl_staged_transfer as transfer_module
+    from modelexpress_rl.inference.adapter import TrainerSourceShard
+    from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+
+    installer, model = capture_installer
+    installer._vllm_config = SimpleNamespace(quant_config=object() if quantized else None)
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    manager = MagicMock()
+    manager.add_remote_agent.return_value = "source"
+
+    class Transport:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def post_reads(self, descriptors) -> list:
+            for descriptor in descriptors:
+                ctypes.memmove(descriptor.dst_addr, descriptor.src_addr, descriptor.nbytes)
+            return []
+
+        def await_reads(self, posted) -> None:
+            pass
+
+    monkeypatch.setattr(transfer_module, "NixlReshardTransport", Transport)
+    transfer = transfer_module._NixlStagedTransfer(
+        manager=manager, device_id=0, device=torch.device("cpu")
+    )
+    replicas = {"A": torch.arange(9, dtype=torch.float32).reshape(3, 3)}
+    replicas["B"] = replicas["A"].clone() + 100
+    try:
+        for index, worker in enumerate(("A", "B", "A")):
+            value = replicas[worker]
+            blob = wrap_rendezvous_blob(b"source", "source", "source:19000", [
+                PublishedTensor("weight", "torch.float32", 4, (3, 3), [
+                    PublishedShard("source", 0, value.data_ptr(), (0, 0), (3, 3))
+                ])
+            ])
+            shard = TrainerSourceShard("slot", worker, hashlib.sha256(blob).hexdigest(), "source:19000", blob)
+            prepared = transfer.prepare_full_copy(
+                trainer_snapshot=TrainerSourceSnapshot("mesh", 1, (shard,)),
+                manifests=[blob], capture_layout=installer.capture,
+            )
+            assert torch.equal(transfer.stage(prepared).tensors["weight"], value[:2, :2])
+            if index:
+                assert prepared.metrics.get("initial_whole_plan_s", 0) == 0
+            else:
+                def unavailable(weights) -> None:
+                    raise AssertionError("engine capture is no longer available")
+
+                model.load_weights = unavailable
+    finally:
+        transfer.close()

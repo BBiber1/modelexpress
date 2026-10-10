@@ -687,9 +687,15 @@ independent copy before installation.
 Trainer plan reuse checks the current mesh and lists publications for the
 requested version under its lease. A matching selected worker, slot, endpoint,
 and stable metadata digest reuse the validated plan without fetching or parsing
-stable metadata or rebinding the fixed engine load layout. Missing or changed
-publications use normal replica discovery from the same listing. Mesh identity
-alone cannot prove that a selected replica published the requested version.
+stable metadata or rebinding the fixed engine load layout. Missing selected
+publications use normal replica discovery from the same listing. A first-seen
+compatible replica extends per-slot physical bindings without repeating logical
+planning. Returning to a learned replica reuses its validated metadata. Reads
+retain their original owning slot, source tensor, shard box and byte offset,
+including replicated or aliased tensors. Known-replica physical metadata drift
+within the same generation rejects the round; a new generation rebuilds the
+physical plan. Mesh identity alone cannot prove that a selected replica published
+the requested version.
 Read handles and content checksums belong to the current version round. Failed
 native preparation and manager reset invalidate the physical plan; the client's
 canonical engine load layout remains available for the next preparation.

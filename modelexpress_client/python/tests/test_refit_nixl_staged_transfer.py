@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import hashlib
 from contextlib import nullcontext
 from dataclasses import replace
 from types import MappingProxyType
@@ -251,7 +252,7 @@ def _manifest(
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "registration", "cleanup", "metadata", "capture", "malformed"]
+    "failure", [None, "registration", "cleanup", "metadata", "metadata_drift", "capture", "malformed"]
 )
 @pytest.mark.parametrize("bounded", [False, True])
 def test_fixed_mode_updates_receive_changed_values(
@@ -432,13 +433,13 @@ def test_fixed_mode_updates_receive_changed_values(
             with pytest.raises(RuntimeError, match="release"):
                 method.prepare(version=None, source=ResolvedTrainerSource(source))
             method.release(prepared)
-            if index == 0 and failure in ("metadata", "capture", "malformed"):
+            if index == 0 and failure in ("metadata", "metadata_drift", "capture", "malformed"):
                 addresses = {
                     name: tensor.data_ptr()
                     for name, tensor in transfer._manager.registered.items()
                 }
                 reads = events.count("read")
-                if failure == "metadata":
+                if failure in ("metadata", "metadata_drift"):
                     payload = unwrap_rendezvous_blob(manifest)
                     changed = wrap_rendezvous_blob(
                         b"changed",
@@ -448,10 +449,11 @@ def test_fixed_mode_updates_receive_changed_values(
                     )
                     bad_source = replace(
                         source,
-                        mesh_generation=2,
-                        shards=(replace(source.shards[0], metadata=changed),),
+                        mesh_generation=1 if failure == "metadata_drift" else 2,
+                        shards=(replace(source.shards[0], metadata=changed,
+                            stable_metadata_digest=hashlib.sha256(changed).hexdigest()),),
                     )
-                    expected = "already connected source"
+                    expected = "within a mesh generation" if failure == "metadata_drift" else "already connected source"
                 elif failure == "capture":
                     payload = unwrap_rendezvous_blob(manifest)
                     renamed = replace(payload.tensors[0], name="renamed")
@@ -464,8 +466,10 @@ def test_fixed_mode_updates_receive_changed_values(
                     bad_source = replace(
                         source,
                         mesh_generation=2,
-                        shards=(replace(source.shards[0], metadata=changed),),
+                        shards=(replace(source.shards[0], metadata=changed,
+                            stable_metadata_digest=hashlib.sha256(changed).hexdigest()),),
                     )
+
                     capture_layout = method._capture_layout
 
                     def fail_capture(_manifest) -> tuple:
@@ -476,6 +480,7 @@ def test_fixed_mode_updates_receive_changed_values(
                 else:
                     bad_source = replace(
                         source,
+                        mesh_generation=2,
                         shards=(replace(source.shards[0], metadata=b"malformed"),),
                     )
                 try:
@@ -495,7 +500,7 @@ def test_fixed_mode_updates_receive_changed_values(
                 } == addresses
                 assert events.count("read") == reads
                 assert "shutdown" not in events
-            if index != 0 or failure not in ("metadata", "capture", "malformed"):
+            if index != 0 or failure not in ("metadata", "metadata_drift", "capture", "malformed"):
                 source = method.cached_trainer_source()
                 assert source is not None
         assert events.count("register") == (2 if failure == "registration" else 1)
@@ -1265,14 +1270,18 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         if not budget_fits:
             with pytest.raises(IncompleteRefit, match="255"):
                 transfer.prepare_streaming(
-                    trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+                    trainer_snapshot=TrainerSourceSnapshot("mesh", 1, (
+                        TrainerSourceShard("slot", "worker", hashlib.sha256(manifest).hexdigest(), "source:19000", manifest),
+                    )),
                     manifests=[manifest],
                     capture_layout=lambda m: (capture, layout),
                 )
             assert "register_dram" not in events
             return
         prepared = transfer.prepare_streaming(
-            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, (
+                        TrainerSourceShard("slot", "worker", hashlib.sha256(manifest).hexdigest(), "source:19000", manifest),
+                    )),
             manifests=[manifest],
             capture_layout=lambda m: (capture, layout),
         )

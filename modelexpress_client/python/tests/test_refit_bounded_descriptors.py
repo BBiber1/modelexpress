@@ -168,10 +168,10 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         captures.append(manifest)
         return capture, layout
 
-    def prepare() -> module._PreparedBoundedTransfer:
+    def prepare(*, worker="worker", generation=1) -> module._PreparedBoundedTransfer:
         blobs = manifests()
-        snapshot = TrainerSourceSnapshot("mesh", 1, tuple(
-            TrainerSourceShard("slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob)
+        snapshot = TrainerSourceSnapshot("mesh", generation, tuple(
+            TrainerSourceShard("slot", worker, hashlib.sha256(blob).hexdigest(), "source:19000", blob)
             for blob in blobs
         ))
         cached = transfer.cached_trainer_source()
@@ -266,7 +266,7 @@ def test_changed_source_addresses_rebuild_descriptors(harness) -> None:
     first = harness.prepare()
     harness.collect(first)
     harness.sources["exact"] = harness.sources["exact"].clone() + 5
-    second = harness.prepare()
+    second = harness.prepare(generation=2)
     metrics, _ = harness.collect(second)
     assert metrics["descriptor_cache_hits"] == 0
     assert metrics["descriptor_builds"] == len(second.batches)
@@ -341,7 +341,7 @@ def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure) -> N
             monkeypatch.setattr(harness.transfer._manager, "register_dram_buffer", fail)
         expected = RuntimeError
     with pytest.raises(expected):
-        harness.prepare()
+        harness.prepare(generation=2 if failure == "coverage" else 1)
     assert harness.transfer._descriptor_cache is None
 
 
@@ -453,3 +453,93 @@ def test_prepared_list_indexing_replays_selected_rows_with_fresh_values(
     _, installed = harness.collect(harness.prepare())
     expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
     assert torch.equal(installed["b.weight"], expected)
+
+
+@pytest.mark.parametrize("aliases", [False, True])
+def test_compatible_replicas_extend_plan_and_read_current_bytes(harness, aliases) -> None:
+    if aliases:
+        harness.sources.update({name: harness.sources["exact"] for name in harness.sources})
+    replicas = {"A": dict(harness.sources)}
+    replicas["B"] = {name: tensor.clone() + 100 + index for index, (name, tensor) in enumerate(reversed(tuple(harness.sources.items())))}
+    for index, worker in enumerate(("A", "B", "A")):
+        harness.sources.update(replicas[worker])
+        prepared = harness.prepare(worker=worker)
+        _, installed = harness.collect(prepared)
+        _check_values(harness, installed)
+        if index:
+            assert prepared.metrics.get("initial_whole_plan_s", 0) == 0
+            assert prepared.metrics.get("owner_plan_builds", 0) == 0
+            assert prepared.metrics["replica_rebindings"] == 1
+
+
+def test_known_replica_storage_drift_fails_before_read(harness) -> None:
+    harness.collect(harness.prepare(worker="A"))
+    harness.sources["exact"] = harness.sources["exact"].clone() + 100
+    harness.events.clear()
+    with pytest.raises(RuntimeError, match="within a mesh generation"):
+        harness.prepare(worker="A")
+    assert "post" not in harness.events
+    prepared = harness.prepare(worker="A", generation=2)
+    _, installed = harness.collect(prepared)
+    _check_values(harness, installed)
+
+
+@pytest.mark.parametrize("conflicting_agent", [False, True])
+def test_replica_binding_preserves_original_slot_owner(harness, conflicting_agent) -> None:
+    def shard(slot: str, worker: str, agent: str, values: dict) -> TrainerSourceShard:
+        blob = wrap_rendezvous_blob(
+            agent.encode(), agent, f"{agent}:19000",
+            [PublishedTensor(
+                name=name, dtype="torch.float32", elsize=4, full_shape=(4, 4),
+                shards=[PublishedShard(agent_name=agent, device_id=0, addr=tensor.data_ptr(), shard_offset=(0, 0), shape=(4, 4))],
+            ) for name, tensor in values.items()],
+        )
+        return TrainerSourceShard(slot, worker, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob)
+
+    def prepare(shards: tuple) -> module._PreparedBoundedTransfer:
+        return harness.transfer.prepare_streaming(
+            trainer_snapshot=TrainerSourceSnapshot("owners", 1, shards),
+            manifests=[source.metadata for source in shards],
+            capture_layout=lambda _: (harness.capture, harness.layout),
+        )
+
+    original = dict(harness.sources)
+    ignored = {name: tensor.clone() + 1000 for name, tensor in original.items()}
+    replacement = {name: tensor.clone() + 100 for name, tensor in original.items()}
+    a = shard("first", "A", "agentA", original)
+    z = shard("second", "Z", "agentZ", ignored)
+    _, installed = harness.collect(prepare((a, z)))
+    _check_values(harness, installed)
+    b = shard("first", "B", "agentZ" if conflicting_agent else "agentB", replacement)
+    harness.events.clear()
+    if conflicting_agent:
+        with pytest.raises(ValueError, match="duplicate NIXL agents"):
+            prepare((z, b))
+        assert "post" not in harness.events
+    else:
+        harness.sources.update(replacement)
+        prepared = prepare((z, b))
+        _, installed = harness.collect(prepared)
+        _check_values(harness, installed)
+        assert prepared.metrics.get("owner_plan_builds", 0) == 0
+
+
+def test_failed_replica_setup_rebuilds_before_next_transfer(harness, monkeypatch) -> None:
+    original = dict(harness.sources)
+    harness.collect(harness.prepare(worker="A"))
+    harness.sources.update({name: tensor.clone() + 100 for name, tensor in original.items()})
+    transport = module.NixlReshardTransport
+
+    def fail(*args, **kwargs) -> None:
+        raise RuntimeError("replica connection failed")
+
+    monkeypatch.setattr(module, "NixlReshardTransport", fail)
+    with pytest.raises(RuntimeError, match="replica connection failed"):
+        harness.prepare(worker="B")
+    monkeypatch.setattr(module, "NixlReshardTransport", transport)
+    harness.sources.update(original)
+    prepared = harness.prepare(worker="A")
+    _, installed = harness.collect(prepared)
+    _check_values(harness, installed)
+    assert prepared.metrics["plan_cache_misses"] == 1
+    assert prepared.metrics["initial_whole_plan_s"] > 0

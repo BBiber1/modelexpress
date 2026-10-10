@@ -14,6 +14,7 @@ import pytest
 from modelexpress_rl import WeightPayloadFormat, refit_pb2, refit_pb2_grpc
 from modelexpress_rl.control import WeightVersion, WeightVersionState
 from modelexpress_rl.inference.source import TrainerSourceResolver
+from modelexpress_rl.inference.plan import ResolvedTrainerSource
 from tests.test_refit_generator_client import _RefitService, _STABLE_METADATA
 
 
@@ -71,6 +72,7 @@ def protocol(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
         service = refit_pb2_grpc.RefitServiceStub(channel)
         case = SimpleNamespace(
             control=control, worker=worker, cached_snapshot=None,
+            learned={}, learned_scope=None,
             version=WeightVersion(
                 version_id="version-a", model_name="test/model",
                 payload_format=WeightPayloadFormat.FULL_TENSOR, layout_signature="layout-a",
@@ -81,6 +83,10 @@ def protocol(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
         case.resolver = TrainerSourceResolver(
             service=lambda: service, rpc_timeout_seconds=2,
             cached_source=lambda: case.cached_snapshot,
+            cached_replicas=lambda mesh_id, generation: (
+                tuple(case.learned.values())
+                if case.learned_scope == (mesh_id, generation) else ()
+            ),
         )
         _advertise(case)
         try:
@@ -172,6 +178,21 @@ def test_duplicate_physical_checksum_keys_are_rejected_before_version_fetch(
     assert protocol.worker.version_requests == []
 
 
+def test_duplicate_geometry_with_distinct_addresses_rejects_before_version_fetch(
+    protocol: SimpleNamespace,
+) -> None:
+    payload = json.loads(protocol.worker.blob)
+    shards = payload["tensors"][0]["shards"]
+    duplicate = dict(shards[0])
+    duplicate["addr"] = 8192
+    shards.append(duplicate)
+    payload["total_bytes"] = 16
+    protocol.worker.blob = json.dumps(payload).encode()
+    _advertise(protocol)
+    assert list(protocol.resolver.candidates(protocol.version)) == []
+    assert protocol.worker.version_requests == []
+
+
 def test_coverage_only_metadata_cannot_resolve_physical_reads(protocol: SimpleNamespace) -> None:
     protocol.worker.blob = json.dumps({"tensors": [{
         "name": "weight", "dtype": "torch.bfloat16", "elsize": 2,
@@ -194,13 +215,27 @@ def test_verification_disabled_resolves_without_version_rpc(
     assert protocol.worker.version_requests == []
 
 
-def _next_version(protocol: SimpleNamespace) -> WeightVersion:
-    protocol.worker.metadata.version_id = "version-b"
-    protocol.worker.metadata.checksums[0].digest = "second"
-    protocol.control.shards[0].version_id = "version-b"
-    protocol.control.version.uid = "version-b"
+def _next_version(
+    protocol: SimpleNamespace, version_id: str = "version-b", digest: str = "second",
+) -> WeightVersion:
+    protocol.worker.metadata.version_id = version_id
+    protocol.worker.metadata.checksums[0].digest = digest
+    protocol.control.shards[0].version_id = version_id
+    protocol.control.version.uid = version_id
     _advertise(protocol)
-    return replace(protocol.version, version_id="version-b")
+    return replace(protocol.version, version_id=version_id)
+
+
+def _remember(protocol: SimpleNamespace, resolved: ResolvedTrainerSource) -> None:
+    protocol.cached_snapshot = resolved.snapshot
+    scope = (resolved.snapshot.mesh_id, resolved.snapshot.mesh_generation)
+    if protocol.learned_scope != scope:
+        protocol.learned.clear()
+    protocol.learned_scope = scope
+    protocol.learned.update({
+        (shard.source_slot_id, shard.worker_id): shard
+        for shard in resolved.snapshot.shards
+    })
 
 
 @pytest.mark.parametrize("verify", [False, True])
@@ -209,7 +244,7 @@ def test_new_version_resolves_fresh_checksums_without_refetching_stable_metadata
 ) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
     first, = protocol.resolver.candidates(protocol.version)
-    protocol.cached_snapshot = first.snapshot
+    _remember(protocol, first)
     second, = protocol.resolver.candidates(_next_version(protocol))
     assert first.snapshot == second.snapshot
     assert list(first.checksums.values()) == (["first"] if verify else [])
@@ -226,7 +261,7 @@ def test_cached_selection_missing_worker_uses_current_publication_replica(
     protocol: SimpleNamespace,
 ) -> None:
     first, = protocol.resolver.candidates(protocol.version)
-    protocol.cached_snapshot = first.snapshot
+    _remember(protocol, first)
     protocol.control.shards[0].worker_id = "trainer-replacement"
     protocol.worker.metadata.worker_id = "trainer-replacement"
     payload = json.loads(protocol.worker.blob)
@@ -245,7 +280,7 @@ def test_new_mesh_generation_can_replace_cached_workers_stable_storage(
     protocol: SimpleNamespace,
 ) -> None:
     first, = protocol.resolver.candidates(protocol.version)
-    protocol.cached_snapshot = first.snapshot
+    _remember(protocol, first)
     payload = json.loads(protocol.worker.blob)
     payload["tensors"][0]["shards"][0]["addr"] = 8192
     protocol.worker.blob = json.dumps(payload).encode()
@@ -268,10 +303,77 @@ def test_requested_version_generation_mismatch_rejects_cached_selection(
     protocol: SimpleNamespace,
 ) -> None:
     first, = protocol.resolver.candidates(protocol.version)
-    protocol.cached_snapshot = first.snapshot
+    _remember(protocol, first)
     protocol.control.mesh_generation_on_recheck = 2
     with pytest.raises(RuntimeError, match="generation"):
         next(protocol.resolver.candidates(_next_version(protocol)))
     assert protocol.control.list_calls == 1
     assert len(protocol.worker.stable_requests) == 1
     assert len(protocol.worker.version_requests) == 1
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_learned_replicas_reuse_stable_metadata_across_a_b_a_selection(
+    protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, verify: bool,
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    first, = protocol.resolver.candidates(protocol.version)
+    _remember(protocol, first)
+    original_blob = protocol.worker.blob
+    protocol.control.shards[0].worker_id = "trainer-b"
+    protocol.worker.metadata.worker_id = "trainer-b"
+    payload = json.loads(original_blob)
+    payload["tensors"][0]["shards"][0]["addr"] = 8192
+    protocol.worker.blob = json.dumps(payload).encode()
+    protocol.worker.metadata.stable_metadata_digest = hashlib.sha256(protocol.worker.blob).hexdigest()
+    second, = protocol.resolver.candidates(_next_version(protocol))
+    _remember(protocol, second)
+    protocol.control.shards[0].worker_id = "trainer-0"
+    protocol.worker.metadata.worker_id = "trainer-0"
+    protocol.worker.blob = original_blob
+    protocol.worker.metadata.stable_metadata_digest = hashlib.sha256(original_blob).hexdigest()
+    third, = protocol.resolver.candidates(_next_version(protocol, "version-c", "third"))
+    assert [resolved.snapshot.shards[0].worker_id for resolved in (first, second, third)] == [
+        "trainer-0", "trainer-b", "trainer-0",
+    ]
+    assert third.snapshot.shards[0].metadata == original_blob
+    assert [list(resolved.checksums.values()) for resolved in (first, second, third)] == (
+        [["first"], ["second"], ["third"]] if verify else [[], [], []]
+    )
+    assert len(protocol.worker.stable_requests) == 2
+    assert [request.version_id for request in protocol.worker.version_requests] == (
+        ["version-a", "version-b", "version-c"] if verify else []
+    )
+    assert protocol.control.list_calls == 3
+
+
+@pytest.mark.parametrize("drift", ["digest", "endpoint"])
+@pytest.mark.parametrize("selected", [False, True])
+def test_known_replica_physical_drift_rejects_before_worker_rpc(
+    protocol: SimpleNamespace, drift: str, selected: bool,
+) -> None:
+    first, = protocol.resolver.candidates(protocol.version)
+    _remember(protocol, first)
+    original = refit_pb2.WeightVersionShard()
+    original.CopyFrom(protocol.control.shards[0])
+    protocol.control.shards[0].worker_id = "trainer-b"
+    protocol.worker.metadata.worker_id = "trainer-b"
+    second, = protocol.resolver.candidates(_next_version(protocol))
+    _remember(protocol, second)
+    requested = _next_version(protocol, "version-c", "third")
+    original.version_id = "version-c"
+    if drift == "digest":
+        original.stable_metadata_digest = "changed-known-storage"
+    else:
+        original.metadata_endpoint = "different-worker:19000"
+    if selected:
+        protocol.control.shards = [original]
+    else:
+        protocol.control.shards.append(original)
+    stable_calls = len(protocol.worker.stable_requests)
+    version_calls = len(protocol.worker.version_requests)
+    with pytest.raises(RuntimeError):
+        next(protocol.resolver.candidates(requested))
+    assert len(protocol.worker.stable_requests) == stable_calls
+    assert len(protocol.worker.version_requests) == version_calls
+    assert protocol.control.list_calls == 3

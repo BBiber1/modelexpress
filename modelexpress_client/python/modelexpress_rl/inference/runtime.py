@@ -258,6 +258,14 @@ def _create_resolvers(
                         ),
                         None,
                     ),
+                    cached_replicas=next(
+                        (
+                            method.cached_trainer_replicas
+                            for method in methods
+                            if isinstance(method, LoadTimeTensorNixlUpdateMethod)
+                        ),
+                        None,
+                    ),
                 )
             )
         else:

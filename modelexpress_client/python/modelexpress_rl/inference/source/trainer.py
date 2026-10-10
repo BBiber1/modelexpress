@@ -95,9 +95,11 @@ class TrainerSourceResolver(SourceResolver):
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
         cached_source: Callable[[], TrainerSourceSnapshot | None] | None = None,
+        cached_replicas: Callable[[str, int], tuple[TrainerSourceShard, ...]] | None = None,
     ) -> None:
         self._service = service
         self._cached_source = cached_source
+        self._cached_replicas = cached_replicas
         self._rpc_timeout_seconds = rpc_timeout_seconds
 
 
@@ -171,10 +173,29 @@ class TrainerSourceResolver(SourceResolver):
             published[shard.logical_shard_id].append(shard)
 
         cached = self._cached_source() if self._cached_source is not None else None
+        known = (
+            self._cached_replicas(version.trainer_mesh_id, mesh_generation)
+            if self._cached_replicas is not None else ()
+        )
+        known_by_identity = {
+            (source.source_slot_id, source.worker_id): source for source in known
+        }
+        for publication in response.shards:
+            source = known_by_identity.get((publication.logical_shard_id, publication.worker_id))
+            if source is not None and (
+                publication.metadata_endpoint != source.metadata_endpoint
+                or publication.stable_metadata_digest != source.stable_metadata_digest
+            ):
+                raise RuntimeError("known trainer replica metadata changed within a mesh generation")
         stable_sources = {
             (source.metadata_endpoint, source.stable_metadata_digest): source
-            for source in cached.shards
-        } if cached is not None else {}
+            for source in known
+        }
+        if cached is not None and cached.mesh_generation == mesh_generation:
+            stable_sources.update({
+                (source.metadata_endpoint, source.stable_metadata_digest): source
+                for source in cached.shards
+            })
         round_sources = {}
         failed_sources = set()
         round_checksums = {}
@@ -407,6 +428,7 @@ class TrainerSourceResolver(SourceResolver):
                     for tensor in tensors for item in tensor.shards
                 )
                 or len(set(keys.values())) != len(keys)
+                or len({(key[0], key[3], key[4]) for key in keys.values()}) != len(keys)
             ):
                 raise ValueError("stable metadata counts or physical shard identities are inconsistent")
         except (AttributeError, KeyError, TypeError, ValueError) as error:
