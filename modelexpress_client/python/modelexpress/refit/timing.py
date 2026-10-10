@@ -129,12 +129,6 @@ class RefitTimingRecorder:
             extra = {**(metadata or {}), **discovered}
             if duration_key is not None:
                 extra[duration_key] = elapsed
-            if telemetry.recording() or os.environ.get(
-                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
-            ):
-                for name, value in extra.items():
-                    if isinstance(value, (int, float)) and not name.endswith("_s"):
-                        telemetry.attribute(name, value)
             self.add_duration(
                 stage,
                 elapsed,
@@ -190,6 +184,8 @@ class RefitTimingRecorder:
             item.statuses.append(status)
         if metadata:
             for name, value in metadata.items():
+                if isinstance(value, (int, float)) and not name.endswith("_s"):
+                    telemetry.attribute(name, value)
                 if (
                     accumulate_metadata
                     and isinstance(value, (int, float))

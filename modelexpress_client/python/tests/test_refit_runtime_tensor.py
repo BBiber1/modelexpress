@@ -47,14 +47,14 @@ class _Transfer:
 
     def receive_peer(
         self, *, tensor_read, destination_tensors, on_transfer_start
-    ):
+    ) -> dict:
         assert tensor_read is self.lease
         self.received_leases.append(tensor_read)
         self.receive_tensors = destination_tensors
         if self.fail_before_start:
             raise RuntimeError("peer disappeared before transfer")
         on_transfer_start()
-        return {"bytes_received": 16, "wire_s": 0.25}
+        return {"bytes_received": 16, "wire_host_s": 0.25}
 
     def close(self):
         self.closed = True

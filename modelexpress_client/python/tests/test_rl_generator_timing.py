@@ -31,7 +31,7 @@ from modelexpress_rl.train import WeightPayloadFormat
 STAGED_METRICS = {
     "bytes_received": 4_000_000_000,
     "segments": 12,
-    "wire_s": 1.5,
+    "wire_host_s": 1.5,
     "reconstruct_s": 0.25,
 }
 
@@ -90,7 +90,7 @@ def test_the_payload_size_travels_with_the_timing(monkeypatch):
     assert recorder.as_dict()["bytes"] == 4_000_000_000
 
 
-def test_a_peer_pull_reports_a_wire_time_and_no_reconstruction(monkeypatch):
+def test_a_peer_pull_reports_a_wire_time_and_no_reconstruction(monkeypatch) -> None:
     """Pulling an identical-rank peer's canonical buffers needs no replay, and
     reports no ``reconstruct_s``. The stage has to stay unmeasured rather than
     be recorded as zero, so a mean over cycles is not dragged down by cycles
@@ -99,7 +99,7 @@ def test_a_peer_pull_reports_a_wire_time_and_no_reconstruction(monkeypatch):
     recorder = timing.start_cycle(version_id="run.a1:7", rank=0)
 
     with timing.active(recorder):
-        _attribute_transfer({"bytes_received": 1, "wire_s": 0.5, "peer_s": 0.6})
+        _attribute_transfer({"bytes_received": 1, "wire_host_s": 0.5, "peer_s": 0.6})
 
     assert recorder.has_measurements("wire_transfer")
     assert not recorder.has_measurements("receive_sync")

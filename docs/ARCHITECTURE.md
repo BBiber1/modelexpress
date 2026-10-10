@@ -1897,12 +1897,16 @@ The captured layout is reused when the ordered resolved source names, dtypes and
 global shapes match the previous plan. Current resolved metadata remains the basis
 for physical reads, so changed addresses or mesh generations do not reuse stale
 transport data.
+Compatible replicas extend physical bindings without recompiling the logical
+schedule; fresh version checksums remain round-local.
 Full-copy and bounded preparation share metadata/layout resolution, connection
 and registration, descriptor binding, and publication phases while retaining
 their separate compilation and transfer algorithms. Prepared plans publish only
 after all setup succeeds. Internal batching consumes the fixed validated budget;
-coverage and capacity checks remain at the compilation boundary. Plan reuse is unconditional; debug plan and layout validation are opt-in.
-Descriptor bindings remain lazy at this layer.
+coverage and capacity checks remain at the compilation boundary. Plan reuse is
+unconditional; debug plan and layout validation are opt-in. Workspace descriptors
+and typed arena views bind eagerly and are reused while their registration
+generation remains valid.
 
 The transfer owns cleanup of partial native preparation. Metadata, layout and
 compilation failures leave registered storage and existing connections intact.
@@ -2006,3 +2010,21 @@ broadcast. Operations measured before a parent is discovered retain their
 original start and end times and are emitted after context arrives from that
 broadcast or the version lookup. Telemetry adds no application synchronization
 or ports.
+
+Refit telemetry records `mx.refit.stage_weight`, `mx.refit.apply_weight`, and
+`mx.refit.release_weight` for both transfer modes. Cold preparation exposes
+metadata resolution, fixed-layout binding, physical planning, source connections,
+arena allocation and registration, and descriptor binding. Warm preparation
+reports reuse and current publication counters without repeating cold spans.
+Bounded compilation emits one `mx.refit.bounded_plan_compile` span per rank,
+with aggregate owner planning, validation, cache and batch measurements. It does
+not emit individual owner planning spans. Full-copy preparation retains separate
+`mx.refit.transfer_planning` and `mx.refit.transfer_validation` spans.
+Trainer source discovery emits one completed `mx.refit.source_resolution` span
+per resolution flush when worker metadata RPCs occurred. Counters export once
+through the timing recorder; lazy iterator pauses and consumer work are excluded
+from discovery durations, and no telemetry context remains active across yields.
+Reconstruction spans include the device completion fence. Runtime tensor peer
+publication completes before the apply timing record is emitted. Trainer digest
+staging records its completion fence once before reading checksums, and the
+publication layer skips that already-completed wait.

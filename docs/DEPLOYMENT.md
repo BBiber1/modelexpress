@@ -1498,18 +1498,18 @@ Failed preparation storage is reset before retrying; a reset failure requires an
 engine restart. Once installation starts, failures are not automatically retried.
 Release errors remain visible to callers, but a locally released update no longer
 holds the client's active slot even when lease deletion fails.
-Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
-`reconstruct_s`. `wire_s` measures READ posting through completion observation;
-`wire_wait_s` measures the blocking completion wait. With two arenas, a READ can
-overlap the previous batch's installation, so wire and installation times must
-not be added as disjoint intervals. GPU validation is required for each target
+Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_host_s`, and
+`reconstruct_s`. `wire_host_s` sums host time posting READs and waiting for their completion;
+`wire_wait_s` measures the blocking completion wait. Prefetch overlap and time
+spent installing an earlier batch are excluded from these host measurements.
+Native NIXL spans report request completion separately. GPU validation is required for each target
 model and topology before performance qualification.
 
 Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
 `streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
 `source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
 `connection_registration_s`; the remaining preparation time includes version
-discovery and lease/control operations. Application contains NIXL `wire_s`,
+discovery and lease/control operations. Application contains NIXL `wire_host_s`,
 `reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
 `post_install_sync_s`. In the generic installer, vLLM's post-load processing
 refreshes attention-derived weights within `reload_s`. The ordinary

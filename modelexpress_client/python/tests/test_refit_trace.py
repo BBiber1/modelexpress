@@ -251,3 +251,39 @@ def test_disabled_trace_skips_exports_and_deferred_work(monkeypatch, recording) 
     assert trainer._pending == []
     assert not trainer._role._span
     assert not recording.get_finished_spans()
+
+
+def test_trainer_e2e_span_and_timing_record_use_global_rank(
+    recording, monkeypatch, caplog
+) -> None:
+    from modelexpress_rl.train.runtime import TrainerRuntime
+
+    class Method:
+        def stage(self, **_kwargs) -> object:
+            return object()
+
+        def publish(self, **_kwargs) -> None:
+            pass
+
+    class Runtime(TrainerRuntime):
+        def _full_tensor(self) -> Method:
+            return self.method
+
+    monkeypatch.setenv("RANK", "8")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("MX_REFIT_TIMING", "1")
+    runtime = Runtime(method=Method(), resources=None)
+    runtime._bound_tensors = {"weight": object()}
+
+    with caplog.at_level(logging.INFO, logger="modelexpress_rl.train.runtime"):
+        runtime.publish_bound(version=SimpleNamespace(version_id="v1"))
+
+    span = _by_name(recording)["mx.refit.trainer_refit_e2e"]
+    assert span.attributes["rank"] == 8
+    payloads = [
+        json.loads(record.message.split(" ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("MX_REFIT_TIMING ")
+    ]
+    assert len(payloads) == 1
+    assert payloads[0]["rank"] == 8
