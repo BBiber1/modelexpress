@@ -34,6 +34,7 @@ from modelexpress.nixl_transfer import (
     NixlTransferManager,
 )
 from modelexpress.refit.reshard import throughput
+from modelexpress.refit.timing import refit_span
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
@@ -936,10 +937,10 @@ class _NixlStagedTransfer:
             resolved = self._source_cache.resolve(
                 manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
             )
-            manifest = [
-                (name, source.dtype, tuple(source.global_shape))
-                for name, source in resolved.sources.items()
-            ]
+        manifest = [
+            (name, source.dtype, tuple(source.global_shape))
+            for name, source in resolved.sources.items()
+        ]
         metrics["source_metadata_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         with telemetry.span("mx.refit.layout_capture"):
@@ -982,7 +983,8 @@ class _NixlStagedTransfer:
                 plan = _plan_staged_transfer(capture, resolved.sources)
             metrics["initial_whole_plan_s"] = time.perf_counter() - phase_started
             validation_started = time.perf_counter()
-            self._validate_complete(capture, parameter_layout, plan)
+            with telemetry.span("mx.refit.transfer_validation"):
+                self._validate_complete(capture, parameter_layout, plan)
             metrics["initial_whole_validation_s"] = (
                 time.perf_counter() - validation_started
             )
@@ -993,7 +995,8 @@ class _NixlStagedTransfer:
             if batches is not None
             else "full"
         )
-        required_metadata = _required_agent_metadata(plan, resolved)
+        with telemetry.span("mx.refit.required_agents"):
+            required_metadata = _required_agent_metadata(plan, resolved)
         if batches is not None:
             for batch in batches:
                 required_metadata.update(_required_agent_metadata(batch.plan, resolved))
@@ -1010,7 +1013,8 @@ class _NixlStagedTransfer:
                 "NIXL metadata changed for an already connected source agent: "
                 f"{conflicting[:10]}"
             )
-        _load_agent_metadata(self._manager, changed)
+        with telemetry.span("mx.refit.connection_registration"):
+            _load_agent_metadata(self._manager, changed)
         self._loaded_agent_metadata.update(changed)
         host_staging = batches is not None and staging_device == "cpu"
         transport = NixlReshardTransport(
@@ -1024,28 +1028,33 @@ class _NixlStagedTransfer:
         if batches is not None:
             assert buffer_budget is not None
             arena_bytes = max(b.nbytes for b in batches)
-            if not self._staging_arenas:
-                self._staging_device = torch.device(staging_device)
-                for index in range(staging_buffers):
-                    arena = self._allocate_arena(arena_bytes)
-                    # Keep the buffer referenced before registering it so a
-                    # failed registration still has live storage to deregister
-                    # when the workspace is reset.
-                    self._staging_arenas.append(arena)
-                    if host_staging:
-                        self._staging_registrations.append(
-                            self._manager.register_dram_buffer(arena)
-                        )
-                    else:
-                        self._manager.register_tensors(
-                            {f"__bounded_arena_{index}__": arena}
-                        )
-            elif self._staging_arenas[0].numel() < arena_bytes:
-                raise RuntimeError(
-                    "bounded workspace layout grew; restart the generator engine"
-                )
-            if self._staging_arenas[0].numel() > buffer_budget:
-                raise RuntimeError("existing bounded arena exceeds the requested limit")
+            with telemetry.span("mx.refit.receive_workspace"):
+                if not self._staging_arenas:
+                    self._staging_device = torch.device(staging_device)
+                    for index in range(staging_buffers):
+                        with telemetry.span("mx.refit.arena_allocation"):
+                            arena = self._allocate_arena(arena_bytes)
+                        # Keep the buffer referenced before registering it so a
+                        # failed registration still has live storage to deregister
+                        # when the workspace is reset.
+                        self._staging_arenas.append(arena)
+                        with telemetry.span("mx.refit.arena_registration"):
+                            if host_staging:
+                                self._staging_registrations.append(
+                                    self._manager.register_dram_buffer(arena)
+                                )
+                            else:
+                                self._manager.register_tensors(
+                                    {f"__bounded_arena_{index}__": arena}
+                                )
+                elif self._staging_arenas[0].numel() < arena_bytes:
+                    raise RuntimeError(
+                        "bounded workspace layout grew; restart the generator engine"
+                    )
+                if self._staging_arenas[0].numel() > buffer_budget:
+                    raise RuntimeError(
+                        "existing bounded arena exceeds the requested limit"
+                    )
             metrics["connection_registration_s"] = time.perf_counter() - phase_started
             descriptor_cache = None
             if metrics["plan_cache_enabled"] and all(
@@ -1075,7 +1084,8 @@ class _NixlStagedTransfer:
             self._active = prepared
             self._descriptor_cache = descriptor_cache
             return prepared
-        self._ensure_workspace(plan, parameter_layout)
+        with telemetry.span("mx.refit.receive_workspace"):
+            self._ensure_workspace(plan, parameter_layout)
         descriptors = tuple(self._descriptors(plan))
         used_sources = {
             copy.src_name: resolved.sources[copy.src_name]
@@ -1194,12 +1204,18 @@ class _NixlStagedTransfer:
                 descriptors(index, recv, full, convert),
                 prepared.transport,
             )
-            batch = telemetry._NixlBatch()
-            with batch.posting():
-                started = time.perf_counter()
-                with telemetry.span("mx.refit.wire_post"):
+            batch_span = telemetry._NixlBatch()
+            with batch_span.posting():
+                post_started = time.perf_counter()
+                with telemetry.span("mx.refit.wire_post") as span:
                     posted = prepared.transport.post_reads(list(chunk.descriptors))
-                post_seconds = time.perf_counter() - started
+                    if span.is_recording():
+                        span.set_attribute("descriptor.count", len(chunk.descriptors))
+                        span.set_attribute(
+                            "wire.host_staging",
+                            int(any(t.device.type == "cpu" for t in arenas)),
+                        )
+                post_seconds = time.perf_counter() - post_started
             return chunk, (recv, convert, full), posted, post_seconds, prefetched
 
         pending = None
@@ -1425,12 +1441,23 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL staged transfer is closed")
         if prepared is not self._active:
             raise RuntimeError("NIXL transfer plan is no longer active")
-        batch = telemetry._NixlBatch()
-        with batch.posting():
-            started = time.perf_counter()
-            with telemetry.span("mx.refit.wire_post"):
+        batch_span = telemetry._NixlBatch()
+        with batch_span.posting():
+            post_started = time.perf_counter()
+            with telemetry.span("mx.refit.wire_post") as span:
                 posted = prepared.transport.post_reads(list(prepared.descriptors))
-            post_seconds = time.perf_counter() - started
+                if span.is_recording():
+                    span.set_attribute("descriptor.count", len(prepared.descriptors))
+                    span.set_attribute(
+                        "wire.host_staging",
+                        int(
+                            any(
+                                t.device.type == "cpu"
+                                for t in self._recv_buffers.values()
+                            )
+                        ),
+                    )
+            post_seconds = time.perf_counter() - post_started
         return self._complete_stage(prepared, posted, post_seconds)
 
     @torch.no_grad()
@@ -1444,8 +1471,10 @@ class _NixlStagedTransfer:
     ) -> _StagedNixlWeights:
         """Wait for posted READs, then reconstruct, convert, and verify."""
         wait_started = time.perf_counter()
-        with telemetry.span("mx.refit.wire_wait"):
+        with telemetry.span("mx.refit.wire_wait") as span:
             prepared.transport.await_reads(posted)
+            if span.is_recording():
+                span.set_attribute("wire.wait_s", time.perf_counter() - wait_started)
         wire_wait_seconds = time.perf_counter() - wait_started
         wire_seconds = post_seconds + wire_wait_seconds
 
@@ -1480,7 +1509,8 @@ class _NixlStagedTransfer:
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
-            self._verify(prepared)
+            with refit_span("receive_sync", duration_key="digest_verification_s"):
+                self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
         # This is the path the FSDP trainer refits over, and the path the 20x
@@ -1615,12 +1645,11 @@ class _NixlStagedTransfer:
         remote_agent_name: str | None = None
         started = time.perf_counter()
         manifest = tensor_read.manifest
-        with telemetry.span("mx.refit.peer_metadata"):
-            source_tensors = self._validate_peer_manifest(
-                manifest,
-                destination_tensors,
-            )
-            host, port, remote_agent_name = self._peer_endpoint(manifest)
+        source_tensors = self._validate_peer_manifest(
+            manifest,
+            destination_tensors,
+        )
+        host, port, remote_agent_name = self._peer_endpoint(manifest)
         try:
             self._manager.fetch_remote_and_wait(
                 remote_agent_name=remote_agent_name,
@@ -1628,19 +1657,17 @@ class _NixlStagedTransfer:
                 port=port,
                 timeout_seconds=self._timeout,
             )
-            with telemetry._NixlBatch().posting():
-                with telemetry.span("mx.refit.direct_peer_read"):
-                    bytes_received, tensor_count, wire_seconds = (
-                        self._manager.receive_from_source(
-                            source_metadata=b"",
-                            source_tensors=source_tensors,
-                            timeout_seconds=self._timeout,
-                            remote_agent_name=remote_agent_name,
-                            require_exact_match=True,
-                            destination_tensors=destination_tensors,
-                            on_transfer_start=on_transfer_start,
-                        )
-                    )
+            bytes_received, tensor_count, wire_seconds = (
+                self._manager.receive_from_source(
+                    source_metadata=b"",
+                    source_tensors=source_tensors,
+                    timeout_seconds=self._timeout,
+                    remote_agent_name=remote_agent_name,
+                    require_exact_match=True,
+                    destination_tensors=destination_tensors,
+                    on_transfer_start=on_transfer_start,
+                )
+            )
         finally:
             if remote_agent_name is not None:
                 self._manager.remove_remote_agent(remote_agent_name)
@@ -1654,7 +1681,6 @@ class _NixlStagedTransfer:
         return {
             "bytes_received": bytes_received,
             "segments": tensor_count,
-            "wire_host_s": round(wire_seconds, 6),
             "peer_s": round(time.perf_counter() - started, 6),
         }
 
