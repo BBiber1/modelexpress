@@ -17,7 +17,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -70,6 +70,7 @@ from modelexpress_rl.inference._source_snapshot import (
     _SourceSnapshot,
 )
 
+from ..shard_metadata import ShardChecksumKey
 from .plan import StreamingSettings
 
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
@@ -127,6 +128,7 @@ class _PreparedNixlTransfer:
     descriptors: tuple[ReadDescriptor | _BoundedReadDescriptor, ...]
     transport: NixlReshardTransport
     metrics: dict[str, float] = field(default_factory=dict)
+    checksums: Mapping[ShardChecksumKey, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ class _PreparedBoundedTransfer:
     sources: dict
     transport: NixlReshardTransport
     metrics: dict[str, float] = field(default_factory=dict)
+    checksums: Mapping[ShardChecksumKey, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1032,7 @@ class _NixlStagedTransfer:
         manifests: list[bytes],
         capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot,
+        checksums: Mapping[ShardChecksumKey, str] | None = None,
     ) -> _PreparedNixlTransfer:
         """Create a version-scoped transfer over one reusable full-copy plan."""
         if self._streaming is not None:
@@ -1100,6 +1104,7 @@ class _NixlStagedTransfer:
                 descriptors=self._full_copy_descriptors,
                 transport=transport,
                 metrics=metrics,
+                checksums=checksums if checksums is not None else MappingProxyType({}),
             )
             cached = _WeightUpdatePlan(
                 trainer,
@@ -1118,6 +1123,7 @@ class _NixlStagedTransfer:
         manifests: list[bytes],
         capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot,
+        checksums: Mapping[ShardChecksumKey, str] | None = None,
     ) -> _PreparedBoundedTransfer:
         """Create fresh deferred reads over one reusable bounded pull plan."""
         streaming = self._streaming
@@ -1176,7 +1182,8 @@ class _NixlStagedTransfer:
                 enabled=bool(metrics["plan_cache_enabled"]),
             )
             prepared = _PreparedBoundedTransfer(
-                compiled.batches, resolved.sources, transport, metrics
+                compiled.batches, resolved.sources, transport, metrics,
+                checksums if checksums is not None else MappingProxyType({}),
             )
             key = compiler._entry[0] if compiler._entry is not None else None
             cached = _WeightUpdatePlan(
@@ -1354,6 +1361,7 @@ class _NixlStagedTransfer:
                 sources,
                 descriptors(index, recv, full, convert),
                 prepared.transport,
+                checksums=prepared.checksums,
             )
             started = time.perf_counter()
             posted = prepared.transport.post_reads(list(chunk.descriptors))
@@ -1805,7 +1813,13 @@ class _NixlStagedTransfer:
         for name, source in prepared.sources.items():
             tensor = self._verification_tensor(prepared, name)
             for shard in source.shards:
-                if not shard.digest:
+                expected = prepared.checksums.get(
+                    (
+                        name, shard.session, shard.addr,
+                        tuple(shard.shard_offset), tuple(shard.shape),
+                    )
+                )
+                if not expected:
                     raise RuntimeError(
                         f"source {name!r} did not publish a verification digest"
                     )
@@ -1817,7 +1831,7 @@ class _NixlStagedTransfer:
                         shard.shape,
                     )
                 )
-                if actual != shard.digest:
+                if actual != expected:
                     raise RuntimeError(
                         f"staged weight digest mismatch for source {name!r} "
                         f"at offset {tuple(shard.shard_offset)}"

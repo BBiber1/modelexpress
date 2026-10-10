@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from modelexpress import p2p_pb2
 
 from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
+from ..shard_metadata import ShardChecksumKey
 from ..train import WeightPayloadFormat
 from .adapter import TrainerSourceShard
 
@@ -124,8 +126,21 @@ class ObjectStorageUpdateSource:
     kind = WeightSource.OBJECT_STORAGE
 
 
+@dataclass(frozen=True)
+class ResolvedTrainerSource:
+    """A stable trainer selection and checksums owned by this leased round."""
+
+    snapshot: TrainerSourceSnapshot
+    checksums: Mapping[ShardChecksumKey, str] = field(default_factory=dict)
+    kind = WeightSource.TRAINER
+    payload_format = WeightPayloadFormat.FULL_TENSOR
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checksums", MappingProxyType(dict(self.checksums)))
+
+
 ResolvedSource = (
-    GeneratorPeerUpdateSource | TrainerSourceSnapshot | ObjectStorageUpdateSource
+    GeneratorPeerUpdateSource | ResolvedTrainerSource | ObjectStorageUpdateSource
 )
 
 
@@ -438,6 +453,7 @@ __all__ = [
     "ResolvedSource",
     "StagedEngineTensors",
     "TrainerSourceSnapshot",
+    "ResolvedTrainerSource",
     "UpdateMethod",
     "WeightSource",
     "SourceResolver",

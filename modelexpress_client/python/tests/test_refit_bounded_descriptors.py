@@ -6,7 +6,7 @@ import gc
 import weakref
 from collections.abc import Iterator
 from dataclasses import replace
-from types import SimpleNamespace
+from types import SimpleNamespace, MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as module
 from modelexpress_rl.inference.plan import StreamingSettings
@@ -149,9 +149,6 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
                                 addr=tensor.data_ptr(),
                                 shard_offset=(0, 0),
                                 shape=(4, 4),
-                                digest=tensor_digest(tensor)
-                                if envs.MX_RESHARD_PUBLISH_DIGEST
-                                else None,
                             )
                         ],
                     )
@@ -169,6 +166,10 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
             manifests=manifests(),
             capture_layout=capture_layout,
+            checksums=MappingProxyType({
+                (name, "source", tensor.data_ptr(), (0, 0), (4, 4)): tensor_digest(tensor)
+                for name, tensor in sources.items()
+            }) if envs.MX_RESHARD_PUBLISH_DIGEST else None,
         )
 
     def collect(prepared):

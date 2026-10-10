@@ -789,7 +789,7 @@ impl RefitBackend for RedisRefitBackend {
             .arg(i32::from(WeightVersionState::Ready))
             .arg(&shard.worker_id)
             .arg(i32::from(WorkerRole::Trainer))
-            .arg(&shard.manifest_endpoint)
+            .arg(&shard.metadata_endpoint)
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -877,7 +877,7 @@ impl RefitBackend for RedisRefitBackend {
             shards.retain(|shard| {
                 mesh.workers.get(&shard.worker_id).is_some_and(|metadata| {
                     metadata.logical_shard_id == shard.logical_shard_id
-                        && metadata.metadata_endpoint == shard.manifest_endpoint
+                        && metadata.metadata_endpoint == shard.metadata_endpoint
                 })
             });
             if !shards.is_empty() {

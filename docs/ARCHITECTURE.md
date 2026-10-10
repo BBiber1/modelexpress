@@ -527,7 +527,7 @@ flowchart LR
         TA["Explicit engine context<br/>Megatron or FSDP"]
         PM["Publication method<br/>full tensor NIXL or canonical checkpoint"]
         B["Registered source buffers"]
-        M["RefitWorkerService<br/>manifest endpoint"]
+        M["RefitWorkerService<br/>metadata endpoint"]
         C["Canonical HF gather<br/>XOR staging"]
     end
 
@@ -562,26 +562,25 @@ flowchart LR
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
-The manifest is an opaque description of the exact published source buffers;
-the generator uses it to compile and validate its receiver-local transfer plan.
-Trainers serve canonical, address-independent coverage after `bind_tensors()`.
-`GetWeightVersionShardManifest` with an empty version ID retrieves this binding
-by logical shard ID. Mesh creation resolves idempotent retries before contacting trainers and validates
-every binding only for a new mesh; mesh updates validate
-new workers and changed endpoints or logical shards. Unchanged members are not
-refetched. Shard publication retains atomic registration, membership, endpoint,
-and conflict checks in Redis without fetching or parsing a trainer manifest.
-Per-version tensor counts and coverage are trusted at publication; generators
-still verify versioned manifest digests and validate transfer coverage.
-Full-tensor trainers reuse manifest bytes while registrations, addresses, and
-tensor geometry remain stable and content digests are disabled. Generators
-cache each selected worker manifest by endpoint and digest. A changed endpoint,
-registration metadata,
-address, dtype, shape, or sharding changes the structural fingerprint and
-rebuilds the transfer plan. Content-only digest changes refresh verification
-metadata without rebuilding that plan. Releasing a trainer shard evicts its
-worker-local version entry only after the central service accepts the deletion;
+For NIXL, `RefitWorkerService` exposes stable trainer metadata separately from
+version checksums. `GetTrainerShardMetadata` takes a content digest and returns
+immutable bytes: address-independent coverage is available after `bind_tensors()`,
+and physical metadata is available once buffers and NIXL registrations are initialized.
+Physical metadata contains tensor geometry, addresses, registrations, and cached tensor
+counts and byte totals; it contains neither publisher steps nor content checksums.
+Mesh creation resolves idempotent retries before contacting trainers and validates
+every binding only for a new mesh. Mesh updates validate new workers and changed
+endpoints or logical shards; unchanged members are not refetched.
+
+`GetWeightVersionShardMetadata` takes a version ID and logical shard ID. Its typed
+response binds the version, worker, and logical shard to the stable metadata digest,
+with ordered per-tensor shard checksums. Publications carry both metadata digests
+and the trainer endpoint. Generators validate the identities, hashes, and checksum
+coverage before reading tensor bytes, and keep fresh version checksums separate from
+cached source geometry and transfer plans. With checksum verification disabled,
+trainers publish no version checksum record and generators make no version metadata RPC.
+Stable metadata remains available for the worker process lifetime. Releasing a trainer
+shard removes its optional version checksum record only after central deletion succeeds;
 the service rejects deletion while a version lease is active.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
@@ -716,15 +715,15 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker metadata reference for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
 | `DeleteVersionLease` | `DeleteVersionLeaseRequest` | `DeleteVersionLeaseResponse` | Release a generator's protection of the version shards |
 
-`RefitWorkerService.GetWeightVersionShardManifest` is also unary and returns
-`GetWeightVersionShardManifestResponse`; tensor bytes remain on the advertised
-data-plane transport.
+`RefitWorkerService.GetTrainerShardMetadata` and
+`RefitWorkerService.GetWeightVersionShardMetadata` are unary metadata RPCs; tensor
+bytes remain on the advertised data-plane transport.
 
 The final missing NIXL source slot atomically changes the version to `READY`.
 For S3, the orchestrator marks the version `READY` after publication completes.
@@ -886,7 +885,7 @@ index's `metadata.version` and `metadata.base_version` are optional descriptive
 fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
 MX lineage checks and payload validation remain enabled. The registering caller
 is responsible for selecting the correct S3 artifacts and base mapping.
-`WeightVersionShard` remains the name of the per-worker manifest publication.
+`WeightVersionShard` identifies a per-worker version publication.
 Its identity is `(version_id, worker_id, logical_shard_id)`: `logical_shard_id`
 identifies the logical shard covered by the publication, and
 `worker_id` identifies the publishing process. The trainer engine adapter
@@ -895,7 +894,9 @@ the logical tensor names and shard geometry, excluding physical process and DP
 replica identity. The orchestrator deduplicates those adapter-defined logical shards when
 declaring the version's expected contributions. Multiple DP workers may therefore
 advertise the same logical shard; generators rotate through those publications on
-transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
+transfer retry. Each shard carries `metadata_endpoint`, `stable_metadata_digest`, and an optional
+`version_metadata_digest`. Tensor counts and byte totals live in stable metadata,
+where they are computed once when the physical metadata is initialized.
 Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 

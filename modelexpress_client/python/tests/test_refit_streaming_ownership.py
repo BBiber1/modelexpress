@@ -12,6 +12,7 @@ from modelexpress_rl.inference.adapter import (
 from modelexpress_rl.inference.plan import (
     PreparedStreamingTensors,
     TrainerSourceSnapshot,
+    ResolvedTrainerSource,
     StreamingSettings,
 )
 from modelexpress_rl.train import WeightPayloadFormat
@@ -62,10 +63,9 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
             TrainerSourceShard(
                 source_slot_id="slot",
                 worker_id="trainer",
-                manifest_digest="digest",
-                manifest_endpoint="trainer:19000",
-                manifest=b"manifest",
-                structural_digest="structure",
+                stable_metadata_digest="digest",
+                metadata_endpoint="trainer:19000",
+                metadata=b"metadata",
             ),
         ),
     )
@@ -75,7 +75,7 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
 def prepare(method, source) -> PreparedStreamingTensors:
     return method.prepare_streaming(
         version=SimpleNamespace(version_id="v:1"),
-        source=source,
+        source=ResolvedTrainerSource(source),
     )
 
 

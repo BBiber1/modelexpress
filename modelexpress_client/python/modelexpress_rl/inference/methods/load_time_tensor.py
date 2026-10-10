@@ -26,7 +26,7 @@ from ..plan import (
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
-    TrainerSourceSnapshot,
+    ResolvedTrainerSource,
     UpdateMethod,
     WeightSource,
 )
@@ -57,13 +57,14 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release staged weight before staging another version")
-        if not isinstance(source, TrainerSourceSnapshot):
+        if not isinstance(source, ResolvedTrainerSource):
             raise TypeError("load-time tensor method requires a trainer source")
-        manifests = [item.manifest for item in source.shards]
+        manifests = [item.metadata for item in source.snapshot.shards]
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare_full_copy(
                 manifests=manifests,
-                trainer_snapshot=source,
+                trainer_snapshot=source.snapshot,
+                checksums=source.checksums,
                 capture_layout=self._capture_layout,
             )
             counters.update(prepared.metrics)
@@ -81,11 +82,12 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         """Prepare trainer metadata without transferring a full weight copy."""
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release the active update before preparing another")
-        if not isinstance(source, TrainerSourceSnapshot):
+        if not isinstance(source, ResolvedTrainerSource):
             raise ValueError("bounded staging requires NIXL trainer sources")
         prepared = self._transfer.prepare_streaming(
-            manifests=[item.manifest for item in source.shards],
-            trainer_snapshot=source,
+            manifests=[item.metadata for item in source.snapshot.shards],
+            trainer_snapshot=source.snapshot,
+            checksums=source.checksums,
             capture_layout=self._capture_layout,
         )
         metrics = dict(prepared.metrics)

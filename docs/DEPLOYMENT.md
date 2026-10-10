@@ -1065,8 +1065,16 @@ server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
 
 RL refit has the same trusted-network requirement. Its trainer-local
-`RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
-manifest digest detects corruption but does not authenticate the trainer.
+`RefitWorkerService` serves stable trainer metadata and separate version checksum
+records over plaintext gRPC. Metadata digests detect corruption but do not
+authenticate the trainer.
+
+The split worker metadata protocol requires a coordinated upgrade of the MX server,
+trainers, and generators. It replaces `GetWeightVersionShardManifest` and retires the
+old `WeightVersionShard` manifest, endpoint, and count fields; mixed protocol versions
+are unsupported. Retire active refit rounds and their leases before stopping workers.
+Restart workers and remove obsolete refit metadata during the upgrade, preserving
+unrelated Redis and model-cache state.
 
 Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.

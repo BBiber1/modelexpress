@@ -21,9 +21,10 @@ from modelexpress_rl.train.adapter import (
     TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
-    WeightVersionShardManifest,
+    TrainerShardMetadata,
 )
 from modelexpress_rl.train.manifest import bound_tensor_manifest
+from modelexpress_rl.shard_metadata import stable_metadata_blob
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 from .publisher import build_megatron_reshard_manifest
@@ -45,7 +46,7 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
         self._logical_shard_id: str | None = None
         self._bound_manifest: bytes | None = None
         self._registered_addrs: dict[str, int] | None = None
-        self._manifest: WeightVersionShardManifest | None = None
+        self._metadata: TrainerShardMetadata | None = None
 
     @property
     def logical_shard_id(self) -> str:
@@ -128,7 +129,11 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 "Megatron source storage changed after NIXL registration; "
                 "IN_PLACE requires stable tensor addresses"
             )
-        cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
+        cache_hit = self._metadata is not None
+        published = (
+            build_hf_aliases(tensors, agent_name=str(self._manager.agent_name))
+            if not cache_hit or mx_envs.MX_RESHARD_PUBLISH_DIGEST else []
+        )
         if not cache_hit:
             with refit_span(
                 "source_preparation",
@@ -136,10 +141,6 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 accumulate_metadata=True,
                 duration_key="manifest_generation_s",
             ):
-                published = build_hf_aliases(
-                    tensors,
-                    agent_name=str(self._manager.agent_name),
-                )
                 manifest = build_megatron_reshard_manifest(
                     manager=self._manager,
                     published=published,
@@ -150,30 +151,38 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 for tensor in manifest.tensors
                 for shard in tensor.shards
             )
-            self._manifest = WeightVersionShardManifest(
-                data=manifest.blob,
+            self._metadata = TrainerShardMetadata(
+                data=stable_metadata_blob(manifest.blob, len(manifest.tensors), total_bytes),
                 tensor_count=len(manifest.tensors),
                 total_bytes=total_bytes,
                 transport="NIXL",
             )
-        assert self._manifest is not None
+        assert self._metadata is not None
         add_refit_metadata(
             "source_preparation",
             {
-                "manifest_bytes": len(self._manifest.data),
+                "manifest_bytes": len(self._metadata.data),
                 "manifest_cache_hit": cache_hit,
-                "manifest_tensor_count": self._manifest.tensor_count,
+                "manifest_tensor_count": self._metadata.tensor_count,
             },
         )
 
         return StagedWeightVersionShardData(
-            manifest=self._manifest,
+            metadata=self._metadata,
             # IN_PLACE performs no asynchronous copy, so the shard is ready to
             # publish as soon as its manifest has been built.
             publish_ready=CompletionFence(lambda: None),
             # IN_PLACE borrows these live tensor objects until the version is
             # retired; retaining them here makes that ownership explicit.
             buffer_owner=tuple(tensors),
+            checksums=(
+                tuple(
+                    (tensor.name, index, shard.digest)
+                    for tensor in published
+                    for index, shard in enumerate(tensor.shards)
+                )
+                if mx_envs.MX_RESHARD_PUBLISH_DIGEST else ()
+            ),
         )
 
 

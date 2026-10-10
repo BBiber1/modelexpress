@@ -4,19 +4,29 @@
 """Trainer-memory source resolution."""
 
 import hashlib
+import json
 import logging
+import math
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import grpc
-from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
+from modelexpress import envs
+from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
+from ...shard_metadata import ShardChecksumKey, version_metadata_digest
 from ...train import WeightPayloadFormat
 from ..adapter import TrainerSourceShard
-from ..plan import ResolvedSource, SourceResolver, TrainerSourceSnapshot, WeightSource
+from ..plan import (
+    ResolvedSource,
+    ResolvedTrainerSource,
+    SourceResolver,
+    TrainerSourceSnapshot,
+    WeightSource,
+)
 
 logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 
@@ -77,7 +87,7 @@ class _SlotReplicas:
 
 
 class TrainerSourceResolver(SourceResolver):
-    """Resolve trainer shard manifests without compiling a transfer plan."""
+    """Resolve trainer metadata and round checksums without compiling a plan."""
 
     def __init__(
         self,
@@ -87,7 +97,9 @@ class TrainerSourceResolver(SourceResolver):
     ) -> None:
         self._service = service
         self._rpc_timeout_seconds = rpc_timeout_seconds
-        self._manifest_cache: dict[tuple[str, str], tuple[str, str, bytes, str]] = {}
+        self._metadata_cache: dict[
+            tuple[str, str], tuple[bytes, dict[tuple[str, int], ShardChecksumKey]]
+        ] = {}
 
     @property
     def kind(self) -> WeightSource:
@@ -151,10 +163,19 @@ class TrainerSourceResolver(SourceResolver):
             return
         published = defaultdict(list)
         for shard in response.shards:
+            if shard.version_id != version.version_id:
+                raise RuntimeError("publication listing returned a different weight version")
             metadata = mesh_workers.get(shard.worker_id)
             if metadata is None or metadata.logical_shard_id != shard.logical_shard_id:
                 continue
             published[shard.logical_shard_id].append(shard)
+
+        round_checksums = {}
+
+        def resolve(shard: refit_pb2.WeightVersionShard) -> TrainerSourceShard:
+            source, checksums = self._resolve_source(shard)
+            round_checksums[(source.source_slot_id, source.worker_id)] = checksums
+            return source
 
         slots = []
         for source_slot_id in expected_slots:
@@ -167,7 +188,7 @@ class TrainerSourceResolver(SourceResolver):
                     source_slot_id,
                 )
                 return
-            slots.append(_SlotReplicas(source_slot_id, ordered, self._resolve_source))
+            slots.append(_SlotReplicas(source_slot_id, ordered, resolve))
 
         seen: set[tuple[tuple[str, str], ...]] = set()
         offset = 0
@@ -203,10 +224,19 @@ class TrainerSourceResolver(SourceResolver):
                 ):
                     raise RuntimeError("trainer mesh generation changed during source resolution")
                 seen.add(selection)
-                yield TrainerSourceSnapshot(
-                    mesh_id=version.trainer_mesh_id,
-                    mesh_generation=mesh_generation,
-                    shards=tuple(selected),
+                yield ResolvedTrainerSource(
+                    snapshot=TrainerSourceSnapshot(
+                        mesh_id=version.trainer_mesh_id,
+                        mesh_generation=mesh_generation,
+                        shards=tuple(selected),
+                    ),
+                    checksums={
+                        key: digest
+                        for source in selected
+                        for key, digest in round_checksums[
+                            (source.source_slot_id, source.worker_id)
+                        ].items()
+                    },
                 )
             deepest = max((slot.usable_count for slot in slots), default=1)
             if all(slot.exhausted for slot in slots) and offset + 1 >= deepest:
@@ -215,110 +245,136 @@ class TrainerSourceResolver(SourceResolver):
 
     def _resolve_source(
         self, shard: refit_pb2.WeightVersionShard
-    ) -> TrainerSourceShard:
-        if not shard.manifest_endpoint:
-            raise RuntimeError("NIXL source is missing its manifest endpoint")
-        if not shard.manifest_digest:
-            raise RuntimeError("source is missing its manifest digest")
-        key = (shard.logical_shard_id, shard.worker_id)
-        cached = self._manifest_cache.get(key)
-        reusable = (
-            cached is not None
-            and cached[0] == shard.manifest_endpoint
-            and cached[1] == shard.manifest_digest
-        )
+    ) -> tuple[TrainerSourceShard, dict[ShardChecksumKey, str]]:
+        if not shard.metadata_endpoint:
+            raise RuntimeError("NIXL source is missing its metadata endpoint")
+        if not shard.stable_metadata_digest:
+            raise RuntimeError("source is missing its stable metadata digest")
+        key = (shard.metadata_endpoint, shard.stable_metadata_digest)
+        cached = self._metadata_cache.get(key)
+        checksums = {}
         with refit_span(
             "source_preparation",
             metadata={
-                "manifest_cache_hits": int(reusable),
-                "manifest_cache_misses": int(not reusable),
+                "manifest_cache_hits": int(cached is not None),
+                "manifest_cache_misses": int(cached is None),
             },
             accumulate_metadata=True,
         ) as counters:
-            if reusable:
-                # These bytes hashed to this digest when they were stored, so
-                # verifying them again would be checking them against
-                # themselves.
-                assert cached is not None
-                manifest = cached[2]
-                structure_digest = cached[3]
-            else:
-                manifest, structure_digest = self._fetch_manifest(shard)
-                self._manifest_cache[key] = (
-                    shard.manifest_endpoint,
-                    shard.manifest_digest,
-                    manifest,
-                    structure_digest,
-                )
-                counters["manifest_fetch_bytes"] = len(manifest)
-                counters["manifest_fetch_count"] = 1
-            counters["manifest_bytes"] = len(manifest)
+            if cached is None or envs.MX_RESHARD_PUBLISH_DIGEST:
+                with grpc.insecure_channel(
+                    shard.metadata_endpoint,
+                    options=[
+                        ("grpc.max_receive_message_length", _MAX_MANIFEST_MESSAGE_SIZE_BYTES)
+                    ],
+                ) as channel:
+                    stub = refit_pb2_grpc.RefitWorkerServiceStub(channel)
+                    if cached is None:
+                        cached = self._fetch_stable_metadata(stub, shard)
+                        self._metadata_cache[key] = cached
+                        counters.update(
+                            manifest_fetch_bytes=len(cached[0]), manifest_fetch_count=1
+                        )
+                    if envs.MX_RESHARD_PUBLISH_DIGEST:
+                        checksums = self._fetch_version_metadata(stub, shard, cached[1])
+                        counters["version_metadata_fetch_count"] = 1
+            blob, _ = cached
+            counters["manifest_bytes"] = len(blob)
         return TrainerSourceShard(
             source_slot_id=shard.logical_shard_id,
             worker_id=shard.worker_id,
-            manifest_digest=shard.manifest_digest,
-            manifest_endpoint=shard.manifest_endpoint,
-            manifest=manifest,
-            structural_digest=structure_digest,
-        )
+            stable_metadata_digest=shard.stable_metadata_digest,
+            metadata_endpoint=shard.metadata_endpoint,
+            metadata=blob,
+        ), checksums
 
-    def _fetch_manifest(
-        self, shard: refit_pb2.WeightVersionShard
-    ) -> tuple[bytes, str]:
-        """Fetch, verify and fingerprint one worker's manifest.
-
-        Three spans on one stage rather than one, because the stage total
-        cannot say whether a slow warm refit is waiting on the wire or on the
-        CPU, and with digests published these manifests are refetched by
-        construction on every version.
-        """
+    def _fetch_stable_metadata(
+        self, stub: refit_pb2_grpc.RefitWorkerServiceStub, shard: refit_pb2.WeightVersionShard
+    ) -> tuple[bytes, dict[tuple[str, int], ShardChecksumKey]]:
         with refit_span(
             "source_preparation",
             accumulate_metadata=True,
             duration_key="manifest_fetch_s",
-        ), grpc.insecure_channel(
-            shard.manifest_endpoint,
-            options=[
-                (
-                    "grpc.max_receive_message_length",
-                    _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
-                )
-            ],
-        ) as channel:
-            response = refit_pb2_grpc.RefitWorkerServiceStub(
-                channel
-            ).GetWeightVersionShardManifest(
-                refit_pb2.GetWeightVersionShardManifestRequest(
-                    version_id=shard.version_id,
-                    logical_shard_id=shard.logical_shard_id,
+        ):
+            response = stub.GetTrainerShardMetadata(
+                refit_pb2.GetTrainerShardMetadataRequest(
+                    metadata_digest=shard.stable_metadata_digest
                 ),
                 timeout=self._rpc_timeout_seconds,
             )
-        with refit_span(
-            "source_preparation",
-            accumulate_metadata=True,
-            duration_key="manifest_hash_s",
-        ):
-            digest = hashlib.sha256(response.manifest).hexdigest()
+        blob = response.metadata
         if (
-            response.manifest_digest != shard.manifest_digest
-            or digest != shard.manifest_digest
+            response.metadata_digest != shard.stable_metadata_digest
+            or hashlib.sha256(blob).hexdigest() != shard.stable_metadata_digest
         ):
-            raise RuntimeError(
-                f"manifest digest mismatch for source slot {shard.logical_shard_id!r}"
-            )
+            raise RuntimeError(f"stable metadata digest mismatch for source slot {shard.logical_shard_id!r}")
         try:
-            with refit_span(
-                "source_preparation",
-                accumulate_metadata=True,
-                duration_key="manifest_fingerprint_s",
+            payload = json.loads(blob)
+            if (
+                "publisher_step" in payload
+                or type(payload["tensor_count"]) is not int
+                or payload["tensor_count"] <= 0
+                or type(payload["total_bytes"]) is not int
+                or payload["total_bytes"] <= 0
+                or any("digest" in item for tensor in payload["tensors"] for item in tensor["shards"])
             ):
-                structure_digest = structural_manifest_digest(response.manifest)
+                raise ValueError("stable metadata contains version state or invalid counts")
+            tensors = unwrap_rendezvous_blob(blob).tensors
+            keys = {
+                (tensor.name, index): (
+                    tensor.name, item.agent_name, item.addr,
+                    tuple(item.shard_offset), tuple(item.shape),
+                )
+                for tensor in tensors for index, item in enumerate(tensor.shards)
+            }
+            if len({tensor.name for tensor in tensors}) != len(tensors):
+                raise ValueError("stable metadata contains duplicate tensor names")
+            if (
+                payload["tensor_count"] != len(tensors)
+                or payload["total_bytes"] != sum(
+                    math.prod(item.shape) * tensor.elsize
+                    for tensor in tensors for item in tensor.shards
+                )
+                or len(set(keys.values())) != len(keys)
+            ):
+                raise ValueError("stable metadata counts or physical shard identities are inconsistent")
         except (AttributeError, KeyError, TypeError, ValueError) as error:
-            raise RuntimeError(
-                f"invalid manifest for source slot {shard.logical_shard_id!r}"
-            ) from error
-        return response.manifest, structure_digest
+            raise RuntimeError(f"invalid stable metadata for source slot {shard.logical_shard_id!r}") from error
+        return blob, keys
+
+    def _fetch_version_metadata(
+        self,
+        stub: refit_pb2_grpc.RefitWorkerServiceStub,
+        shard: refit_pb2.WeightVersionShard,
+        keys: dict[tuple[str, int], ShardChecksumKey],
+    ) -> dict[ShardChecksumKey, str]:
+        if not shard.version_metadata_digest:
+            raise RuntimeError("source did not publish version verification metadata")
+        response = stub.GetWeightVersionShardMetadata(
+            refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id=shard.version_id, logical_shard_id=shard.logical_shard_id
+            ),
+            timeout=self._rpc_timeout_seconds,
+        )
+        metadata = response.metadata
+        try:
+            digest = version_metadata_digest(metadata)
+        except ValueError as error:
+            raise RuntimeError("invalid version checksum metadata") from error
+        if (
+            not response.HasField("metadata")
+            or response.version_metadata_digest != shard.version_metadata_digest
+            or digest != shard.version_metadata_digest
+            or metadata.version_id != shard.version_id
+            or metadata.worker_id != shard.worker_id
+            or metadata.logical_shard_id != shard.logical_shard_id
+            or metadata.stable_metadata_digest != shard.stable_metadata_digest
+        ):
+            raise RuntimeError("version checksum metadata identity or digest mismatch")
+        published = {(row.tensor_name, row.shard_index): row.digest for row in metadata.checksums}
+        if published.keys() != keys.keys() or any(not digest for digest in published.values()):
+            raise RuntimeError("version checksum metadata does not cover the stable source shards")
+        return {keys[key]: digest for key, digest in published.items()}
 
 
 __all__ = ["TrainerSourceResolver"]

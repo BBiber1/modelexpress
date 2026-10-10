@@ -25,9 +25,9 @@ from modelexpress_rl.train.adapter import (
     CompletionFence,
     StagedWeightVersionShardData,
     TrainerEngineAdapter,
-    WeightVersionShardManifest,
+    TrainerShardMetadata,
 )
-from modelexpress_rl.train.manifest import WeightVersionShardManifestService, bound_tensor_manifest
+from modelexpress_rl.train.manifest import RefitWorkerService, bound_tensor_manifest
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -96,12 +96,12 @@ class _Adapter(TrainerEngineAdapter):
             raise ValueError("tensors must not be None")
         return self.logical_shard_id
 
-    def stage_shard(self, *, tensors, staging_mode, payload_format):
+    def stage_shard(self, *, tensors, staging_mode, payload_format) -> StagedWeightVersionShardData:
         self.calls.append((tensors, staging_mode, payload_format))
 
         return StagedWeightVersionShardData(
-            manifest=WeightVersionShardManifest(
-                data=json.dumps({"tensors": [{
+            metadata=TrainerShardMetadata(
+                data=json.dumps({"tensor_count": 2, "total_bytes": 128, "tensors": [{
                     "name": "weight", "dtype": "torch.bfloat16", "elsize": 2,
                     "full_shape": [4], "shards": [{"shard_offset": [0], "shape": [4]}],
                 }]}).encode(),
@@ -111,6 +111,7 @@ class _Adapter(TrainerEngineAdapter):
             ),
             publish_ready=CompletionFence(lambda: None),
             buffer_owner=tensors,
+            checksums=(("weight", 0, "weight-digest"),),
         )
 
 
@@ -159,10 +160,10 @@ def test_trainer_config_preserves_original_positional_field_order():
     assert config.engine_context is None
 
 
-def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
-    shard = refit_pb2.WeightVersionShard(manifest_endpoint="trainer:9000")
+def test_refit_shard_advertises_its_metadata_endpoint() -> None:
+    shard = refit_pb2.WeightVersionShard(metadata_endpoint="trainer:9000")
 
-    assert shard.manifest_endpoint == "trainer:9000"
+    assert shard.metadata_endpoint == "trainer:9000"
     assert (
         refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["object_storage"].number == 10
     )
@@ -182,37 +183,54 @@ def test_refit_service_uses_named_response_messages():
     )
 
 
-def test_released_manifests_do_not_accumulate():
-    service = WeightVersionShardManifestService(endpoint="trainer:9000")
-    manifest = WeightVersionShardManifest(
-        data=b"manifest",
+def test_releasing_version_metadata_preserves_stable_metadata() -> None:
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    port = server.add_insecure_port("127.0.0.1:0")
+    service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(service, server)
+    manifest = TrainerShardMetadata(
+        data=b'{"tensor_count":1,"total_bytes":2}',
         tensor_count=1,
         total_bytes=2,
         transport="NIXL",
     )
+    version_metadata = refit_pb2.WeightVersionShardMetadata(
+        version_id="version-a",
+        worker_id="trainer-0",
+        logical_shard_id="rank:0",
+        stable_metadata_digest=manifest.digest,
+        checksums=[refit_pb2.ShardChecksum(tensor_name="weight", digest="digest")],
+    )
+    service.publish_metadata(
+        version_id="version-a", logical_shard_id="rank:0", metadata=manifest,
+        version_metadata=version_metadata,
+    )
+    server.start()
+    try:
+        with grpc.insecure_channel(service.endpoint) as channel:
+            worker = refit_pb2_grpc.RefitWorkerServiceStub(channel)
+            request = refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id="version-a", logical_shard_id="rank:0",
+            )
+            assert worker.GetWeightVersionShardMetadata(request).metadata == version_metadata
+            service.release_version_metadata(version_id="version-a", logical_shard_id="rank:0")
+            with pytest.raises(grpc.RpcError) as released:
+                worker.GetWeightVersionShardMetadata(request)
+            assert released.value.code() is grpc.StatusCode.NOT_FOUND
+            assert worker.GetTrainerShardMetadata(
+                refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=manifest.digest)
+            ).metadata == manifest.data
+    finally:
+        server.stop(grace=None).wait()
 
-    for index in range(1000):
-        version_id = f"version-{index}"
-        service.publish_manifest(
-            version_id=version_id,
-            logical_shard_id="rank:0",
-            manifest=manifest,
-        )
-        service.release_manifest(
-            version_id=version_id,
-            logical_shard_id="rank:0",
-        )
 
-    assert service._manifests == {}
-
-
-def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
+def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch) -> None:
     service = _RefitService()
     service.mesh_id = "mesh-a"
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
     port = server.add_insecure_port("127.0.0.1:0")
-    manifest_service = WeightVersionShardManifestService(endpoint=f"127.0.0.1:{port}")
+    manifest_service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
     refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
     server.start()
     adapter = _Adapter()
@@ -222,6 +240,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "test/model")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", "COPY_TO_DEVICE")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR")
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     monkeypatch.setenv("MX_WORKER_HOST", "127.0.0.1")
     monkeypatch.setenv("MX_WORKER_GRPC_PORT", str(port))
     _patch_resources(
@@ -258,27 +277,40 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         with grpc.insecure_channel(metadata.metadata_endpoint) as channel:
             binding = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
-            ).GetWeightVersionShardManifest(
-                refit_pb2.GetWeightVersionShardManifestRequest(
-                    logical_shard_id=metadata.logical_shard_id
+            ).GetTrainerShardMetadata(
+                refit_pb2.GetTrainerShardMetadataRequest(
+                    metadata_digest=metadata.logical_shard_id
                 )
             )
-        assert binding.manifest == adapter.bound_manifest
-        assert binding.manifest_digest == metadata.logical_shard_id
+        assert binding.metadata == adapter.bound_manifest
+        assert binding.metadata_digest == metadata.logical_shard_id
         trainer.publish_version(version=WeightVersionRef("version-a"))
         metrics = trainer.pop_metrics()
         assert metrics["trainer_refit_e2e_s"] >= 0
         assert metrics["publication_rpc_s"] >= 0
 
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
-            grpc.insecure_channel(service.shards[0].manifest_endpoint)
+            grpc.insecure_channel(service.shards[0].metadata_endpoint)
         )
-        fetched = worker_stub.GetWeightVersionShardManifest(
-            refit_pb2.GetWeightVersionShardManifestRequest(
-                version_id="version-a",
-                logical_shard_id=metadata.logical_shard_id,
+        fetched = worker_stub.GetTrainerShardMetadata(
+            refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=service.shards[0].stable_metadata_digest,
             )
         )
+        version_metadata = worker_stub.GetWeightVersionShardMetadata(
+            refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id="version-a", logical_shard_id=metadata.logical_shard_id,
+            )
+        )
+        assert version_metadata.metadata.version_id == "version-a"
+        assert version_metadata.metadata.worker_id == "trainer-0"
+        assert version_metadata.metadata.stable_metadata_digest == fetched.metadata_digest
+        assert [(row.tensor_name, row.shard_index, row.digest)
+                for row in version_metadata.metadata.checksums] == [("weight", 0, "weight-digest")]
+        assert version_metadata.version_metadata_digest == service.shards[0].version_metadata_digest
+        assert version_metadata.version_metadata_digest == hashlib.sha256(
+            version_metadata.metadata.SerializeToString(deterministic=True)
+        ).hexdigest()
         with pytest.raises(TypeError, match="tensors"):
             trainer.stage_shard(
                 version=WeightVersionRef("version-a"),
@@ -299,8 +331,8 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         trainer.release_version(version=WeightVersionRef("version-a"))
         assert "version-a" not in method.published
         with pytest.raises(grpc.RpcError) as released:
-            worker_stub.GetWeightVersionShardManifest(
-                refit_pb2.GetWeightVersionShardManifestRequest(
+            worker_stub.GetWeightVersionShardMetadata(
+                refit_pb2.GetWeightVersionShardMetadataRequest(
                     version_id="version-a",
                     logical_shard_id=metadata.logical_shard_id,
                 )
@@ -328,16 +360,15 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert len(service.deleted_shards) == 1
     assert service.deleted_shards[0].logical_shard_id == metadata.logical_shard_id
     assert service.registrations["trainer-0"].role == refit_pb2.WORKER_ROLE_TRAINER
-    assert "endpoint" not in refit_pb2.WorkerRegistration.DESCRIPTOR.fields_by_name
     assert service.shards[0].version_id == "version-a"
     assert service.shards[0].logical_shard_id == metadata.logical_shard_id
     assert service.shards[0].worker_id == "trainer-0"
-    assert service.shards[0].tensor_count == 2
-    assert service.shards[0].total_bytes == 128
-    assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
-    assert json.loads(fetched.manifest)["tensors"][0]["name"] == "weight"
+    assert json.loads(fetched.metadata)["tensor_count"] == 2
+    assert json.loads(fetched.metadata)["total_bytes"] == 128
+    assert service.shards[0].metadata_endpoint == f"127.0.0.1:{port}"
+    assert json.loads(fetched.metadata)["tensors"][0]["name"] == "weight"
     assert metadata.logical_shard_id == hashlib.sha256(
-        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+        bound_tensor_manifest(json.loads(fetched.metadata)["tensors"])
     ).hexdigest()
 
 
@@ -529,21 +560,19 @@ def test_trainer_initialization_cleans_up_when_renewal_thread_cannot_start(
     resources.close.assert_called_once_with()
 
 
-def test_binding_manifest_is_available_before_version_publication():
-    service = WeightVersionShardManifestService(endpoint="127.0.0.1:9000")
+def test_binding_manifest_is_available_before_version_publication() -> None:
+    service = RefitWorkerService(endpoint="127.0.0.1:9000")
     manifest = _Adapter.bound_manifest
     service.publish_binding(manifest)
     binding_id = hashlib.sha256(manifest).hexdigest()
-    response = service.GetWeightVersionShardManifest(
-        refit_pb2.GetWeightVersionShardManifestRequest(
-            version_id="", logical_shard_id=binding_id
-        ),
+    response = service.GetTrainerShardMetadata(
+        refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=binding_id),
         None,
     )
-    assert response.manifest == manifest
-    assert response.manifest_digest == binding_id
-    service.release_manifest(version_id="version-a", logical_shard_id=binding_id)
-    assert service.GetWeightVersionShardManifest(
-        refit_pb2.GetWeightVersionShardManifestRequest(logical_shard_id=binding_id),
+    assert response.metadata == manifest
+    assert response.metadata_digest == binding_id
+    service.release_version_metadata(version_id="version-a", logical_shard_id=binding_id)
+    assert service.GetTrainerShardMetadata(
+        refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=binding_id),
         None,
-    ).manifest == manifest
+    ).metadata == manifest

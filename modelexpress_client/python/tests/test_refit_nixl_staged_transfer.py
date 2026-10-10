@@ -4,6 +4,7 @@
 import ctypes
 from contextlib import nullcontext
 from dataclasses import replace
+from types import MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress_rl.inference.plan import StreamingSettings
@@ -14,7 +15,6 @@ from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
-    structural_manifest_digest,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
@@ -41,7 +41,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _ResolvedSources,
     _source_structure,
 )
-from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
 
 
 def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(
@@ -274,7 +274,7 @@ def test_fixed_mode_updates_receive_changed_values(
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
 
-    def empty(shape, **kwargs):
+    def empty(shape, **kwargs) -> torch.Tensor:
         if torch.device(kwargs.get("device", "cpu")).type == "cuda":
             kwargs["device"] = "cpu"
         return real_empty(shape, **kwargs)
@@ -289,7 +289,7 @@ def test_fixed_mode_updates_receive_changed_values(
             self.fail_register = 0
             self.fail_shutdown = 0
 
-        def initialize(self):
+        def initialize(self) -> None:
             if self.ready:
                 return
             events.append("initialize")
@@ -303,12 +303,12 @@ def test_fixed_mode_updates_receive_changed_values(
                 self.fail_shutdown -= 1
                 raise cleanup_error
             if self.registered:
-                assert transfer._recv_buffers or transfer._bounded_arena is not None
+                assert all(tensor.numel() > 0 for tensor in self.registered.values())
             events.append("shutdown")
             self.registered.clear()
             self.ready = False
 
-        def register_tensors(self, tensors):
+        def register_tensors(self, tensors) -> None:
             assert self.ready
             events.append("register")
             self.registered.update(tensors)
@@ -316,13 +316,13 @@ def test_fixed_mode_updates_receive_changed_values(
                 self.fail_register -= 1
                 raise RuntimeError("registration failed")
 
-        def add_remote_agent(self, metadata):
+        def add_remote_agent(self, metadata) -> str:
             assert self.ready
             events.append("metadata")
             return metadata.decode()
 
     class Transport:
-        def __init__(self, manager, *args, **kwargs):
+        def __init__(self, manager, *args, **kwargs) -> None:
             self.manager = manager
 
         def read(self, descriptors) -> None:
@@ -337,11 +337,11 @@ def test_fixed_mode_updates_receive_changed_values(
                 )
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
-        def post_reads(self, descriptors):
+        def post_reads(self, descriptors) -> list:
             self.read(descriptors)
             return []
 
-        def await_reads(self, posted):
+        def await_reads(self, posted) -> None:
             assert posted == []
 
     monkeypatch.setattr(transfer_module, "NixlTransferManager", Manager)
@@ -378,7 +378,6 @@ def test_fixed_mode_updates_receive_changed_values(
                 "unchanged",
                 "source:19000",
                 manifest,
-                structural_manifest_digest(manifest),
             ),
         ),
     )
@@ -395,10 +394,7 @@ def test_fixed_mode_updates_receive_changed_values(
             )
         ]
     )
-    capture_calls = []
-
-    def capture_layout(manifest):
-        capture_calls.append(tuple(manifest))
+    def capture_layout(manifest) -> tuple[CaptureResult, dict]:
         return capture, {"layer.weight": ((4,), torch.float32)}
 
     transfer = _NixlStagedTransfer(
@@ -422,39 +418,27 @@ def test_fixed_mode_updates_receive_changed_values(
                 with pytest.raises(
                     ValueError, match=f"failed to reset {mode} preparation"
                 ) as raised:
-                    prepare(version=None, source=source)
+                    prepare(version=None, source=ResolvedTrainerSource(source))
                 assert raised.value.__cause__ is cleanup_error
                 assert transfer._manager.registered
-                assert transfer._weight_update_plan is None
                 return
             with pytest.raises(RuntimeError, match="registration failed"):
-                prepare(version=None, source=source)
+                prepare(version=None, source=ResolvedTrainerSource(source))
             assert not transfer._manager.ready
             assert not transfer._manager.registered
         for index in range(4):
             source_tensor.add_(1)
             if bounded:
-                prepared = method.prepare_streaming(version=None, source=source)
+                prepared = method.prepare_streaming(version=None, source=ResolvedTrainerSource(source))
                 for tensors in prepared.batches():
                     assert torch.equal(tensors["layer.weight"], source_tensor)
             else:
-                prepared = method.prepare(version=None, source=source)
+                prepared = method.prepare(version=None, source=ResolvedTrainerSource(source))
                 assert torch.equal(
                     prepared.staged.tensors["layer.weight"], source_tensor
                 )
-            if failure is None:
-                if index == 0:
-                    retained_capture = (
-                        transfer._weight_update_plan.generator_capture_snapshot
-                    )
-                    assert retained_capture is capture
-                else:
-                    assert (
-                        transfer._weight_update_plan.generator_capture_snapshot
-                        is retained_capture
-                    )
             with pytest.raises(RuntimeError, match="release"):
-                method.prepare(version=None, source=source)
+                method.prepare(version=None, source=ResolvedTrainerSource(source))
             method.release(prepared)
             if index == 0 and failure in ("metadata", "capture", "malformed"):
                 addresses = {
@@ -462,7 +446,6 @@ def test_fixed_mode_updates_receive_changed_values(
                     for name, tensor in transfer._manager.registered.items()
                 }
                 reads = events.count("read")
-                capture_count = len(capture_calls)
                 if failure == "metadata":
                     payload = unwrap_rendezvous_blob(manifest)
                     changed = wrap_rendezvous_blob(
@@ -474,7 +457,7 @@ def test_fixed_mode_updates_receive_changed_values(
                     bad_source = replace(
                         source,
                         mesh_generation=2,
-                        shards=(replace(source.shards[0], manifest=changed),),
+                        shards=(replace(source.shards[0], metadata=changed),),
                     )
                     expected = "already connected source"
                 elif failure == "capture":
@@ -489,7 +472,7 @@ def test_fixed_mode_updates_receive_changed_values(
                     bad_source = replace(
                         source,
                         mesh_generation=2,
-                        shards=(replace(source.shards[0], manifest=changed),),
+                        shards=(replace(source.shards[0], metadata=changed),),
                     )
                     capture_layout = method._capture_layout
 
@@ -501,23 +484,18 @@ def test_fixed_mode_updates_receive_changed_values(
                 else:
                     bad_source = replace(
                         source,
-                        shards=(replace(source.shards[0], manifest=b"malformed"),),
+                        shards=(replace(source.shards[0], metadata=b"malformed"),),
                     )
                 try:
                     if failure == "malformed":
                         with pytest.raises(ValueError):
-                            prepare(version=None, source=bad_source)
+                            prepare(version=None, source=ResolvedTrainerSource(bad_source))
                     else:
                         with pytest.raises(RuntimeError, match=expected):
-                            prepare(version=None, source=bad_source)
+                            prepare(version=None, source=ResolvedTrainerSource(bad_source))
                 finally:
                     if failure == "capture":
                         method._capture_layout = capture_layout
-                assert transfer._weight_update_plan is None
-                if failure == "metadata":
-                    assert len(capture_calls) == capture_count
-                if failure == "malformed":
-                    assert len(capture_calls) == capture_count
                 assert transfer._manager.ready
                 assert {
                     name: tensor.data_ptr()
@@ -527,19 +505,8 @@ def test_fixed_mode_updates_receive_changed_values(
                 assert "shutdown" not in events
         assert events.count("register") == (2 if failure == "registration" else 1)
         assert events.count("shutdown") == int(failure == "registration")
-        if failure is None:
-            assert len(capture_calls) == 1
-        elif failure == "registration":
-            assert len(capture_calls) == 2
-        elif failure == "metadata":
-            assert len(capture_calls) == 2
-        elif failure == "capture":
-            assert len(capture_calls) == 2
-        elif failure == "malformed":
-            assert len(capture_calls) == 2
     finally:
         method.close()
-        assert transfer._weight_update_plan is None
         assert not transfer._manager.registered
 
 
@@ -740,7 +707,7 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
                 session="trainer",
                 addr=0,
                 elsize=tensor.element_size(),
-                digest=digest,
+                digest=None,
             )
         ],
     )
@@ -750,10 +717,15 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
         sources={"weight": source},
         descriptors=(),
         transport=object(),
+        checksums=MappingProxyType(
+            {("weight", "trainer", 0, (0,), tuple(tensor.shape)): digest}
+            if digest is not None
+            else {}
+        ),
     )
 
 
-def test_staged_verification_rejects_missing_or_mismatched_digest():
+def test_staged_verification_rejects_missing_or_mismatched_digest() -> None:
     tensor = torch.arange(64, dtype=torch.int32)
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None

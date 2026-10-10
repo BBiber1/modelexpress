@@ -1,4 +1,4 @@
--- Atomically publish one worker manifest and advance version readiness.
+-- Atomically publish one worker metadata and advance version readiness.
 --
 -- KEYS[1]: version hash
 -- KEYS[2]: publishing worker registration hash
@@ -7,7 +7,7 @@
 -- KEYS[4]: trainer mesh hash
 -- KEYS[5]: publication endpoint index, keyed like physical publications
 -- ARGV: publication key, encoded shard, model_name, logical_shard_id, staging_state,
---       ready_state, worker_id, trainer_role, manifest_endpoint
+--       ready_state, worker_id, trainer_role, metadata_endpoint
 --
 -- Returns OK:<state> for a new or byte-identical repeated publication. Other
 -- named results reject missing, incompatible, or conflicting inputs. The

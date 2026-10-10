@@ -19,14 +19,13 @@ class TrainerSourceShard:
 
     source_slot_id: str
     worker_id: str
-    manifest_digest: str
-    manifest_endpoint: str
-    manifest: bytes
-    structural_digest: str
+    stable_metadata_digest: str
+    metadata_endpoint: str
+    metadata: bytes
 
     @property
     def physical_fingerprint(self) -> tuple:
-        return ("NIXL", self.manifest_endpoint, self.structural_digest)
+        return ("NIXL", self.metadata_endpoint, self.stable_metadata_digest)
 
 
 __all__ = ["GeneratorEngineContext", "TrainerSourceShard"]
