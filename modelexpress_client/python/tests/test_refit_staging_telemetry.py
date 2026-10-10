@@ -12,7 +12,12 @@ from opentelemetry import trace
 from modelexpress import telemetry
 from modelexpress.refit.timing import use_refit_timing
 from modelexpress_rl import refit_pb2
-from modelexpress_rl.inference.plan import StreamingSettings
+from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+from modelexpress_rl.inference.plan import (
+    ResolvedTrainerSource,
+    StreamingSettings,
+    TrainerSourceSnapshot,
+)
 import modelexpress_rl.inference.source.trainer as trainer_source_module
 from tests import test_nixl_telemetry, test_refit_bounded_descriptors
 from tests.test_refit_shard_metadata import (
@@ -62,6 +67,43 @@ def _assert_exported_counters(reader, stage: dict) -> None:
     for key, value in stage["metadata"].items():
         if isinstance(value, (int, float)) and not key.endswith("_s"):
             assert exported.get("mx_refit_" + key, 0) == pytest.approx(value), key
+
+
+def test_streaming_prepare_exports_cache_counters_on_existing_outer_span(recording) -> None:
+    class Transfer:
+        def prepare_streaming(self, **_kwargs):
+            return SimpleNamespace(
+                metrics={
+                    "plan_cache_hits": 1,
+                    "plan_cache_misses": 0,
+                    "source_cache_hits": 1,
+                    "source_cache_misses": 0,
+                },
+                batches=[SimpleNamespace(layouts=({"weight": None},))],
+            )
+
+        def iter_bounded(self, _prepared, _metrics):
+            return iter(())
+
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=None)
+    source = ResolvedTrainerSource(
+        TrainerSourceSnapshot(
+            mesh_id="mesh",
+            mesh_generation=1,
+            shards=(),
+        )
+    )
+    with telemetry.refit_attributes(role="generator", rank=3):
+        with telemetry.span("mx.refit.stage_weight") as parent:
+            method.prepare_streaming(version=None, source=source)
+
+    assert parent.attributes["mx.measurement.plan_cache_hits"] == 1
+    assert parent.attributes["mx.measurement.plan_cache_misses"] == 0
+    assert parent.attributes["mx.measurement.source_cache_hits"] == 1
+    assert parent.attributes["mx.measurement.source_cache_misses"] == 0
+    assert [span.name for span in recording.get_finished_spans()] == [
+        "mx.refit.stage_weight"
+    ]
 
 
 @pytest.mark.parametrize("verify", [False, True])
