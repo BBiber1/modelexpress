@@ -2770,13 +2770,12 @@ def test_streaming_creates_and_emits_one_timing_cycle(
     class Transfer:
         def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             observe_cycle()
-            with refit_span("transfer_planning"):
-                if prepare_fails:
-                    raise ValueError("injected streaming preparation failure")
-                return SimpleNamespace(
-                    metrics={},
-                    batches=[SimpleNamespace(layouts=({"weight": None},))],
-                )
+            if prepare_fails:
+                raise ValueError("injected streaming preparation failure")
+            return SimpleNamespace(
+                metrics={},
+                batches=[SimpleNamespace(layouts=({"weight": None},))],
+            )
 
         def reset_workspace(self):
             observe_cycle()

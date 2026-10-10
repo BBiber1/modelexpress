@@ -55,7 +55,6 @@ from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
-    SourceToEngineMapping,
     UnsupportedReshard,
     summarize_unsupported,
 )
@@ -1091,8 +1090,10 @@ class _NixlStagedTransfer:
                 )
                 metrics["transfer_planning_s"] = time.perf_counter() - started
             resolved = trainer.resolved_metadata
+            with telemetry.span("mx.refit.required_agents"):
+                required_metadata = _required_agent_metadata(plan, resolved)
             transport = self._connect_sources(
-                resolved, _required_agent_metadata(plan, resolved)
+                resolved, required_metadata
             )
             self._ensure_workspace(plan, parameter_layout)
             if not reusable or self._full_copy_descriptors is None:
@@ -1166,13 +1167,14 @@ class _NixlStagedTransfer:
             metrics["transfer_planning_s"] = time.perf_counter() - started
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(
-                compiled.transfer_plan, resolved
-            )
-            for batch in compiled.batches:
-                required_metadata.update(
-                    _required_agent_metadata(batch.transfer_plan, resolved)
+            with telemetry.span("mx.refit.required_agents"):
+                required_metadata = _required_agent_metadata(
+                    compiled.transfer_plan, resolved
                 )
+                for batch in compiled.batches:
+                    required_metadata.update(
+                        _required_agent_metadata(batch.transfer_plan, resolved)
+                    )
             transport = self._connect_sources(
                 resolved, required_metadata, host_staging=staging_device == "cpu"
             )
@@ -1211,18 +1213,20 @@ class _NixlStagedTransfer:
         if not self._staging_arenas:
             self._staging_device = torch.device(staging_device)
             for index in range(staging_buffers):
-                arena = self._allocate_arena(arena_bytes)
+                with telemetry.span("mx.refit.arena_allocation"):
+                    arena = self._allocate_arena(arena_bytes)
                 # Retain storage before registration so failed setup can be cleaned up.
                 self._staging_arenas.append(arena)
                 self._native_setup_started = True
-                if staging_device == "cpu":
-                    self._staging_registrations.append(
-                        self._manager.register_dram_buffer(arena)
-                    )
-                else:
-                    self._manager.register_tensors(
-                        {f"__bounded_arena_{index}__": arena}
-                    )
+                with telemetry.span("mx.refit.arena_registration"):
+                    if staging_device == "cpu":
+                        self._staging_registrations.append(
+                            self._manager.register_dram_buffer(arena)
+                        )
+                    else:
+                        self._manager.register_tensors(
+                            {f"__bounded_arena_{index}__": arena}
+                        )
         elif self._staging_arenas[0].numel() < arena_bytes:
             raise RuntimeError(
                 "bounded workspace layout grew; restart the generator engine"

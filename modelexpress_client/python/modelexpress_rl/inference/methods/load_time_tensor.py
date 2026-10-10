@@ -83,11 +83,12 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, TrainerSourceSnapshot):
             raise ValueError("bounded staging requires NIXL trainer sources")
-        prepared = self._transfer.prepare_streaming(
-            manifests=[item.manifest for item in source.shards],
-            trainer_snapshot=source,
-            capture_layout=self._capture_layout,
-        )
+        with refit_span("transfer_planning"):
+            prepared = self._transfer.prepare_streaming(
+                manifests=[item.manifest for item in source.shards],
+                trainer_snapshot=source,
+                capture_layout=self._capture_layout,
+            )
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
         metrics = dict(prepared.metrics)
         streamed = PreparedStreamingTensors(
