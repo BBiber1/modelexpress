@@ -267,20 +267,59 @@ class _BoundedPlanCache:
         if copy_key_on_miss and not self._compile_lock.acquire(blocking=False):
             raise RuntimeError("bounded plan compilation is already in progress")
         try:
-            return self._compile(
-                manifests=manifests,
-                resolved=resolved,
-                capture=capture,
-                parameter_layout=parameter_layout,
-                max_staging_bytes=max_staging_bytes,
-                enabled=enabled,
-                metrics=metrics,
-                copy_key_on_miss=copy_key_on_miss,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=total_staging_bytes,
-                source_snapshot=source_snapshot,
-            )
+            with telemetry.span("mx.refit.bounded_plan_compile") as span:
+                compiled = self._compile(
+                    manifests=manifests,
+                    resolved=resolved,
+                    capture=capture,
+                    parameter_layout=parameter_layout,
+                    max_staging_bytes=max_staging_bytes,
+                    enabled=enabled,
+                    metrics=metrics,
+                    copy_key_on_miss=copy_key_on_miss,
+                    staging_device=staging_device,
+                    staging_buffers=staging_buffers,
+                    total_staging_bytes=total_staging_bytes,
+                    source_snapshot=source_snapshot,
+                )
+                if span.is_recording():
+                    span.set_attributes(
+                        {
+                            "plan_cache.enabled": bool(metrics["plan_cache_enabled"]),
+                            "plan_cache.hits": metrics["plan_cache_hits"],
+                            "plan_cache.misses": metrics["plan_cache_misses"],
+                            "plan_cache.lookup_s": metrics["plan_cache_lookup_s"],
+                            "plan_cache.validate_s": metrics["plan_cache_validate_s"],
+                            "plan_cache.fingerprint_s": metrics[
+                                "plan_cache_fingerprint_s"
+                            ],
+                            "plan_cache.key_copies": metrics["plan_cache_key_copies"],
+                            "source_cache.enabled": bool(
+                                metrics.get("source_cache_enabled", 0)
+                            ),
+                            "source_cache.hits": metrics.get("source_cache_hits", 0),
+                            "source_cache.misses": metrics.get(
+                                "source_cache_misses", 0
+                            ),
+                            "initial_whole_plan_s": metrics["initial_whole_plan_s"],
+                            "initial_whole_validation_s": metrics[
+                                "initial_whole_validation_s"
+                            ],
+                            "bounded_whole_plan_s": metrics["bounded_whole_plan_s"],
+                            "bounded_whole_plan_builds": metrics[
+                                "bounded_whole_plan_builds"
+                            ],
+                            "bounded_whole_validation_s": metrics[
+                                "bounded_whole_validation_s"
+                            ],
+                            "owner_plan_s": metrics["owner_plan_s"],
+                            "owner_validation_s": metrics["owner_validation_s"],
+                            "owner_plan_builds": metrics["owner_plan_builds"],
+                            "module_batches": len(compiled.module_batches),
+                            "batches": len(compiled.batches),
+                        }
+                    )
+                return compiled
         finally:
             if copy_key_on_miss:
                 self._compile_lock.release()
@@ -383,27 +422,22 @@ class _BoundedPlanCache:
             # Plan copies/layouts must not alias the callback or key snapshots.
             capture, parameter_layout = deepcopy((capture, parameter_layout))
         started = time.perf_counter()
-        with telemetry.span("mx.refit.transfer_planning"):
-            plan = _plan_staged_transfer(capture, resolved.sources)
+        plan = _plan_staged_transfer(capture, resolved.sources)
         metrics["initial_whole_plan_s"] = time.perf_counter() - started
         started = time.perf_counter()
         if not reuse_complete:
-            with telemetry.span("mx.refit.transfer_validation"):
-                _NixlStagedTransfer._validate_complete(
-                    capture, parameter_layout, plan
-                )
+            _NixlStagedTransfer._validate_complete(capture, parameter_layout, plan)
         metrics["initial_whole_validation_s"] = time.perf_counter() - started
-        with telemetry.span("mx.refit.transfer_planning"):
-            modules = _bounded_batches(
-                capture,
-                parameter_layout,
-                resolved.sources,
-                max_staging_bytes,
-                complete_plan=plan if reuse_complete else None,
-                metrics=metrics,
-                total_staging_bytes=total_staging_bytes,
-                staging_buffers=staging_buffers,
-            )
+        modules = _bounded_batches(
+            capture,
+            parameter_layout,
+            resolved.sources,
+            max_staging_bytes,
+            complete_plan=plan if reuse_complete else None,
+            metrics=metrics,
+            total_staging_bytes=total_staging_bytes,
+            staging_buffers=staging_buffers,
+        )
         batches = _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
         fingerprint = None
         if key is not None:
@@ -439,13 +473,11 @@ def _bounded_batches(
     started = time.perf_counter()
     complete = complete_plan
     if complete is None:
-        with telemetry.span("mx.refit.transfer_planning"):
-            complete = _plan_staged_transfer(capture, sources)
+        complete = _plan_staged_transfer(capture, sources)
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
     started = time.perf_counter()
-    with telemetry.span("mx.refit.transfer_validation"):
-        _NixlStagedTransfer._validate_complete(capture, parameter_layout, complete)
+    _NixlStagedTransfer._validate_complete(capture, parameter_layout, complete)
     metrics["bounded_whole_validation_s"] = time.perf_counter() - started
     if {copy.param_name for copy in capture.copies} - parameter_layout.keys():
         raise IncompleteRefit("bounded capture references unknown engine parameters")
@@ -461,13 +493,11 @@ def _bounded_batches(
             copies=[c for c in capture.copies if c.param_name in recv]
         )
         started = time.perf_counter()
-        with telemetry.span("mx.refit.transfer_planning"):
-            plan = _plan_staged_transfer(subset, sources)
+        plan = _plan_staged_transfer(subset, sources)
         metrics["owner_plan_s"] += time.perf_counter() - started
         metrics["owner_plan_builds"] += 1
         started = time.perf_counter()
-        with telemetry.span("mx.refit.transfer_validation"):
-            _NixlStagedTransfer._validate_complete(subset, recv, plan)
+        _NixlStagedTransfer._validate_complete(subset, recv, plan)
         metrics["owner_validation_s"] += time.perf_counter() - started
         convert = {
             c.param_name: (tuple(c.dest_shape), c.src_dtype) for c in plan.converts
@@ -650,9 +680,7 @@ def _merge_plan(target: TensorTransferPlan, source: TensorTransferPlan) -> None:
     target.exact_bytes += source.exact_bytes
 
 
-def _plan_staged_transfer(
-    capture: CaptureResult, sources: dict
-) -> TensorTransferPlan:
+def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TensorTransferPlan:
     """Plan reads for each source.
 
     Default: minimal slice reads via plan_transfer (a partial read of a shard cannot
@@ -1140,20 +1168,19 @@ class _NixlStagedTransfer:
                 compiler._entry = (previous.key, previous.transfer_plan)
             self._weight_update_plan = None
             started = time.perf_counter()
-            with telemetry.span("mx.refit.transfer_planning"):
-                compiled = compiler.compile(
-                    manifests=manifests,
-                    resolved=trainer.resolved_metadata,
-                    capture=capture,
-                    parameter_layout=dict(parameter_layout),
-                    max_staging_bytes=buffer_budget,
-                    enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-                    metrics=metrics,
-                    staging_device=staging_device,
-                    staging_buffers=staging_buffers,
-                    total_staging_bytes=max_staging_bytes,
-                    source_snapshot=frozen,
-                )
+            compiled = compiler.compile(
+                manifests=manifests,
+                resolved=trainer.resolved_metadata,
+                capture=capture,
+                parameter_layout=dict(parameter_layout),
+                max_staging_bytes=buffer_budget,
+                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
+                metrics=metrics,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
+                total_staging_bytes=max_staging_bytes,
+                source_snapshot=frozen,
+            )
             metrics["transfer_planning_s"] = time.perf_counter() - started
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
@@ -1583,7 +1610,10 @@ class _NixlStagedTransfer:
                     span.set_attribute(
                         "wire.host_staging",
                         int(
-                            any(t.device.type == "cpu" for t in self._recv_buffers.values())
+                            any(
+                                t.device.type == "cpu"
+                                for t in self._recv_buffers.values()
+                            )
                         ),
                     )
             post_seconds = time.perf_counter() - post_started
@@ -1619,7 +1649,9 @@ class _NixlStagedTransfer:
                         + copy.dest_offset,
                     )
                     destination.copy_(_replay_ops(source, copy.op_chain))
-            converted = {convert.param_name for convert in prepared.transfer_plan.converts}
+            converted = {
+                convert.param_name for convert in prepared.transfer_plan.converts
+            }
             conversion_copies = {
                 copy.param_name: copy
                 for copy in prepared.capture.copies
