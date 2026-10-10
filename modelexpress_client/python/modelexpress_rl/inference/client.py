@@ -452,30 +452,34 @@ class ModelExpressGeneratorClient:
                     self._engine_state = _EngineState.UNCERTAIN
                 elif not was_applied and restore_version_id is not None:
                     try:
-                        runtime.publish_runtime_tensors(restore_version_id)
+                        with timing.active(staged._timing), refit_span(
+                            "post_install", duration_key="runtime_tensor_publish_s"
+                        ):
+                            runtime.publish_runtime_tensors(restore_version_id)
                     except Exception:
                         logger.exception(
                             "failed to republish unchanged runtime tensors for %s",
                             restore_version_id,
                         )
                 raise
+            else:
+                self._serving_version_id = staged.version_id
+                self._engine_state = _EngineState.READY
+                if not was_applied:
+                    try:
+                        with timing.active(staged._timing), refit_span(
+                            "post_install", duration_key="runtime_tensor_publish_s"
+                        ):
+                            runtime.publish_runtime_tensors(staged.version_id)
+                    except Exception:
+                        logger.exception(
+                            "failed to publish installed runtime tensors for %s",
+                            staged.version_id,
+                        )
+                return result
             finally:
-                # Reported even when the install raised: a refit that failed
-                # after seconds on the wire is exactly the case the split has to
-                # explain, and dropping the record would leave the failure with
-                # no timing at all.
+                # Include installation and runtime tensor publication in one record.
                 timing.emit(staged._timing, logger)
-            self._serving_version_id = staged.version_id
-            self._engine_state = _EngineState.READY
-            if not was_applied:
-                try:
-                    runtime.publish_runtime_tensors(staged.version_id)
-                except Exception:
-                    logger.exception(
-                        "failed to publish installed runtime tensors for %s",
-                        staged.version_id,
-                    )
-            return result
 
     def close(self) -> None:
         """Stop renewal and release control-plane and adapter resources."""

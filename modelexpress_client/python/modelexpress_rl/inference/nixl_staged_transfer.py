@@ -1174,7 +1174,7 @@ class _NixlStagedTransfer:
                 buffers.append(tensors)
             return tuple(buffers)
 
-        def post(index: int) -> tuple:
+        def post(index: int, *, prefetched: bool = False) -> tuple:
             batch = batches[index]
             recv, convert, full = carve(batch, arenas[index % len(arenas)])
             # Captured loaders may leave padding untouched. Reused arenas must
@@ -1200,7 +1200,7 @@ class _NixlStagedTransfer:
                 with telemetry.span("mx.refit.wire_post"):
                     posted = prepared.transport.post_reads(list(chunk.descriptors))
                 post_seconds = time.perf_counter() - started
-            return chunk, (recv, convert, full), posted, post_seconds
+            return chunk, (recv, convert, full), posted, post_seconds, prefetched
 
         pending = None
         unwinding = False
@@ -1208,15 +1208,17 @@ class _NixlStagedTransfer:
         try:
             pending = post(0)
             for index in range(len(batches)):
-                chunk, buffers, posted, post_seconds = pending
+                chunk, buffers, posted, post_seconds, prefetched = pending
                 pending = None
                 self._recv_buffers, self._convert_buffers, self._full_buffers = buffers
                 self._active = chunk
-                staged = self._complete_stage(chunk, posted, post_seconds)
+                staged = self._complete_stage(
+                    chunk, posted, post_seconds, prefetched=prefetched
+                )
                 if len(arenas) > 1 and index + 1 < len(batches):
                     # The other arena's previous batch was committed and
                     # synchronized one iteration ago, so it is free to refill.
-                    pending = post(index + 1)
+                    pending = post(index + 1, prefetched=True)
                 for key, value in staged.metrics.items():
                     metrics[key] = metrics.get(key, 0) + value
                 yield staged.tensors
@@ -1433,7 +1435,12 @@ class _NixlStagedTransfer:
 
     @torch.no_grad()
     def _complete_stage(
-        self, prepared: _PreparedNixlTransfer, posted: list, post_seconds: float
+        self,
+        prepared: _PreparedNixlTransfer,
+        posted: list,
+        post_seconds: float,
+        *,
+        prefetched: bool = False,
     ) -> _StagedNixlWeights:
         """Wait for posted READs, then reconstruct, convert, and verify."""
         wait_started = time.perf_counter()
@@ -1478,12 +1485,13 @@ class _NixlStagedTransfer:
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
         # This is the path the FSDP trainer refits over, and the path the 20x
         # collapse was measured on, so it is the one the floor most needs to cover.
-        throughput.warn_if_below_floor(
-            wire_bytes=bytes_received,
-            wire_seconds=wire_seconds,
-            log=logger,
-            context={"device_id": self._device_id, "phase": "stage"},
-        )
+        if not prefetched:
+            throughput.warn_if_below_floor(
+                wire_bytes=bytes_received,
+                wire_seconds=wire_seconds,
+                log=logger,
+                context={"device_id": self._device_id, "phase": "stage"},
+            )
         logger.info(
             "[TIMING] staged xfer: %.3f GB, %d descriptors "
             "(seg=%d full_pull=%d convert=%d), %d tensors | "
