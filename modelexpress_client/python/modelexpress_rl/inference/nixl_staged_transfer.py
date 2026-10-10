@@ -806,6 +806,7 @@ class _NixlStagedTransfer:
 
     def _invalidate_descriptors(self) -> None:
         self._descriptor_cache = None
+        self._full_copy_descriptors = None
         self._workspace_generation += 1
 
     def _release_staging_registrations(self) -> None:
@@ -850,8 +851,6 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._loaded_agent_metadata.clear()
         self._manager_ready = False
-        self._weight_update_plan = None
-        self._full_copy_descriptors = None
 
     def _ensure_manager_initialized(self) -> None:
         if not self._manager_ready and self._owns_manager:
@@ -998,11 +997,11 @@ class _NixlStagedTransfer:
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
         self._native_setup_started = False
+        self._active = None
         try:
             yield
         except Exception:
-            self._weight_update_plan = None
-            self._full_copy_descriptors = None
+            self._invalidate_descriptors()
             if self._native_setup_started:
                 try:
                     self.reset_workspace()
@@ -1014,14 +1013,6 @@ class _NixlStagedTransfer:
             raise
         finally:
             self._native_setup_started = False
-
-    def _publish_prepared(
-        self,
-        cached: _WeightUpdatePlan,
-        prepared: _PreparedNixlTransfer | _PreparedBoundedTransfer,
-    ) -> None:
-        self._weight_update_plan = cached
-        self._active = prepared
 
     def prepare_full_copy(
         self,
@@ -1049,7 +1040,6 @@ class _NixlStagedTransfer:
                 if source_mapping_key is not None
                 else None
             )
-            self._weight_update_plan = None
             reusable = (
                 previous is not None
                 and isinstance(previous.transfer_plan, TensorTransferPlan)
@@ -1076,9 +1066,7 @@ class _NixlStagedTransfer:
                     mapping_key = previous.source_mapping_key
                 if tuple(manifests) != previous.manifests:
                     if layout is None:
-                        self._weight_update_plan = previous
                         resolved, frozen = self._resolve_metadata(manifests, metrics)
-                        self._weight_update_plan = None
                     else:
                         resolved = trainer.resolved_metadata
                         frozen = layout[3]
@@ -1116,9 +1104,17 @@ class _NixlStagedTransfer:
                 )
                 metrics["transfer_planning_s"] = time.perf_counter() - started
             resolved = trainer.resolved_metadata
-            transport = self._connect_sources(
-                resolved, _required_agent_metadata(plan, resolved)
+            required_metadata = _required_agent_metadata(plan, resolved)
+            self._weight_update_plan = _WeightUpdatePlan(
+                trainer,
+                capture,
+                parameter_layout,
+                plan,
+                trainer_snapshot.physical_fingerprint,
+                tuple(manifests),
+                mapping_key,
             )
+            transport = self._connect_sources(resolved, required_metadata)
             self._ensure_workspace(plan, parameter_layout)
             if not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
@@ -1134,16 +1130,7 @@ class _NixlStagedTransfer:
                 transport=transport,
                 metrics=metrics,
             )
-            cached = _WeightUpdatePlan(
-                trainer,
-                capture,
-                parameter_layout,
-                plan,
-                trainer_snapshot.physical_fingerprint,
-                tuple(manifests),
-                mapping_key,
-            )
-            self._publish_prepared(cached, prepared)
+            self._active = prepared
             return prepared
 
     def prepare_streaming(
@@ -1182,7 +1169,6 @@ class _NixlStagedTransfer:
                 previous.transfer_plan, _StreamingSchedule
             ):
                 compiler._entry = (previous.key, previous.transfer_plan)
-            self._weight_update_plan = None
             started = time.perf_counter()
             compiled = compiler.compile(
                 manifests=manifests,
@@ -1207,6 +1193,16 @@ class _NixlStagedTransfer:
                 required_metadata.update(
                     _required_agent_metadata(batch.transfer_plan, resolved)
                 )
+            key = compiler._entry[0] if compiler._entry is not None else None
+            self._weight_update_plan = _WeightUpdatePlan(
+                trainer,
+                capture,
+                parameter_layout,
+                compiled,
+                key,
+                tuple(manifests),
+                mapping_key,
+            )
             transport = self._connect_sources(
                 resolved, required_metadata, host_staging=staging_device == "cpu"
             )
@@ -1220,17 +1216,7 @@ class _NixlStagedTransfer:
             prepared = _PreparedBoundedTransfer(
                 compiled.batches, resolved.sources, transport, metrics
             )
-            key = compiler._entry[0] if compiler._entry is not None else None
-            cached = _WeightUpdatePlan(
-                trainer,
-                capture,
-                parameter_layout,
-                compiled,
-                key,
-                tuple(manifests),
-                mapping_key,
-            )
-            self._publish_prepared(cached, prepared)
+            self._active = prepared
             self._descriptor_cache = descriptors
             return prepared
 

@@ -92,6 +92,7 @@ def mapping_transfer(capture_installer, monkeypatch, request) -> Iterator[object
     class Manager:
         def __init__(self, **kwargs) -> None:
             self.registrations = {}
+            self.fail_connect = False
 
         def initialize(self) -> None:
             pass
@@ -100,6 +101,8 @@ def mapping_transfer(capture_installer, monkeypatch, request) -> Iterator[object
             self.registrations.clear()
 
         def add_remote_agent(self, metadata) -> str:
+            if self.fail_connect:
+                raise RuntimeError("connection failed")
             return "source"
 
         def register_tensors(self, tensors) -> None:
@@ -137,10 +140,13 @@ def mapping_transfer(capture_installer, monkeypatch, request) -> Iterator[object
         streaming=StreamingSettings(512, "cpu") if request.param else None,
     )
     captured = []
+    faults = SimpleNamespace(compile=False)
 
     def capture(manifest) -> tuple:
         result = installer.capture(manifest)
         captured.append(result)
+        if faults.compile:
+            result[0].unsupported.append("weight")
         return result
 
     def prepare(source, mesh="mesh") -> object:
@@ -189,6 +195,8 @@ def mapping_transfer(capture_installer, monkeypatch, request) -> Iterator[object
         events=events,
         captured=captured,
         transfer=transfer,
+        manager=transfer._manager,
+        faults=faults,
     )
     transfer.close()
 
@@ -285,3 +293,64 @@ def test_invalid_mapping_key_requires_fresh_capture_before_reads(
     with pytest.raises(RuntimeError, match="unexpected source capture"):
         h.prepare(source)
     assert h.events == []
+
+
+def test_connection_failure_reuses_validated_preparation_on_next_round(
+    mapping_transfer,
+) -> None:
+    h = mapping_transfer
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    h.manager.fail_connect = True
+    with pytest.raises(RuntimeError, match="connection failed"):
+        h.prepare(source)
+    assert h.events == []
+    assert h.manager.registrations == {}
+    h.manager.fail_connect = False
+    h.model.reject_capture = True
+    source.add_(100)
+    assert torch.equal(h.receive(h.prepare(source)), source[:2, :2])
+    assert h.manager.registrations
+
+
+@pytest.mark.parametrize("failure", ["capture", "compile"])
+def test_failed_replacement_preserves_previous_valid_plan(
+    mapping_transfer, failure
+) -> None:
+    from modelexpress.refit.reshard.types import IncompleteRefit
+
+    h = mapping_transfer
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    assert torch.equal(h.receive(h.prepare(source)), source[:2, :2])
+    h.events.clear()
+    replacement = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    if failure == "capture":
+        h.model.reject_capture = True
+        error, message = RuntimeError, "unexpected source capture"
+    else:
+        h.faults.compile = True
+        error, message = IncompleteRefit, "cover every"
+    with pytest.raises(error, match=message):
+        h.prepare(replacement, "replacement-mesh")
+    assert h.events == []
+    assert h.manager.registrations
+    h.faults.compile = False
+    h.model.reject_capture = True
+    source.add_(100)
+    assert torch.equal(h.receive(h.prepare(source)), source[:2, :2])
+
+
+def test_safe_reset_rebinds_retained_plan_and_invalidates_old_prepared_state(
+    mapping_transfer,
+) -> None:
+    h = mapping_transfer
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    prepared = h.prepare(source)
+    assert torch.equal(h.receive(prepared), source[:2, :2])
+    h.transfer.reset_workspace()
+    assert h.manager.registrations == {}
+    with pytest.raises(RuntimeError, match="no longer active"):
+        h.receive(prepared)
+    h.model.reject_capture = True
+    source.add_(100)
+    assert torch.equal(h.receive(h.prepare(source)), source[:2, :2])
+    assert h.manager.registrations
