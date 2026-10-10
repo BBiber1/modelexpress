@@ -25,7 +25,7 @@ from modelexpress_rl.inference.methods.load_time_tensor import (
     LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
 )
-from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
 from modelexpress_rl.train import WeightPayloadFormat
 
 STAGED_METRICS = {
@@ -131,7 +131,7 @@ def test_full_copy_timing_reports_transfer_owned_cache_reuse() -> None:
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=Transfer(), capture_layout=lambda _manifest: None
     )
-    source = TrainerSourceSnapshot("mesh", 1, ())
+    source = ResolvedTrainerSource(TrainerSourceSnapshot("mesh", 1, ()))
     version = SimpleNamespace(
         base_version_id=None,
         layout_signature="layout",
