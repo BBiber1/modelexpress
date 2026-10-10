@@ -178,6 +178,9 @@ class TrainerShardMetadataPublisher(Protocol):
     def publish_metadata(self, *, metadata: TrainerShardMetadata) -> str:
         """Publish stable metadata and return its ready worker-local endpoint."""
 
+    def release_metadata(self) -> None:
+        """Stop serving the current physical metadata after publication retirement."""
+
     def publish_version_metadata(
         self, metadata: refit_pb2.WeightVersionShardMetadata
     ) -> None:

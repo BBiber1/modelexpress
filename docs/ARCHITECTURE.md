@@ -588,9 +588,17 @@ The worker publisher serves stable physical metadata without a version ID throug
 `publish_version_metadata()` only after the referenced stable metadata is available;
 both stores are ready before central shard advertisement. Canonical metadata helpers
 and the worker service live together in `modelexpress_rl/train/manifest.py`.
-Stable metadata remains available for the worker process lifetime. Releasing a trainer
-shard removes its optional version checksum record only after central deletion succeeds;
-the service rejects deletion while a version lease is active.
+The worker serves one current physical metadata record and a distinct current
+coverage binding for admission. Repeated publication of the same physical record is
+idempotent; replacement explicitly releases it after all trainer publication owners
+retire. A mesh identity, generation, or physical digest change cannot replace metadata
+while any owned version remains, including when checksum verification is disabled.
+Releasing a trainer shard removes its optional checksum record only after central
+deletion passes the version lease fence. An ambiguous publication RPC retains buffer
+ownership even after a later successful retry; cleanup first requires the version to
+be RELEASING, preventing an outstanding publication from committing after deletion.
+Ordinary version retirement keeps the current physical metadata available for reuse;
+retired or replaced physical digests are not served as historical records.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
 typed location and does not contact S3.

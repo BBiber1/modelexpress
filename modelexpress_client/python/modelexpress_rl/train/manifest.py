@@ -83,26 +83,36 @@ def bound_tensor_manifest(tensor_coverage: list[dict]) -> bytes:
 
 
 class RefitWorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
-    """Serve process-lifetime stable metadata and releasable version checksums."""
+    """Serve current stable metadata and releasable version checksums."""
 
     def __init__(self, *, endpoint: str) -> None:
         if not endpoint.strip():
             raise ValueError("endpoint is required")
         self.endpoint = endpoint
-        self._metadata: dict[str, bytes] = {}
+        self._metadata: TrainerShardMetadata | None = None
+        self._binding: tuple[str, bytes] | None = None
         self._versions: dict[tuple[str, str], bytes] = {}
         self._lock = threading.Lock()
 
     def publish_binding(self, manifest: bytes) -> None:
         binding_id = hashlib.sha256(manifest).hexdigest()
         with self._lock:
-            self._metadata[binding_id] = manifest
+            self._binding = (binding_id, manifest)
 
     def publish_metadata(self, *, metadata: TrainerShardMetadata) -> str:
         """Serve immutable physical metadata independently of any weight version."""
         with self._lock:
-            self._metadata.setdefault(metadata.digest, metadata.data)
+            if self._metadata is not None and self._metadata.digest != metadata.digest:
+                raise ValueError("release current trainer metadata before replacing it")
+            self._metadata = metadata
         return self.endpoint
+
+    def release_metadata(self) -> None:
+        """Drop current physical metadata after its version records are released."""
+        with self._lock:
+            if self._versions:
+                raise RuntimeError("trainer metadata still has published version records")
+            self._metadata = None
 
     def publish_version_metadata(
         self, metadata: refit_pb2.WeightVersionShardMetadata
@@ -118,7 +128,7 @@ class RefitWorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
         encoded = metadata.SerializeToString(deterministic=True)
         key = (metadata.version_id, metadata.logical_shard_id)
         with self._lock:
-            if metadata.stable_metadata_digest not in self._metadata:
+            if self._metadata is None or metadata.stable_metadata_digest != self._metadata.digest:
                 raise ValueError("version metadata references unpublished stable metadata")
             existing = self._versions.get(key)
             if existing is not None and existing != encoded:
@@ -139,7 +149,11 @@ class RefitWorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
         self, request, context
     ) -> refit_pb2.GetTrainerShardMetadataResponse:
         with self._lock:
-            metadata = self._metadata.get(request.metadata_digest)
+            metadata = None
+            if self._metadata is not None and request.metadata_digest == self._metadata.digest:
+                metadata = self._metadata.data
+            elif self._binding is not None and request.metadata_digest == self._binding[0]:
+                metadata = self._binding[1]
         if metadata is None:
             context.abort(grpc.StatusCode.NOT_FOUND, "metadata was not found")
         return refit_pb2.GetTrainerShardMetadataResponse(
