@@ -8,7 +8,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-import modelexpress_rl.train.engines.fsdp.adapter as fsdp_adapter_module
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadFormat
 from modelexpress_rl.train.context import FSDPTrainerContext
@@ -262,7 +261,6 @@ def test_digest_mode_rebuilds_version_manifest(dist_ready, monkeypatch):
     from modelexpress_rl.train.adapter import CompletionFence
 
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
-    monkeypatch.setattr(fsdp_adapter_module.mx_envs, "MX_RESHARD_PUBLISH_DIGEST", True)
     clock = [0.0]
 
     def wait():
