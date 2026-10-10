@@ -1681,6 +1681,7 @@ class _NixlStagedTransfer:
         return {
             "bytes_received": bytes_received,
             "segments": tensor_count,
+            "wire_host_s": round(wire_seconds, 6),
             "peer_s": round(time.perf_counter() - started, 6),
         }
 
