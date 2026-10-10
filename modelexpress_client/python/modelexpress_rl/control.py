@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+
 import grpc
-from modelexpress import auth
+from modelexpress import auth, telemetry
 from modelexpress.client import _get_server_url
 
 from . import refit_pb2, refit_pb2_grpc
@@ -50,6 +51,7 @@ class WeightVersion:
     object_storage: ObjectStorageSource | None = None
     trainer_mesh_id: str | None = None
     version_number: int | None = None
+    trace_context: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Require a uint64 generation consistent with whether the version has a mesh."""
@@ -165,6 +167,7 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
             version.trainer_mesh_id if version.HasField("trainer_mesh_id") else None
         ),
         version_number=version.version_number if version.HasField("version_number") else None,
+        trace_context=dict(version.trace_context),
     )
 
 
@@ -199,7 +202,9 @@ class ModelExpressControlClient:
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
         if self._channel is None:
-            self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
+            self._channel = telemetry.refit_channel(
+                auth.with_auth(grpc.insecure_channel(self.server_url))
+            )
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
         assert self._stub is not None
         return self._stub
@@ -298,6 +303,7 @@ class ModelExpressControlClient:
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
             }[state],
         )
+        telemetry.inject(request.trace_context)
         if uid is not None:
             request.uid = _required(uid, "uid")
         if trainer_mesh_id is not None:
@@ -357,6 +363,7 @@ class ModelExpressControlClient:
         response = self._service.ListWeightVersions(request, timeout=self._rpc_timeout_seconds)
         return [_weight_version(version) for version in response.versions]
 
+    @telemetry.span("mx.refit.retire")
     def delete_weight_version(self, version_id: str) -> WeightVersion:
         """Move a STAGING or READY version to RELEASING."""
         response = self._service.DeleteWeightVersion(

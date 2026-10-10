@@ -1852,3 +1852,33 @@ run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunni
 the whole GitHub workflow uses a new attempt and does not recover an older retained
 namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.
+
+### Refit OpenTelemetry export
+
+
+Install the Python client's `otel` extra to enable its optional refit telemetry facade. Set
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to exact OTLP HTTP
+signal URLs in each refit process. The ModelExpress server uses the traces endpoint for refit
+gRPC spans. Refit calls propagate W3C `traceparent`, `tracestate`, and `baggage`; server spans
+join the caller's trace and carry `role=server` and `rank=0`. The client creates its
+refit tracer after each worker fork so every rank has distinct span IDs and an active
+export thread, even when vLLM has already installed a global tracer. Refit spans are
+recorded whenever an OTLP traces endpoint is configured. The telemetry facade's
+`RefitCycle` starts a native `mx.refit.cycle` root independently of the current
+context. Its `inject` method propagates the root through W3C context, and `finish`
+ends it on completion or failure. It stays open across offer and completion hooks;
+it does not leave a span attached between hooks. Trace-only work is guarded by
+`is_recording`.
+
+Framework adapters use `modelexpress_rl.RefitTrace` for role and group ownership.
+`trainer` creates the root and trainer group on rank zero; `context()` exports
+their carriers for an existing broadcast. Other ranks and the `orchestrator`
+bind their discovered parent with `bind`. A `span` measures framework work,
+including work performed before binding. `active()` supplies context to MX client
+operations without adding another operation span. Both restore the caller's
+context on exit; a failed operation finishes the owned trace. Use `with trace`
+or `finish()` to close a successful role. The orchestrator's `generators()` scope
+yields the parent carrier to forward to each generator worker.
+
+`MX_REFIT_TRACE_DETAIL` defaults to false; enabling it exports additional per-request refit diagnostics. Native request samples are collected before NIXL handles are released. Missing telemetry remains explicit and does not fail a transfer.
+`MX_REFIT_EXPERIMENT` adds an optional experiment label, and `MX_REFIT_STAGING_MODE` supplies a staging label when a caller does not provide one. Both are unset by default.
