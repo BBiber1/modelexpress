@@ -283,8 +283,18 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
         if mx_envs.MX_RESHARD_PUBLISH_DIGEST:
             # Host digests must not read buffers before asynchronous copies finish.
-            publish_ready.wait()
-        return self._staged(shards, publish_ready)
+            with refit_span(
+                "source_preparation",
+                metadata={"staging_syncs": 1},
+                accumulate_metadata=True,
+                duration_key="staging_sync_s",
+            ):
+                publish_ready.wait()
+        return self._staged(
+            shards,
+            publish_ready,
+            publish_ready_completed=mx_envs.MX_RESHARD_PUBLISH_DIGEST,
+        )
 
     def _snapshot_into_arenas(self, shards: list[LocalTensorShard]) -> CompletionFence:
         """Copy each rank-local source into its persistent registered arena.
@@ -384,7 +394,11 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             )
 
     def _staged(
-        self, shards: list[LocalTensorShard], publish_ready: CompletionFence
+        self,
+        shards: list[LocalTensorShard],
+        publish_ready: CompletionFence,
+        *,
+        publish_ready_completed: bool = False,
     ) -> StagedWeightVersionShardData:
         cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
         if not cache_hit:
@@ -427,6 +441,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         return StagedWeightVersionShardData(
             manifest=self._manifest,
             publish_ready=publish_ready,
+            publish_ready_completed=publish_ready_completed,
             # Keep the served buffers alive while the version can be selected.
             buffer_owner=tuple(s.served_tensor for s in shards),
         )

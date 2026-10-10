@@ -7,9 +7,12 @@ use modelexpress_server::{
     config::{ServerArgs, ServerConfig},
     run_server,
 };
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -37,10 +40,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize tracing with the configured log level
     let log_level = config.log_level();
 
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_max_level(log_level)
-        .finish();
+    let trace_provider = match std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
+        Ok(endpoint) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let exporter = SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint)
+                .build()?;
+            Some(
+                SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(
+                        Resource::builder()
+                            .with_service_name("modelexpress-server")
+                            .build(),
+                    )
+                    .build(),
+            )
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let otel_layer = trace_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer().with_tracer(provider.tracer("modelexpress-server"))
+    });
+    let mut filter = EnvFilter::from_default_env().add_directive(log_level.into());
+    if trace_provider.is_some() {
+        filter = filter
+            .add_directive("modelexpress_server::telemetry=info".parse()?)
+            .add_directive("modelexpress_server::refit::service=info".parse()?);
+    }
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer);
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Shut down gracefully on CTRL+C (SIGINT) or SIGTERM. SIGTERM is what
@@ -59,5 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let backend = BackendConfig::from_env()?;
 
-    run_server(config, backend, shutdown).await
+    let result = run_server(config, backend, shutdown).await;
+    if let Some(provider) = trace_provider {
+        provider.shutdown()?;
+    }
+    result
 }
