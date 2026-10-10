@@ -9,11 +9,12 @@ import logging
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping
+from time import perf_counter
 
 import grpc
 from modelexpress import envs
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
-from modelexpress.refit.timing import refit_span
+from modelexpress.refit.timing import add_refit_duration, refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
@@ -199,122 +200,155 @@ class TrainerSourceResolver(SourceResolver):
         round_sources = {}
         failed_sources = set()
         round_checksums = {}
+        verify = envs.MX_RESHARD_PUBLISH_DIGEST
+        counters: dict[str, int | float] = defaultdict(int)
+        resolution_seconds = 0.0
+        resolution_failed = False
+
+        def flush() -> None:
+            nonlocal resolution_seconds, resolution_failed
+            if counters:
+                add_refit_duration(
+                    "source_preparation",
+                    resolution_seconds,
+                    status="error" if resolution_failed else "ok",
+                    metadata=dict(counters),
+                    accumulate_metadata=True,
+                )
+                counters.clear()
+                resolution_seconds = 0.0
+                resolution_failed = False
 
         def resolve(shard: refit_pb2.WeightVersionShard) -> TrainerSourceShard:
             identity = (shard.logical_shard_id, shard.worker_id)
             if identity in round_sources:
                 return round_sources[identity]
             key = (shard.metadata_endpoint, shard.stable_metadata_digest)
-            source, checksums = self._resolve_source(shard, stable_sources.get(key))
+            nonlocal resolution_seconds, resolution_failed
+            started = perf_counter()
+            try:
+                source, checksums = self._resolve_source(
+                    shard, stable_sources.get(key), verify=verify, counters=counters
+                )
+            except BaseException:
+                resolution_failed = True
+                raise
+            finally:
+                resolution_seconds += perf_counter() - started
             stable_sources[key] = source
             round_sources[identity] = source
             round_checksums[identity] = checksums
             return source
 
-        selection = None
-        if (
-            cached is not None
-            and cached.mesh_id == version.trainer_mesh_id
-            and cached.mesh_generation == mesh_generation
-            and tuple(sorted(source.source_slot_id for source in cached.shards)) == expected_slots
-        ):
-            matching = []
-            for source in cached.shards:
-                member = mesh_workers.get(source.worker_id)
-                publication = next((
-                    item for item in published[source.source_slot_id]
-                    if item.worker_id == source.worker_id
-                    and item.metadata_endpoint == source.metadata_endpoint
-                    and item.stable_metadata_digest == source.stable_metadata_digest
-                ), None)
-                if (
-                    member is None
-                    or member.logical_shard_id != source.source_slot_id
-                    or member.metadata_endpoint != source.metadata_endpoint
-                    or publication is None
-                ):
-                    break
-                matching.append(publication)
-            if len(matching) == len(cached.shards):
-                try:
-                    for publication in matching:
-                        resolve(publication)
-                except (grpc.RpcError, RuntimeError) as error:
-                    failed_sources.add((publication.logical_shard_id, publication.worker_id))
-                    logger.warning("cached trainer source %s failed: %s", publication.worker_id, error)
-                else:
-                    if envs.MX_RESHARD_PUBLISH_DIGEST:
-                        self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
-                    selection = tuple(
-                        (source.source_slot_id, source.worker_id) for source in cached.shards
+        try:
+            selection = None
+            if (
+                cached is not None
+                and cached.mesh_id == version.trainer_mesh_id
+                and cached.mesh_generation == mesh_generation
+                and tuple(sorted(source.source_slot_id for source in cached.shards)) == expected_slots
+            ):
+                matching = []
+                for source in cached.shards:
+                    member = mesh_workers.get(source.worker_id)
+                    publication = next((
+                        item for item in published[source.source_slot_id]
+                        if item.worker_id == source.worker_id
+                        and item.metadata_endpoint == source.metadata_endpoint
+                        and item.stable_metadata_digest == source.stable_metadata_digest
+                    ), None)
+                    if (
+                        member is None
+                        or member.logical_shard_id != source.source_slot_id
+                        or member.metadata_endpoint != source.metadata_endpoint
+                        or publication is None
+                    ):
+                        break
+                    matching.append(publication)
+                if len(matching) == len(cached.shards):
+                    try:
+                        for publication in matching:
+                            resolve(publication)
+                    except (grpc.RpcError, RuntimeError) as error:
+                        failed_sources.add((publication.logical_shard_id, publication.worker_id))
+                        logger.warning("cached trainer source %s failed: %s", publication.worker_id, error)
+                    else:
+                        if verify:
+                            self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
+                        selection = tuple(
+                            (source.source_slot_id, source.worker_id) for source in cached.shards
+                        )
+                        flush()
+                        yield ResolvedTrainerSource(
+                            snapshot=cached,
+                            checksums={
+                                key: digest for identity in selection
+                                for key, digest in round_checksums[identity].items()
+                            },
+                        )
+
+            slots = []
+            for source_slot_id in expected_slots:
+                ordered = sorted(
+                    (item for item in published[source_slot_id]
+                     if (item.logical_shard_id, item.worker_id) not in failed_sources),
+                    key=lambda item: item.worker_id
+                )
+                if not ordered:
+                    logger.warning(
+                        "no trainer source published for required slot %s",
+                        source_slot_id,
                     )
+                    return
+                slots.append(_SlotReplicas(source_slot_id, ordered, resolve))
+
+            seen: set[tuple[tuple[str, str], ...]] = (
+                {selection} if selection is not None else set()
+            )
+            offset = 0
+            while True:
+                selected = []
+                for slot in slots:
+                    source = slot.usable(offset)
+                    if source is None:
+                        if not slot.usable_count:
+                            logger.warning(
+                                "no usable trainer source for required slot %s",
+                                slot.slot_id,
+                            )
+                            return
+                        # Exhausted and shorter than the candidate index, so cycle
+                        # its healthy replicas rather than give up on a slot that
+                        # simply has fewer of them.
+                        source = slot.usable(offset % slot.usable_count)
+                    selected.append(source)
+                selection = tuple(
+                    (source.source_slot_id, source.worker_id) for source in selected
+                )
+                if selection not in seen:
+                    self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
+                    seen.add(selection)
+                    flush()
                     yield ResolvedTrainerSource(
-                        snapshot=cached,
+                        snapshot=TrainerSourceSnapshot(
+                            mesh_id=version.trainer_mesh_id,
+                            mesh_generation=mesh_generation,
+                            shards=tuple(selected),
+                        ),
                         checksums={
-                            key: digest for identity in selection
-                            for key, digest in round_checksums[identity].items()
+                            key: digest
+                            for source in selected
+                            for key, digest in round_checksums[
+                                (source.source_slot_id, source.worker_id)
+                            ].items()
                         },
                     )
-
-        slots = []
-        for source_slot_id in expected_slots:
-            ordered = sorted(
-                (item for item in published[source_slot_id]
-                 if (item.logical_shard_id, item.worker_id) not in failed_sources),
-                key=lambda item: item.worker_id
-            )
-            if not ordered:
-                logger.warning(
-                    "no trainer source published for required slot %s",
-                    source_slot_id,
-                )
-                return
-            slots.append(_SlotReplicas(source_slot_id, ordered, resolve))
-
-        seen: set[tuple[tuple[str, str], ...]] = (
-            {selection} if selection is not None else set()
-        )
-        offset = 0
-        while True:
-            selected = []
-            for slot in slots:
-                source = slot.usable(offset)
-                if source is None:
-                    if not slot.usable_count:
-                        logger.warning(
-                            "no usable trainer source for required slot %s",
-                            slot.slot_id,
-                        )
-                        return
-                    # Exhausted and shorter than the candidate index, so cycle
-                    # its healthy replicas rather than give up on a slot that
-                    # simply has fewer of them.
-                    source = slot.usable(offset % slot.usable_count)
-                selected.append(source)
-            selection = tuple(
-                (source.source_slot_id, source.worker_id) for source in selected
-            )
-            if selection not in seen:
-                self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
-                seen.add(selection)
-                yield ResolvedTrainerSource(
-                    snapshot=TrainerSourceSnapshot(
-                        mesh_id=version.trainer_mesh_id,
-                        mesh_generation=mesh_generation,
-                        shards=tuple(selected),
-                    ),
-                    checksums={
-                        key: digest
-                        for source in selected
-                        for key, digest in round_checksums[
-                            (source.source_slot_id, source.worker_id)
-                        ].items()
-                    },
-                )
-            deepest = max((slot.usable_count for slot in slots), default=1)
-            if all(slot.exhausted for slot in slots) and offset + 1 >= deepest:
-                return
-            offset += 1
+                deepest = max((slot.usable_count for slot in slots), default=1)
+                if all(slot.exhausted for slot in slots) and offset + 1 >= deepest:
+                    return
+                offset += 1
+        finally:
+            flush()
 
     def _check_current_mesh(self, mesh_id: str, generation: int) -> None:
         current = self._service().GetTrainerMesh(
@@ -331,44 +365,42 @@ class TrainerSourceResolver(SourceResolver):
     def _resolve_source(
         self,
         shard: refit_pb2.WeightVersionShard,
-        cached: TrainerSourceShard | None = None,
+        cached: TrainerSourceShard | None,
+        *,
+        verify: bool,
+        counters: dict[str, int | float],
     ) -> tuple[TrainerSourceShard, dict[ShardChecksumKey, str]]:
         if not shard.metadata_endpoint:
             raise RuntimeError("NIXL source is missing its metadata endpoint")
         if not shard.stable_metadata_digest:
             raise RuntimeError("source is missing its stable metadata digest")
         checksums = {}
-        with refit_span(
-            "source_preparation",
-            metadata={
-                "manifest_cache_hits": int(cached is not None),
-                "manifest_cache_misses": int(cached is None),
-            },
-            accumulate_metadata=True,
-        ) as counters:
-            if cached is None or envs.MX_RESHARD_PUBLISH_DIGEST:
-                with grpc.insecure_channel(
-                    shard.metadata_endpoint,
-                    options=[
-                        ("grpc.max_receive_message_length", _MAX_MANIFEST_MESSAGE_SIZE_BYTES)
-                    ],
-                ) as channel:
-                    stub = refit_pb2_grpc.RefitWorkerServiceStub(channel)
-                    if cached is None:
-                        blob, keys = self._fetch_stable_metadata(stub, shard)
-                        cached = TrainerSourceShard(
-                            source_slot_id=shard.logical_shard_id,
-                            worker_id=shard.worker_id,
-                            stable_metadata_digest=shard.stable_metadata_digest,
-                            metadata_endpoint=shard.metadata_endpoint,
-                            metadata=blob,
-                            checksum_keys=keys,
-                        )
-                        counters.update(manifest_fetch_bytes=len(blob), manifest_fetch_count=1)
-                    if envs.MX_RESHARD_PUBLISH_DIGEST:
-                        checksums = self._fetch_version_metadata(stub, shard, cached.checksum_keys)
-                        counters["version_metadata_fetch_count"] = 1
-            counters["manifest_bytes"] = len(cached.metadata)
+        counters["manifest_cache_hits"] += int(cached is not None)
+        counters["manifest_cache_misses"] += int(cached is None)
+        if cached is None or verify:
+            with grpc.insecure_channel(
+                shard.metadata_endpoint,
+                options=[
+                    ("grpc.max_receive_message_length", _MAX_MANIFEST_MESSAGE_SIZE_BYTES)
+                ],
+            ) as channel:
+                stub = refit_pb2_grpc.RefitWorkerServiceStub(channel)
+                if cached is None:
+                    blob, keys = self._fetch_stable_metadata(stub, shard, counters)
+                    cached = TrainerSourceShard(
+                        source_slot_id=shard.logical_shard_id,
+                        worker_id=shard.worker_id,
+                        stable_metadata_digest=shard.stable_metadata_digest,
+                        metadata_endpoint=shard.metadata_endpoint,
+                        metadata=blob,
+                        checksum_keys=keys,
+                    )
+                    counters["manifest_fetch_bytes"] += len(blob)
+                    counters["manifest_fetch_count"] += 1
+                if verify:
+                    checksums = self._fetch_version_metadata(stub, shard, cached.checksum_keys)
+                    counters["version_metadata_fetch_count"] += 1
+        counters["manifest_bytes"] += len(cached.metadata)
         if cached.source_slot_id != shard.logical_shard_id or cached.worker_id != shard.worker_id:
             cached = TrainerSourceShard(
                 source_slot_id=shard.logical_shard_id,
@@ -381,19 +413,21 @@ class TrainerSourceResolver(SourceResolver):
         return cached, checksums
 
     def _fetch_stable_metadata(
-        self, stub: refit_pb2_grpc.RefitWorkerServiceStub, shard: refit_pb2.WeightVersionShard
+        self,
+        stub: refit_pb2_grpc.RefitWorkerServiceStub,
+        shard: refit_pb2.WeightVersionShard,
+        counters: dict[str, int | float],
     ) -> tuple[bytes, dict[tuple[str, int], ShardChecksumKey]]:
-        with refit_span(
-            "source_preparation",
-            accumulate_metadata=True,
-            duration_key="manifest_fetch_s",
-        ):
+        started = perf_counter()
+        try:
             response = stub.GetTrainerShardMetadata(
                 refit_pb2.GetTrainerShardMetadataRequest(
                     metadata_digest=shard.stable_metadata_digest
                 ),
                 timeout=self._rpc_timeout_seconds,
             )
+        finally:
+            counters["manifest_fetch_s"] += perf_counter() - started
         blob = response.metadata
         if (
             response.metadata_digest != shard.stable_metadata_digest

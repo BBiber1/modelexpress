@@ -11,6 +11,9 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+import modelexpress_rl.inference.source.trainer as trainer_source_module
+
 from modelexpress_rl import WeightPayloadFormat, refit_pb2, refit_pb2_grpc
 from modelexpress_rl.control import WeightVersion, WeightVersionState
 from modelexpress_rl.inference.source import TrainerSourceResolver
@@ -29,13 +32,23 @@ class _Worker(refit_pb2_grpc.RefitWorkerServiceServicer):
             checksums=[refit_pb2.ShardChecksum(tensor_name="weight", digest="first")],
         )
         self.response_digest = ""
+        self.blobs = {}
+        self.clock = None
+        self.stable_failures = 0
+        self.version_failures = 0
 
     def GetTrainerShardMetadata(
         self, request: refit_pb2.GetTrainerShardMetadataRequest, context: grpc.ServicerContext,
     ) -> refit_pb2.GetTrainerShardMetadataResponse:
         self.stable_requests.append(request)
+        if self.clock is not None:
+            self.clock.now += 2
+        if self.stable_failures:
+            self.stable_failures -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "stable metadata unavailable")
+        blob = self.blobs.get(request.metadata_digest, self.blob)
         return refit_pb2.GetTrainerShardMetadataResponse(
-            metadata=self.blob, metadata_digest=hashlib.sha256(self.blob).hexdigest(),
+            metadata=blob, metadata_digest=hashlib.sha256(blob).hexdigest(),
         )
 
     def GetWeightVersionShardMetadata(
@@ -43,6 +56,11 @@ class _Worker(refit_pb2_grpc.RefitWorkerServiceServicer):
         context: grpc.ServicerContext,
     ) -> refit_pb2.GetWeightVersionShardMetadataResponse:
         self.version_requests.append(request)
+        if self.clock is not None:
+            self.clock.now += 3
+        if self.version_failures:
+            self.version_failures -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "version metadata unavailable")
         return refit_pb2.GetWeightVersionShardMetadataResponse(
             metadata=self.metadata, version_metadata_digest=self.response_digest,
         )
@@ -377,3 +395,156 @@ def test_known_replica_physical_drift_rejects_before_worker_rpc(
     assert len(protocol.worker.stable_requests) == stable_calls
     assert len(protocol.worker.version_requests) == version_calls
     assert protocol.control.list_calls == 3
+
+
+@pytest.fixture
+def discovery_timing(
+    protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
+    clock = SimpleNamespace(now=0.0)
+    protocol.worker.clock = clock
+    read_clock = lambda: clock.now
+    monkeypatch.setattr(trainer_source_module, "perf_counter", read_clock)
+    recorder = RefitTimingRecorder(backend="test", version="version-a", clock=read_clock)
+    return SimpleNamespace(clock=clock, recorder=recorder)
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_discovery_timing_accumulates_cold_and_warm_rpc_work(
+    protocol: SimpleNamespace, discovery_timing: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch, verify: bool,
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    with use_refit_timing(discovery_timing.recorder):
+        first_candidates = protocol.resolver.candidates(protocol.version)
+        first = next(first_candidates)
+        first_candidates.close()
+        _remember(protocol, first)
+        second_candidates = protocol.resolver.candidates(_next_version(protocol))
+        second = next(second_candidates)
+        before_close = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+        discovery_timing.clock.now += 100
+        second_candidates.close()
+    stage = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+    assert stage == before_close
+    metrics = stage["metadata"]
+    assert metrics["manifest_list_count"] == protocol.control.list_calls == 2
+    assert metrics["published_shard_count"] == 2
+    assert metrics["manifest_cache_hits"] == 1
+    assert metrics["manifest_cache_misses"] == 1
+    assert metrics["manifest_fetch_count"] == len(protocol.worker.stable_requests) == 1
+    assert metrics["manifest_fetch_bytes"] == len(protocol.worker.blob)
+    assert metrics["manifest_bytes"] == 2 * len(protocol.worker.blob)
+    assert metrics.get("version_metadata_fetch_count", 0) == len(protocol.worker.version_requests) == (2 if verify else 0)
+    assert list(second.checksums.values()) == (["second"] if verify else [])
+    assert metrics["manifest_fetch_s"] == 2
+    assert stage["duration_ms"] == (8000 if verify else 2000)
+
+
+@pytest.mark.parametrize("failure", ["stable", "version"])
+def test_discovery_timing_retains_partial_failed_rpc_work_before_fallback(
+    protocol: SimpleNamespace, discovery_timing: SimpleNamespace, failure: str,
+) -> None:
+    alternative = refit_pb2.WeightVersionShard()
+    alternative.CopyFrom(protocol.control.shards[0])
+    alternative.worker_id = "trainer-b"
+    protocol.worker.metadata.worker_id = "trainer-b"
+    _advertise(protocol)
+    alternative.version_metadata_digest = protocol.control.shards[0].version_metadata_digest
+    protocol.control.shards.append(alternative)
+    if failure == "stable":
+        protocol.worker.stable_failures = 1
+    else:
+        protocol.worker.version_failures = 1
+    with use_refit_timing(discovery_timing.recorder):
+        candidates = protocol.resolver.candidates(protocol.version)
+        resolved = next(candidates)
+        before_close = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+        candidates.close()
+    stage = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+    assert stage == before_close
+    assert resolved.snapshot.shards[0].worker_id == "trainer-b"
+    assert list(resolved.checksums.values()) == ["first"]
+    metrics = stage["metadata"]
+    assert metrics["manifest_list_count"] == protocol.control.list_calls == 1
+    assert metrics["published_shard_count"] == 2
+    assert metrics["manifest_cache_misses"] == 2
+    assert metrics.get("manifest_cache_hits", 0) == 0
+    successful_stable_fetches = 1 if failure == "stable" else 2
+    assert len(protocol.worker.stable_requests) == 2
+    assert metrics["manifest_fetch_count"] == successful_stable_fetches
+    assert metrics["manifest_fetch_bytes"] == successful_stable_fetches * len(protocol.worker.blob)
+    assert metrics["version_metadata_fetch_count"] == 1
+    assert len(protocol.worker.version_requests) == (1 if failure == "stable" else 2)
+    assert metrics["manifest_bytes"] == len(protocol.worker.blob)
+    assert metrics["manifest_fetch_s"] == 4
+    assert stage["duration_ms"] == (7000 if failure == "stable" else 10000)
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_lazy_discovery_timing_excludes_consumer_pause_and_flushes_once(
+    protocol: SimpleNamespace, discovery_timing: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch, resume: bool,
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    alternative = refit_pb2.WeightVersionShard()
+    alternative.CopyFrom(protocol.control.shards[0])
+    alternative.worker_id = "trainer-b"
+    payload = json.loads(protocol.worker.blob)
+    payload["tensors"][0]["shards"][0]["addr"] = 8192
+    alternative_blob = json.dumps(payload).encode()
+    alternative.stable_metadata_digest = hashlib.sha256(alternative_blob).hexdigest()
+    protocol.worker.blobs[alternative.stable_metadata_digest] = alternative_blob
+    protocol.control.shards.append(alternative)
+    with use_refit_timing(discovery_timing.recorder):
+        candidates = protocol.resolver.candidates(protocol.version)
+        first = next(candidates)
+        first_stage = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+        assert first.snapshot.shards[0].worker_id == "trainer-0"
+        assert first_stage["metadata"]["manifest_fetch_count"] == 1
+        discovery_timing.clock.now += 100
+        if resume:
+            second = next(candidates)
+            assert second.snapshot.shards[0].worker_id == "trainer-b"
+        before_close = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+        discovery_timing.clock.now += 100
+        candidates.close()
+    stage = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+    assert stage == before_close
+    metrics = stage["metadata"]
+    resolved_count = 2 if resume else 1
+    assert metrics["manifest_list_count"] == protocol.control.list_calls == 1
+    assert metrics["published_shard_count"] == 2
+    assert metrics["manifest_fetch_count"] == len(protocol.worker.stable_requests) == resolved_count
+    assert metrics["manifest_cache_misses"] == resolved_count
+    assert metrics.get("manifest_cache_hits", 0) == 0
+    assert metrics["manifest_fetch_bytes"] == len(protocol.worker.blob) + (len(alternative_blob) if resume else 0)
+    assert metrics["manifest_bytes"] == metrics["manifest_fetch_bytes"]
+    assert metrics["manifest_fetch_s"] == resolved_count * 2
+    assert stage["duration_ms"] == resolved_count * 2000
+    assert protocol.worker.version_requests == []
+
+
+@pytest.mark.parametrize("failure", ["stable", "version"])
+def test_exhausted_discovery_flushes_failed_rpc_timing(
+    protocol: SimpleNamespace, discovery_timing: SimpleNamespace, failure: str,
+) -> None:
+    if failure == "stable":
+        protocol.worker.stable_failures = 1
+    else:
+        protocol.worker.version_failures = 1
+    with use_refit_timing(discovery_timing.recorder):
+        assert list(protocol.resolver.candidates(protocol.version)) == []
+    stage = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
+    metrics = stage["metadata"]
+    assert metrics["manifest_list_count"] == protocol.control.list_calls == 1
+    assert metrics["published_shard_count"] == 1
+    assert metrics["manifest_cache_misses"] == 1
+    assert metrics.get("manifest_fetch_count", 0) == (0 if failure == "stable" else 1)
+    assert metrics.get("manifest_fetch_bytes", 0) == (0 if failure == "stable" else len(protocol.worker.blob))
+    assert metrics.get("manifest_bytes", 0) == 0
+    assert metrics.get("version_metadata_fetch_count", 0) == 0
+    assert len(protocol.worker.stable_requests) == 1
+    assert len(protocol.worker.version_requests) == (0 if failure == "stable" else 1)
+    assert metrics["manifest_fetch_s"] == 2
+    assert stage["duration_ms"] == (2000 if failure == "stable" else 5000)

@@ -1836,7 +1836,13 @@ warm preparation. Cold discovery validates and freezes new metadata before
 planning. The snapshot contains only host metadata; it owns no tensors,
 transport handles, current version checksums or source leases. Custom or mutable
 source rows retain field-by-field validation on the cold path. Snapshot
-construction is charged to source preparation on a miss.
+construction is charged to source preparation on a miss. Trainer discovery
+accumulates cache, fetch and verification counters across the sources needed
+for each candidate and flushes them before yielding, on failure or on close.
+Stable RPC time is reported separately within resolution time; waiting for the
+consumer to transfer or install a yielded candidate is excluded. Failed RPCs
+retain elapsed time, while fetch and verification counts record successful
+validation.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back
