@@ -159,6 +159,7 @@ def test_publication_rejects_stale_generation_before_any_write(
         "worker",
         "1",
         "endpoint",
+        "stable-digest",
     ]
     redis_command("HSET", "mesh", "generation", "2")
     assert (

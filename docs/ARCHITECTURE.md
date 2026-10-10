@@ -579,6 +579,10 @@ and the trainer endpoint. Generators validate the identities, hashes, and checks
 coverage before reading tensor bytes, and keep fresh version checksums separate from
 cached source geometry and transfer plans. With checksum verification disabled,
 trainers publish no version checksum record and generators make no version metadata RPC.
+The first publication pins each worker/logical-shard stable metadata digest in the
+current mesh generation. Redis rejects a different digest before publishing that
+shard or advancing readiness. Pins survive version release and unchanged or failed
+mesh updates; only a successful generation change clears them.
 Stable metadata remains available for the worker process lifetime. Releasing a trainer
 shard removes its optional version checksum record only after central deletion succeeds;
 the service rejects deletion while a version lease is active.
