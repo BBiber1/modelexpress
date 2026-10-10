@@ -72,9 +72,10 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             self.registered = {}
 
         def initialize(self) -> None:
-            pass
+            events.append("initialize")
 
         def shutdown(self) -> None:
+            events.append("shutdown")
             self.registered.clear()
 
         def add_remote_agent(self, metadata) -> str:
@@ -85,11 +86,13 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             self.registered.update(tensors)
 
         def register_dram_buffer(self, tensor) -> object:
+            events.append("register")
             handle = object()
             self.registered[handle] = tensor
             return handle
 
         def deregister_memory(self, handle) -> None:
+            events.append("deregister")
             del self.registered[handle]
 
     class Transport:
@@ -211,7 +214,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
     transfer.close()
 
 
-def _check_values(harness, installed):
+def _check_values(harness, installed, *, exact_rows: int | None = None) -> None:
     for source, name, dtype, transpose in (
         ("exact", "a.weight", torch.float32, False),
         ("full", "b.weight", torch.float32, True),
@@ -220,6 +223,8 @@ def _check_values(harness, installed):
     ):
         expected = torch.zeros(20, dtype=dtype)
         value = harness.sources[source]
+        if source == "exact" and exact_rows is not None:
+            value = value[:exact_rows]
         expected[2:18].copy_((value.T if transpose else value).reshape(-1))
         assert torch.equal(installed[name], expected)
 
@@ -401,6 +406,33 @@ def test_reset_and_close_release_arenas_and_handles(harness, cleanup) -> None:
     gc.collect()
     assert all(reference() is None for reference in arena_refs)
     assert transport_ref() is None
+
+
+def _larger_source_snapshot(harness) -> tuple[TrainerSourceSnapshot, list[torch.Tensor]]:
+    source = harness.sources["exact"]
+    rows = [source[start:start + 2].clone() for start in range(0, source.shape[0], 2)]
+    blob = wrap_rendezvous_blob(
+        b"source", "source", "source:19000",
+        [
+            PublishedTensor(
+                name=name, dtype="torch.float32", elsize=4,
+                full_shape=tuple(source.shape) if name == "exact" else (4, 4),
+                shards=[
+                    PublishedShard(
+                        agent_name="source", device_id=0, addr=value.data_ptr(),
+                        shard_offset=(2 * index, 0), shape=(2, 4),
+                    ) for index, value in enumerate(rows)
+                ] if name == "exact" else [PublishedShard(
+                    agent_name="source", device_id=0, addr=tensor.data_ptr(),
+                    shard_offset=(0, 0), shape=(4, 4),
+                )],
+            ) for name, tensor in harness.sources.items()
+        ],
+    )
+    snapshot = TrainerSourceSnapshot("mesh", 2, (TrainerSourceShard(
+        "slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob,
+    ),))
+    return snapshot, rows
 
 
 @pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu"), True)], indirect=True)
@@ -599,3 +631,97 @@ def test_partial_iteration_reports_all_eager_descriptor_builds(harness) -> None:
     assert len(prepared.transport.posts) < len(prepared.batches)
     iterator.close()
     assert prepared.transport.awaited == prepared.transport.posted
+
+
+@pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu", buffers), buffers == 2) for buffers in (1, 2)], indirect=True)
+def test_larger_source_scratch_grows_then_reuses_capacity(harness) -> None:
+    if harness.streaming.staging_buffers == 1:
+        exact = harness.sources["exact"]
+        harness.sources["exact"] = torch.cat((exact, torch.zeros((16, 4), dtype=exact.dtype)))
+        for copy in harness.capture.copies:
+            if copy.src_name == "exact":
+                copy.op_chain = (("__getitem__", (slice(0, 4),), ()),)
+    initial = harness.prepare()
+    cold, installed = harness.collect(initial)
+    _check_values(harness, installed, exact_rows=4)
+    for tensor in harness.sources.values():
+        tensor.add_(5)
+    snapshot, _rows = _larger_source_snapshot(harness)
+    blob = snapshot.shards[0].metadata
+    larger = harness.transfer.prepare_streaming(
+        manifests=[blob], trainer_snapshot=snapshot,
+        capture_layout=lambda _: (harness.capture, harness.layout),
+    )
+    grown, installed = harness.collect(larger)
+    _check_values(harness, installed, exact_rows=4)
+    assert grown["staging_peak_bytes"] > cold["staging_peak_bytes"]
+    assert grown["staging_peak_bytes"] <= harness.streaming.max_staging_bytes
+    current_addresses = {arena.data_ptr() for arena in harness.transfer._staging_arenas}
+    assert harness.events.count("connect:source") == 2
+    registered = list(harness.transfer._manager.registered.values())
+    assert sum(value.numel() for value in registered) == grown["staging_peak_bytes"]
+    for descriptors in larger.transport.posts:
+        assert all(any(
+            value.data_ptr() <= descriptor.dst_addr
+            and descriptor.dst_addr + descriptor.nbytes <= value.data_ptr() + value.numel()
+            for value in registered
+        ) for descriptor in descriptors)
+    transition = harness.events[harness.events.index("shutdown"):]
+    assert transition.index("shutdown") < transition.index("initialize") < transition.index("connect:source") < transition.index("register") < transition.index("post")
+    for tensor in harness.sources.values():
+        tensor.add_(2)
+    smaller = harness.prepare(generation=3)
+    retained, installed = harness.collect(smaller)
+    _check_values(harness, installed, exact_rows=4)
+    assert retained["staging_peak_bytes"] == grown["staging_peak_bytes"]
+    assert {arena.data_ptr() for arena in harness.transfer._staging_arenas} == current_addresses
+    assert harness.events.count("connect:source") == 2
+    assert larger.transport.awaited == larger.transport.posted
+    assert smaller.transport.awaited == smaller.transport.posted
+
+
+@pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu", 2), True)], indirect=True)
+def test_borrowed_manager_rejects_growth_without_native_teardown(harness, monkeypatch) -> None:
+    harness.collect(harness.prepare())
+    snapshot, _rows = _larger_source_snapshot(harness)
+    registrations = [(value.data_ptr(), value.numel()) for value in harness.transfer._manager.registered.values()]
+    harness.events.clear()
+    with monkeypatch.context() as borrowed:
+        borrowed.setattr(harness.transfer, "_owns_manager", False)
+        with pytest.raises(RuntimeError, match="transfer-owned NIXL agent"):
+            harness.transfer.prepare_streaming(
+                manifests=[snapshot.shards[0].metadata], trainer_snapshot=snapshot,
+                capture_layout=lambda _: (harness.capture, harness.layout),
+            )
+    assert not any(event in harness.events for event in ("shutdown", "post", "register", "deregister"))
+    assert [(value.data_ptr(), value.numel()) for value in harness.transfer._manager.registered.values()] == registrations
+
+
+@pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu", 2), True)], indirect=True)
+def test_owned_growth_registration_failure_cleans_up_before_retry(harness, monkeypatch) -> None:
+    harness.collect(harness.prepare())
+    snapshot, _rows = _larger_source_snapshot(harness)
+    harness.events.clear()
+
+    def fail_registration(_tensor: torch.Tensor) -> None:
+        harness.events.append("register_failed")
+        raise RuntimeError("growth registration failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(harness.transfer._manager, "register_dram_buffer", fail_registration)
+        with pytest.raises(RuntimeError, match="growth registration failed"):
+            harness.transfer.prepare_streaming(
+                manifests=[snapshot.shards[0].metadata], trainer_snapshot=snapshot,
+                capture_layout=lambda _: (harness.capture, harness.layout),
+            )
+    assert "post" not in harness.events
+    assert harness.transfer._manager.registered == {}
+    assert harness.events.index("shutdown") < harness.events.index("initialize") < harness.events.index("connect:source") < harness.events.index("register_failed")
+    assert harness.events[-1] == "shutdown"
+    recovered = harness.transfer.prepare_streaming(
+        manifests=[snapshot.shards[0].metadata], trainer_snapshot=snapshot,
+        capture_layout=lambda _: (harness.capture, harness.layout),
+    )
+    _, installed = harness.collect(recovered)
+    _check_values(harness, installed)
+    assert recovered.transport.awaited == recovered.transport.posted

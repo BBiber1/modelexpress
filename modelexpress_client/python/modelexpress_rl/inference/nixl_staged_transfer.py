@@ -208,6 +208,10 @@ class _StreamingSchedule:
     module_batches: tuple[_StreamingBatch, ...]
     batches: tuple[_StreamingBatch, ...]
     fingerprint: str | None = None
+    arena_bytes: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arena_bytes", max(batch.nbytes for batch in self.batches))
 
 
 class _BoundedReadDescriptor(NamedTuple):
@@ -1372,6 +1376,8 @@ class _NixlStagedTransfer:
             cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, compiled
             ))
+            if self._staging_arenas and self._staging_arenas[0].numel() < compiled.arena_bytes:
+                self.reset_workspace()
             transport = self._connect_sources(
                 resolved, cached.required_agent_metadata, host_staging=staging_device == "cpu"
             )
@@ -1379,7 +1385,7 @@ class _NixlStagedTransfer:
                 cached.bounded_workspace is None
                 or cached.bounded_workspace.generation != self._workspace_generation
             ):
-                self._prepare_arenas(compiled.batches)
+                self._prepare_arenas(compiled.arena_bytes)
             metrics["connection_registration_s"] = time.perf_counter() - started
             binding = cached.bounded_workspace
             reused_binding = (
@@ -1405,13 +1411,12 @@ class _NixlStagedTransfer:
 
     def _prepare_arenas(
         self,
-        batches: tuple[_StreamingBatch, ...],
+        arena_bytes: int,
     ) -> None:
         streaming = cast(StreamingSettings, self._streaming)
         buffer_budget = cast(int, self._buffer_budget)
         staging_device = streaming.staging_device
         staging_buffers = streaming.staging_buffers
-        arena_bytes = max(batch.nbytes for batch in batches)
         if not self._staging_arenas:
             self._staging_device = torch.device(staging_device)
             for index in range(staging_buffers):
@@ -1427,10 +1432,6 @@ class _NixlStagedTransfer:
                     self._manager.register_tensors(
                         {f"__bounded_arena_{index}__": arena}
                     )
-        elif self._staging_arenas[0].numel() < arena_bytes:
-            raise RuntimeError(
-                "bounded workspace layout grew; restart the generator engine"
-            )
         if self._staging_arenas[0].numel() > buffer_budget:
             raise RuntimeError("existing bounded arena exceeds the requested limit")
 

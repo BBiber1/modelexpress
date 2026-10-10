@@ -1822,7 +1822,10 @@ hardware. Trainer staging mode and receiver arena location are separate choices.
 The compiled bounded plan owns a destination binding with typed arena views,
 READ descriptors, selected source rows, reconstruction and conversion views,
 and byte totals prepared before the first READ. Warm preparations reuse that
-binding without rebuilding views or scanning arena geometry. Workspace
+binding without rebuilding views or scanning arena geometry. Sufficient arena capacity is reused without shrinking across compatible
+successful preparations. A larger validated schedule grows within the fixed
+budget by resetting the owned agent before reconnecting and registering new
+arenas; a borrowed agent cannot be torn down for growth. Workspace
 registration changes invalidate the binding; reset and failed preparation
 retain #877's physical-plan invalidation and storage cleanup.
 `MX_REFIT_DEBUG_VALIDATE_WORKSPACE=1` additionally checks arena identities and
