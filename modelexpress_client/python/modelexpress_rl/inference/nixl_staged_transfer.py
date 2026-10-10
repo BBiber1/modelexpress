@@ -17,7 +17,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -267,8 +267,8 @@ class _BoundedPlanCache:
         if copy_key_on_miss and not self._compile_lock.acquire(blocking=False):
             raise RuntimeError("bounded plan compilation is already in progress")
         try:
-            with telemetry.span("mx.refit.bounded_plan_compile"):
-                return self._compile(
+            with telemetry.span("mx.refit.bounded_plan_compile") as span:
+                compiled = self._compile(
                     manifests=manifests,
                     resolved=resolved,
                     capture=capture,
@@ -282,6 +282,44 @@ class _BoundedPlanCache:
                     total_staging_bytes=total_staging_bytes,
                     source_snapshot=source_snapshot,
                 )
+                if span.is_recording():
+                    span.set_attributes(
+                        {
+                            "plan_cache.enabled": bool(metrics["plan_cache_enabled"]),
+                            "plan_cache.hits": metrics["plan_cache_hits"],
+                            "plan_cache.misses": metrics["plan_cache_misses"],
+                            "plan_cache.lookup_s": metrics["plan_cache_lookup_s"],
+                            "plan_cache.validate_s": metrics["plan_cache_validate_s"],
+                            "plan_cache.fingerprint_s": metrics[
+                                "plan_cache_fingerprint_s"
+                            ],
+                            "plan_cache.key_copies": metrics["plan_cache_key_copies"],
+                            "source_cache.enabled": bool(
+                                metrics.get("source_cache_enabled", 0)
+                            ),
+                            "source_cache.hits": metrics.get("source_cache_hits", 0),
+                            "source_cache.misses": metrics.get(
+                                "source_cache_misses", 0
+                            ),
+                            "initial_whole_plan_s": metrics["initial_whole_plan_s"],
+                            "initial_whole_validation_s": metrics[
+                                "initial_whole_validation_s"
+                            ],
+                            "bounded_whole_plan_s": metrics["bounded_whole_plan_s"],
+                            "bounded_whole_plan_builds": metrics[
+                                "bounded_whole_plan_builds"
+                            ],
+                            "bounded_whole_validation_s": metrics[
+                                "bounded_whole_validation_s"
+                            ],
+                            "owner_plan_s": metrics["owner_plan_s"],
+                            "owner_validation_s": metrics["owner_validation_s"],
+                            "owner_plan_builds": metrics["owner_plan_builds"],
+                            "module_batches": len(compiled.module_batches),
+                            "batches": len(compiled.batches),
+                        }
+                    )
+                return compiled
         finally:
             if copy_key_on_miss:
                 self._compile_lock.release()
@@ -645,9 +683,7 @@ def _merge_plan(target: TensorTransferPlan, source: TensorTransferPlan) -> None:
     target.exact_bytes += source.exact_bytes
 
 
-def _plan_staged_transfer(
-    capture: CaptureResult, sources: dict
-) -> TensorTransferPlan:
+def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TensorTransferPlan:
     """Plan reads for each source.
 
     Default: minimal slice reads via plan_transfer (a partial read of a shard cannot
@@ -1081,10 +1117,14 @@ class _NixlStagedTransfer:
                     manifests, capture_layout, metrics, trainer_snapshot
                 )
                 started = time.perf_counter()
-                plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
+                with telemetry.span("mx.refit.transfer_planning"):
+                    plan = _plan_staged_transfer(
+                        capture, trainer.resolved_metadata.sources
+                    )
                 metrics["initial_whole_plan_s"] = time.perf_counter() - started
                 validation_started = time.perf_counter()
-                self._validate_complete(capture, dict(parameter_layout), plan)
+                with telemetry.span("mx.refit.transfer_validation"):
+                    self._validate_complete(capture, dict(parameter_layout), plan)
                 metrics["initial_whole_validation_s"] = (
                     time.perf_counter() - validation_started
                 )
@@ -1092,9 +1132,7 @@ class _NixlStagedTransfer:
             resolved = trainer.resolved_metadata
             with telemetry.span("mx.refit.required_agents"):
                 required_metadata = _required_agent_metadata(plan, resolved)
-            transport = self._connect_sources(
-                resolved, required_metadata
-            )
+            transport = self._connect_sources(resolved, required_metadata)
             self._ensure_workspace(plan, parameter_layout)
             if not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
