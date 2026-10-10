@@ -2507,3 +2507,136 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
     del model.tied
     with pytest.raises(AttributeError):
         installer._restore_parameter_aliases(aliases)
+
+
+@pytest.fixture
+def load_time_installer(monkeypatch) -> tuple:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.full((2, 2), 7.0))
+            self.defect = None
+            self.load_shape = (2, 2)
+            self.fail_trace = self.fail_restore = False
+
+        def load_weights(self, weights) -> None:
+            if self.fail_trace:
+                raise RuntimeError("trace failed")
+            for _, tensor in weights:
+                self.weight.weight_loader(self.weight, tensor[: self.load_shape[0], :2])
+            if self.defect == "shape":
+                self.weight = nn.Parameter(torch.empty(1, 2, device="meta"))
+            elif self.defect == "dtype":
+                self.weight = nn.Parameter(
+                    torch.empty(2, 2, dtype=torch.bfloat16, device="meta")
+                )
+            elif self.defect == "name":
+                self.extra = nn.Parameter(torch.empty(1, device="meta"))
+
+    class Info:
+        def __init__(self, model) -> None:
+            self.kernel_tensors = (dict(model._parameters), {})
+
+        def reset(self) -> None:
+            self.kernel_tensors = None
+
+    def initialize(model) -> None:
+        layerwise.LAYERWISE_INFO[model] = Info(model)
+        model.weight = nn.Parameter(torch.empty(model.load_shape, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise._get_original_loader = lambda parameter: None
+
+    def place(model, info) -> None:
+        model._parameters.clear()
+        model._parameters.update(info.kernel_tensors[0])
+        if model.fail_restore:
+            raise RuntimeError("restore failed")
+
+    layerwise._place_kernel_tensors = place
+    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    weight_utils.default_weight_loader = lambda parameter, tensor: parameter.data.copy_(
+        tensor
+    )
+    monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
+    model = Model()
+    original = model.weight
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    return installer, model, original
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("defect", ["shape", "dtype", "name"])
+def test_capture_rejects_source_layout_drift_and_restores_live_weights(
+    load_time_installer, warm, bounded, defect
+) -> None:
+    from modelexpress.refit.reshard.rendezvous import (
+        PublishedTensor, PublishedShard, wrap_rendezvous_blob,
+    )
+    from modelexpress_rl.inference.nixl_staged_transfer import _NixlStagedTransfer
+    from modelexpress_rl.inference.plan import StreamingSettings, TrainerSourceSnapshot
+    installer, model, original = load_time_installer
+    if warm:
+        installer.capture([("weight", torch.float32, (3, 3))])
+    model.defect = defect
+    native_events = []
+    manager = SimpleNamespace(
+        add_remote_agent=lambda _: native_events.append("connect"),
+        register_tensors=lambda _: native_events.append("register"),
+    )
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cuda:0"),
+        manager=manager,
+        streaming=StreamingSettings(512, "cpu") if bounded else None,
+    )
+    manifest = wrap_rendezvous_blob(
+        b"source", "source", "source:19000",
+        [PublishedTensor(
+            name="weight", dtype="torch.float32", elsize=4, full_shape=(4, 4),
+            shards=[PublishedShard(
+                agent_name="source", device_id=0, addr=1234,
+                shard_offset=(0, 0), shape=(4, 4),
+            )],
+        )],
+    )
+    prepare = transfer.prepare_streaming if bounded else transfer.prepare_full_copy
+    with pytest.raises(IncompleteRefit, match="changed the engine load-time layout"):
+        prepare(
+            manifests=[manifest], capture_layout=installer.capture,
+            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
+        )
+    assert native_events == []
+    assert model.weight is original
+    assert torch.equal(model.weight, torch.full((2, 2), 7.0))
+    assert set(dict(model.named_parameters())) == {"weight"}
+    model.defect = None
+    capture, layout = installer.capture([("weight", torch.float32, (4, 4))])
+    assert layout == {"weight": ((2, 2), torch.float32)}
+    assert capture.copies[0].dest_shape == (2, 2)
+    assert model.weight is original
+
+
+@pytest.mark.parametrize("failure", ["trace", "restore"])
+def test_failed_initial_capture_does_not_fix_destination_requirements(
+    load_time_installer, failure
+) -> None:
+    installer, model, original = load_time_installer
+    setattr(model, f"fail_{failure}", True)
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        installer.capture([("weight", torch.float32, (3, 3))])
+    assert model.weight is original
+    assert torch.equal(model.weight, torch.full((2, 2), 7.0))
+    setattr(model, f"fail_{failure}", False)
+    model.load_shape = (1, 2)
+    capture, layout = installer.capture([("weight", torch.float32, (3, 3))])
+    assert layout == {"weight": ((1, 2), torch.float32)}
+    assert capture.copies[0].dest_shape == (1, 2)
+    assert model.weight is original

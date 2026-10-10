@@ -272,7 +272,7 @@ def capture_installer(monkeypatch):
 
 def test_real_capture_cache_uses_snapshot_for_slicing_and_retains_invalidation(
     capture_installer,
-):
+) -> None:
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
     cold, _ = installer.capture(manifest)
@@ -290,12 +290,13 @@ def test_real_capture_cache_uses_snapshot_for_slicing_and_retains_invalidation(
     installer.capture([("weight", torch.float32, (4, 4))])
     assert model.capture_calls == 2
     model.weight = nn.Parameter(torch.zeros(1, 2))
+    with pytest.raises(module.IncompleteRefit, match="fixed destination requirements"):
+        installer.capture(manifest)
+    assert torch.equal(model.weight, torch.zeros(1, 2))
+    model.weight = nn.Parameter(torch.zeros(2, 2))
     changed, changed_layout = installer.capture(manifest)
-    assert model.capture_calls == 3
-    assert changed.copies[0].dest_shape == (1, 2)
-    assert changed_layout == {"weight": ((1, 2), torch.float32)}
-    assert installer.capture(manifest) == (changed, changed_layout)
-    assert model.capture_calls == 3
+    assert changed.copies[0].dest_shape == (2, 2)
+    assert changed_layout == {"weight": ((2, 2), torch.float32)}
 
 
 def test_failed_fresh_capture_discards_snapshot(capture_installer, monkeypatch):

@@ -1826,7 +1826,12 @@ installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.
 
 Trainer source rows and source-to-engine mappings are owned snapshots inside one
-weight update plan. `SourceToEngineMapping` records loader geometry;
+weight update plan. The installer fixes destination names, shapes and dtypes from
+load-time engine state after layerwise initialization and tied-parameter
+restoration, before tracing a source. It compares the resulting layout on the
+first capture and every replacement, and publishes requirements only after
+capture, comparison and live-engine restoration succeed. A later source mapping
+cannot redefine the engine requirements. `SourceToEngineMapping` records loader geometry;
 `TensorTransferPlan` describes physical reads and conversions, and a bounded
 `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
 With source caching enabled, byte-identical ordered manifests reuse the resolved

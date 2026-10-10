@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from functools import cached_property
 from inspect import getattr_static
 from pathlib import Path
-from types import GetSetDescriptorType
+from types import GetSetDescriptorType, MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
@@ -577,6 +577,9 @@ class _VllmInstaller(EngineInstaller):
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
         self._capture_cache = None
+        self._engine_requirements: Mapping[
+            str, tuple[tuple[int, ...], torch.dtype]
+        ] | None = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
     @cached_property
@@ -825,6 +828,17 @@ class _VllmInstaller(EngineInstaller):
             initialize_layerwise_reload(model)
             try:
                 self._restore_parameter_aliases(aliases)
+                requirements = {
+                    name: (tuple(parameter.shape), parameter.dtype)
+                    for name, parameter in model.named_parameters()
+                }
+                if (
+                    self._engine_requirements is not None
+                    and requirements != self._engine_requirements
+                ):
+                    raise IncompleteRefit(
+                        "engine load-time layout differs from fixed destination requirements"
+                    )
                 # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
                 for _, param in model.named_parameters():
                     param.weight_loader = original_loader(param)
@@ -839,6 +853,10 @@ class _VllmInstaller(EngineInstaller):
                     name: (tuple(p.shape), p.dtype)
                     for name, p in model.named_parameters()
                 }
+                if param_layout != requirements:
+                    raise IncompleteRefit(
+                        "captured source mapping changed the engine load-time layout"
+                    )
             finally:
                 for layer in model.modules():
                     info = LAYERWISE_INFO.get(layer)
@@ -846,6 +864,8 @@ class _VllmInstaller(EngineInstaller):
                         if info.kernel_tensors is not None:
                             _place_kernel_tensors(layer, info)
                         info.reset()
+        if self._engine_requirements is None:
+            self._engine_requirements = MappingProxyType(requirements)
         logger.info(
             "captured %d copies and %d unsupported sources (quantized=%s)",
             len(capture.copies),
