@@ -17,7 +17,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -111,10 +111,11 @@ class _ResolvedSources:
 class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
     source_mapping: SourceToEngineMapping
-    parameter_layout: MappingProxyType
+    parameter_layout: Mapping
     transfer_plan: TensorTransferPlan | _StreamingSchedule
     key: tuple | None
     manifests: tuple[bytes, ...]
+    source_mapping_key: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,7 @@ class _StagedNixlWeights:
 _StagingLayout = dict[str, tuple[tuple[int, ...], torch.dtype]]
 _CaptureLayout = Callable[
     [list[tuple[str, torch.dtype, tuple[int, ...]]]],
-    tuple[SourceToEngineMapping, _StagingLayout],
+    tuple[SourceToEngineMapping, Mapping[str, tuple[tuple[int, ...], torch.dtype]]],
 ]
 
 
@@ -917,11 +918,13 @@ class _NixlStagedTransfer:
         capture_layout: _CaptureLayout,
         metrics: dict[str, float],
         trainer_snapshot: TrainerSourceSnapshot,
+        source_mapping_key: Callable | None = None,
     ) -> tuple[
         TrainerSourceSnapshot,
         SourceToEngineMapping,
-        _StagingLayout,
+        Mapping[str, tuple[tuple[int, ...], torch.dtype]],
         _SourceSnapshot | None,
+        tuple | None,
     ]:
         started = time.perf_counter()
         resolved, frozen = self._resolve_metadata(manifests, metrics)
@@ -936,10 +939,25 @@ class _NixlStagedTransfer:
         ]
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        capture, parameter_layout = capture_layout(manifest)
-        capture, parameter_layout = deepcopy((capture, parameter_layout))
+        key = source_mapping_key(manifest) if source_mapping_key is not None else None
+        previous = self._weight_update_plan
+        if (
+            previous is not None
+            and key is not None
+            and key == previous.source_mapping_key
+        ):
+            capture = previous.source_mapping
+            parameter_layout = previous.parameter_layout
+        else:
+            capture, parameter_layout = capture_layout(manifest)
+            capture = deepcopy(capture)
+            if not isinstance(parameter_layout, MappingProxyType):
+                parameter_layout = MappingProxyType(deepcopy(parameter_layout))
+            key = (
+                source_mapping_key(manifest) if source_mapping_key is not None else None
+            )
         metrics["layout_capture_s"] = time.perf_counter() - started
-        return trainer, capture, parameter_layout, frozen
+        return trainer, capture, parameter_layout, frozen, key
 
     def _connect_sources(
         self,
@@ -1011,32 +1029,60 @@ class _NixlStagedTransfer:
         manifests: list[bytes],
         capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot,
+        source_mapping_key: Callable | None = None,
     ) -> _PreparedNixlTransfer:
         """Create a version-scoped transfer over one reusable full-copy plan."""
         if self._streaming is not None:
             raise RuntimeError("this transfer owns bounded staging storage")
         with self._preparing():
             self._descriptor_cache = None
-            previous, self._weight_update_plan = self._weight_update_plan, None
+            previous = self._weight_update_plan
+            metrics = {}
+            layout = (
+                self._resolve_layout(
+                    manifests,
+                    capture_layout,
+                    metrics,
+                    trainer_snapshot,
+                    source_mapping_key,
+                )
+                if source_mapping_key is not None
+                else None
+            )
+            self._weight_update_plan = None
             reusable = (
                 previous is not None
                 and isinstance(previous.transfer_plan, TensorTransferPlan)
                 and previous.key == trainer_snapshot.physical_fingerprint
+                and (
+                    layout is None
+                    or (
+                        layout[4] is not None
+                        and layout[4] == previous.source_mapping_key
+                    )
+                )
             )
-            metrics = {
-                "plan_cache_hits": int(reusable),
-                "plan_cache_misses": int(not reusable),
-            }
+            metrics.update(
+                plan_cache_hits=int(reusable), plan_cache_misses=int(not reusable)
+            )
             if reusable:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.source_mapping
                 parameter_layout = previous.parameter_layout
                 plan = previous.transfer_plan
+                if layout is not None:
+                    trainer, capture, parameter_layout, _, mapping_key = layout
+                else:
+                    mapping_key = previous.source_mapping_key
                 if tuple(manifests) != previous.manifests:
-                    self._weight_update_plan = previous
-                    resolved, frozen = self._resolve_metadata(manifests, metrics)
-                    self._weight_update_plan = None
-                    old = trainer.resolved_metadata
+                    if layout is None:
+                        self._weight_update_plan = previous
+                        resolved, frozen = self._resolve_metadata(manifests, metrics)
+                        self._weight_update_plan = None
+                    else:
+                        resolved = trainer.resolved_metadata
+                        frozen = layout[3]
+                    old = previous.trainer_source_snapshot.resolved_metadata
                     if set(resolved.sources) != set(old.sources) or any(
                         _source_structure(source)
                         != _source_structure(old.sources[name])
@@ -1054,8 +1100,11 @@ class _NixlStagedTransfer:
                     )
                     metrics["manifest_refreshes"] = 1
             else:
-                trainer, capture, parameter_layout, _ = self._resolve_layout(
-                    manifests, capture_layout, metrics, trainer_snapshot
+                trainer, capture, parameter_layout, _, mapping_key = (
+                    layout
+                    or self._resolve_layout(
+                        manifests, capture_layout, metrics, trainer_snapshot
+                    )
                 )
                 started = time.perf_counter()
                 plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
@@ -1088,10 +1137,11 @@ class _NixlStagedTransfer:
             cached = _WeightUpdatePlan(
                 trainer,
                 capture,
-                MappingProxyType(parameter_layout),
+                parameter_layout,
                 plan,
                 trainer_snapshot.physical_fingerprint,
                 tuple(manifests),
+                mapping_key,
             )
             self._publish_prepared(cached, prepared)
             return prepared
@@ -1102,6 +1152,7 @@ class _NixlStagedTransfer:
         manifests: list[bytes],
         capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot,
+        source_mapping_key: Callable | None = None,
     ) -> _PreparedBoundedTransfer:
         """Create fresh deferred reads over one reusable bounded pull plan."""
         streaming = self._streaming
@@ -1116,8 +1167,14 @@ class _NixlStagedTransfer:
             previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
             previous = self._weight_update_plan
             metrics = {}
-            trainer, capture, parameter_layout, frozen = self._resolve_layout(
-                manifests, capture_layout, metrics, trainer_snapshot
+            trainer, capture, parameter_layout, frozen, mapping_key = (
+                self._resolve_layout(
+                    manifests,
+                    capture_layout,
+                    metrics,
+                    trainer_snapshot,
+                    source_mapping_key,
+                )
             )
             compiler = _BoundedPlanCache()
             compiler._compile_lock = self._plan_compile_lock
@@ -1167,10 +1224,11 @@ class _NixlStagedTransfer:
             cached = _WeightUpdatePlan(
                 trainer,
                 capture,
-                MappingProxyType(parameter_layout),
+                parameter_layout,
                 compiled,
                 key,
                 tuple(manifests),
+                mapping_key,
             )
             self._publish_prepared(cached, prepared)
             self._descriptor_cache = descriptors

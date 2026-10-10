@@ -1734,12 +1734,16 @@ load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
 validation remains required.
 
-Warm load-layout capture keeps a private snapshot when records contain only
-ordinary immutable metadata. Each caller receives fresh mutable capture records
-and containers, with duplicate record references preserved. Slice-containing
-operation tuples are copied with a shared memo. Mutable or custom payloads and
-changed copy protocols use whole-result deep copying. The existing model,
-loader, routing and manifest keys still decide whether a capture can be reused.
+The weight update plan is the sole owner of the source-to-engine mapping. Fresh
+captures copy mutable records once at the transfer boundary; the installer owns
+only immutable destination requirements. Its internal engine capability callback
+checks the ordered manifest, live parameter and original-loader identities,
+module loaders, integer routing-buffer mutations and conversion identity before
+reusing a mapping. The key is recorded after live-engine restoration. Compatible
+source schemas across mesh replacements can retain the mapping while compiling
+physical reads for the new trainer snapshot. Engines without this callback retain
+their existing capture and compiled-plan validation paths; quantized vLLM mappings
+are never reused.
 
 Alias validation uses Python module lookup and parameter registration semantics.
 Each streaming batch checks the current ownership structure and reuses the

@@ -350,7 +350,7 @@ def test_runtime_validates_streaming_support_before_allocating_transfers(
             transfer.close.assert_called_once_with()
 
 
-def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
+def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch) -> None:
     context = GeneratorEngineContext()
     monkeypatch.setattr(
         engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
@@ -388,7 +388,6 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     )
 
     assert transfer_kwargs["listen_port"] is None
-    assert set(method_kwargs) == {"transfer", "capture_layout"}
     assert runtime.p2p_client is None
     runtime.close()
 

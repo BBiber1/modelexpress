@@ -51,7 +51,9 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
 
     monkeypatch.setattr(runtime, "_NixlStagedTransfer", Transfer)
     method = runtime._create_load_time_tensor_method(
-        capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=None),
+        capability=SimpleNamespace(
+            device_id=0, device="cpu", capture_layout=None, source_mapping_key=None
+        ),
         worker_id="receiver",
         streaming=StreamingSettings(512, staging_device, staging_buffers),
     )

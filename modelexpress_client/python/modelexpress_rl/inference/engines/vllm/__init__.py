@@ -75,6 +75,7 @@ def _create_vllm_engine_runtime(
             device=engine.get_target_device(),
             worker_rank=engine.get_worker_rank(),
             capture_layout=installer.capture,
+            source_mapping_key=installer._capture_key,
             runtime_tensors=runtime_tensors,
             source_worker_id=(
                 loader.worker_id if runtime_tensors is not None else None

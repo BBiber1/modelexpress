@@ -45,7 +45,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     has_nixl_manager,
     runtime_p2p_available,
     model_name,
-):
+) -> None:
     if model_name is None:
         monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     else:
@@ -92,6 +92,9 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
 
         def capture(self, manifest):
             return manifest
+
+        def _capture_key(self, manifest) -> None:
+            return None
 
     adapter_module = ModuleType("modelexpress.engines.vllm.adapter")
     adapter_module.VllmAdapter = Engine

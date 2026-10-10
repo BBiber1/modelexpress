@@ -37,7 +37,6 @@ from modelexpress.refit.reshard.geometry import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
-from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -576,10 +575,9 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
-        self._capture_cache = None
-        self._engine_requirements: Mapping[
-            str, tuple[tuple[int, ...], torch.dtype]
-        ] | None = None
+        self._engine_requirements: (
+            Mapping[str, tuple[tuple[int, ...], torch.dtype]] | None
+        ) = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
     @cached_property
@@ -594,10 +592,14 @@ class _VllmInstaller(EngineInstaller):
             ) from error
         return _get_original_loader
 
-    def _capture_key(self, manifest):
+    def _capture_key(
+        self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
+    ) -> tuple | None:
+        if self._is_quantized:
+            return None
         original_loader = self._original_loader
 
-        def function_identity(function):
+        def function_identity(function) -> tuple:
             return (
                 id(getattr(function, "__func__", function)),
                 id(function.__self__) if hasattr(function, "__self__") else None,
@@ -781,7 +783,7 @@ class _VllmInstaller(EngineInstaller):
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
     ) -> tuple[
         SourceToEngineMapping,
-        dict[str, tuple[tuple[int, ...], torch.dtype]],
+        Mapping[str, tuple[tuple[int, ...], torch.dtype]],
     ]:
         """Record how published tensors map into vLLM's load-time parameters.
 
@@ -790,20 +792,6 @@ class _VllmInstaller(EngineInstaller):
         afterward without finalizing (finalizing would commit the empty skeletons
         and corrupt the live params).
         """
-        if not self._is_quantized and self._capture_cache is not None:
-            key, result = self._capture_cache
-            current_key = self._capture_key(manifest)
-            if key == current_key:
-                copies = (
-                    result.indices
-                    if type(result) is _CaptureSnapshot
-                    else result[0].copies
-                )
-                logger.info("reusing cached vLLM load layout (%d copies)", len(copies))
-                if type(result) is _CaptureSnapshot:
-                    return result.clone()
-                return copy.deepcopy(result)
-        self._capture_cache = None
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -872,16 +860,7 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
-        if (
-            not self._is_quantized
-            and not capture.unsupported
-            and not capture.unattributed
-        ):
-            self._capture_cache = (
-                self._capture_key(manifest),
-                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
-            )
-        return capture, param_layout
+        return capture, self._engine_requirements
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""

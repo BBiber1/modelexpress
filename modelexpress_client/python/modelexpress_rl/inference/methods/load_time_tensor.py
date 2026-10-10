@@ -40,9 +40,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         *,
         transfer: _NixlStagedTransfer,
         capture_layout: Callable,
+        source_mapping_key: Callable | None = None,
     ) -> None:
         self._transfer = transfer
         self._capture_layout = capture_layout
+        self._source_mapping_key = source_mapping_key
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
@@ -65,6 +67,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 manifests=manifests,
                 trainer_snapshot=source,
                 capture_layout=self._capture_layout,
+                source_mapping_key=self._source_mapping_key,
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
@@ -87,6 +90,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             manifests=[item.manifest for item in source.shards],
             trainer_snapshot=source,
             capture_layout=self._capture_layout,
+            source_mapping_key=self._source_mapping_key,
         )
         metrics = dict(prepared.metrics)
         streamed = PreparedStreamingTensors(

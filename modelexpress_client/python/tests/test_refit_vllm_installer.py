@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
@@ -1958,18 +1959,16 @@ def test_capture_key_reports_missing_layerwise_api_before_mutation(
     assert torch.equal(model.weight, before)
 
 
-def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypatch):
+def test_layerwise_recapture_and_streaming_preserve_tied_parameters(monkeypatch) -> None:
     class Model(nn.Module):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
             self.embedding = nn.Linear(2, 2, bias=False)
             self.lm_head = nn.Linear(2, 2, bias=False)
             self.lm_head.weight = self.embedding.weight
             self.register_buffer("routing", torch.tensor([0, 1]))
-            self.capture_calls = 0
 
-        def load_weights(self, weights):
-            self.capture_calls += 1
+        def load_weights(self, weights) -> None:
             for name, weight in weights:
                 if name == "embedding.weight":
                     self.embedding.weight.weight_loader(self.embedding.weight, weight)
@@ -2032,23 +2031,19 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
     assert torch.equal(model.embedding.weight, original)
     manifest = [("embedding.weight", torch.float32, (2, 2))]
     cached, _ = installer.capture(manifest)
-    assert model.capture_calls == 1
     cached.copies.clear()
     assert installer.capture(manifest)[0].copies
     model.routing.add_(1)
     installer.capture(manifest)
-    assert model.capture_calls == 2
     with torch.inference_mode():
         model.routing = torch.tensor([3, 4])
         installer.capture(manifest)
-        assert model.capture_calls == 3
         model.routing.add_(1)
         installer.capture(manifest)
-        assert model.capture_calls == 4
 
     for value in (7.0, 11.0, -3.0):
 
-        def batches(value=value):
+        def batches(value=value) -> Iterator[dict[str, torch.Tensor]]:
             yield {"embedding.weight": torch.full((2, 2), value)}
 
         prepared = PreparedStreamingTensors(batches, frozenset(layout), {})
@@ -2059,7 +2054,6 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
         assert "retention_batch_scans" not in prepared.transfer_metrics
         assert "retention_final_scans" not in prepared.transfer_metrics
         installer.capture(manifest)
-        assert model.capture_calls == 4
 
 
 class _Parent(nn.Module):

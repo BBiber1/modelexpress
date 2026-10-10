@@ -58,6 +58,7 @@ class FullTensorEngineCapability:
     publish_runtime_tensors: Callable[[str], None]
     build_identity: Callable[[str], p2p_pb2.SourceIdentity]
     nixl_manager: Any | None = None
+    source_mapping_key: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +194,7 @@ def _create_load_time_tensor_method(
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
         capture_layout=capability.capture_layout,
+        source_mapping_key=capability.source_mapping_key,
     )
 
 
