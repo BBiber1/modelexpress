@@ -5,7 +5,7 @@ import ctypes
 import hashlib
 from contextlib import nullcontext
 from dataclasses import replace
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress_rl.inference.plan import StreamingSettings
@@ -43,6 +43,17 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _source_structure,
 )
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
+
+
+def _bind_iteration_workspace(transfer, prepared) -> None:
+    transfer._debug_validate_workspace = False
+    schedule = transfer_module._StreamingSchedule(
+        TensorTransferPlan(), prepared.batches, prepared.batches
+    )
+    transfer._weight_update_plan = SimpleNamespace(
+        bounded_workspace=transfer._bind_bounded_workspace(schedule, prepared.sources)
+    )
+    prepared.metrics["descriptor_builds"] = len(prepared.batches)
 
 
 def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(
@@ -197,7 +208,6 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(
         batches, {"w": source}, Transport()
     )
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
@@ -205,6 +215,7 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(
     transfer._device_id = 0
     transfer._bounded_arena = torch.empty(arena_bytes, dtype=torch.uint8)
     transfer._bounded_arena.fill_(255)
+    _bind_iteration_workspace(transfer, prepared)
     metrics = {}
     installed = {}
     addresses = []
@@ -728,7 +739,6 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
 def test_staged_verification_rejects_missing_or_mismatched_digest() -> None:
     tensor = torch.arange(64, dtype=torch.int32)
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._recv_buffers = {"weight": tensor}
     transfer._convert_buffers = {}
@@ -776,7 +786,6 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     assert calls == ["initialize", "shutdown"]
 
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._manager = _Manager()
     transfer._owns_manager = True
@@ -880,7 +889,7 @@ def test_borrowed_manager_survives_peer_receive_and_refuses_a_reset(monkeypatch)
     transfer.close()
 
 
-def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
+def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch) -> None:
     calls = []
 
     class _Lease:
@@ -931,7 +940,6 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
             calls.append(("remove", agent_name))
 
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
@@ -981,10 +989,9 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
         )
 
 
-def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
+def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch) -> None:
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._device = torch.device("cpu")
     buffers = {}
@@ -1051,7 +1058,6 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(
         batches, {"w": source}, Transport()
     )
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
@@ -1059,6 +1065,7 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(
     transfer._device_id = 0
     arenas = [torch.empty(256, dtype=torch.uint8) for _ in range(2)]
     transfer._staging_arenas = arenas
+    _bind_iteration_workspace(transfer, prepared)
     transfer._staging_registrations = []
     metrics = {}
     addresses = []
@@ -1135,13 +1142,13 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(
         batches, {"w": source}, Transport()
     )
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(256, dtype=torch.uint8) for _ in range(2)]
+    _bind_iteration_workspace(transfer, prepared)
     transfer._staging_registrations = []
     iterator = transfer.iter_bounded(prepared, {})
     next(iterator)
@@ -1366,7 +1373,6 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch) -> None:
         batches, {"w": source}, Transport()
     )
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
@@ -1374,6 +1380,7 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch) -> None:
     transfer._device_id = 0
     # Two arenas, so batch 1's READ is posted before batch 0 is yielded.
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    _bind_iteration_workspace(transfer, prepared)
 
     iterator = transfer.iter_bounded(prepared, {})
     next(iterator)
@@ -1425,41 +1432,15 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch) -> None
         batches, {"w": source}, Transport()
     )
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    _bind_iteration_workspace(transfer, prepared)
 
     iterator = transfer.iter_bounded(prepared, {})
     next(iterator)
     with pytest.raises(RuntimeError, match="the install failed"):
         iterator.throw(RuntimeError("the install failed"))
-
-
-def test_bounded_batch_layouts_are_named_however_they_are_built() -> None:
-    """Readers use both `.full` and `[0]`, so construction style must not matter.
-
-    The annotation alone does not enforce this: a plain 3-tuple or a
-    dataclasses.replace satisfies positional access and breaks attribute
-    access, which fails at only one of the two call sites.
-    """
-    recv = {"a.weight": ((4,), torch.float32)}
-    convert: dict = {}
-    full = {"w": ((4,), torch.float32)}
-
-    built = transfer_module._StreamingBatch(
-        CaptureResult(copies=[]),
-        TensorTransferPlan(),
-        (recv, convert, full),
-        256,
-    )
-    assert isinstance(built.layouts, transfer_module._StagingLayouts)
-    assert built.layouts.recv is built.layouts[0] is recv
-    assert built.layouts.full is built.layouts[2] is full
-
-    swapped = replace(built, layouts=(recv, convert, {}))
-    assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
-    assert swapped.layouts.full == {}

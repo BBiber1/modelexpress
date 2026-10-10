@@ -1819,16 +1819,19 @@ therefore not a total GPU-memory bound. Two arenas can overlap the next READ wit
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
-Bounded transfer can reuse immutable READ addresses and sizes for the currently
-validated compiled plan. The one-entry cache checks the workspace generation and
-the identity, order and geometry of all receive arenas before every batch. It
-holds only weak arena references; source leases, tensor views and transport
-handles remain owned by the update. Preparation still validates current source
-metadata and coverage, and every batch still creates views, zeroes padding,
-posts fresh READs and completes the existing fences. Failed preparation,
-incomplete iteration and workspace teardown discard the descriptors. Private
-transfer counters report hits, misses and builds; descriptor work stays outside
-the wire timer on both cold and warm updates.
+The compiled bounded plan owns a destination binding with typed arena views,
+READ descriptors, selected source rows, reconstruction and conversion views,
+and byte totals prepared before the first READ. Warm preparations reuse that
+binding without rebuilding views or scanning arena geometry. Workspace
+registration changes invalidate the binding; reset and failed preparation
+retain #877's physical-plan invalidation and storage cleanup.
+`MX_REFIT_DEBUG_VALIDATE_WORKSPACE=1` additionally checks arena identities and
+geometry before zeroing or posting each batch. Each round still owns fresh
+checksums, transport handles and source leases. Padding is zeroed before every
+READ, and synchronization, verification and drain rules remain unchanged.
+Typed views retain their arena storage until their plan or iteration is
+released; the binding owns no native manager or READ handles. Descriptor work
+stays outside the wire timer.
 
 The compiled plan owns an immutable snapshot of ordinary parsed source and
 shard rows. A validated publication match returns that snapshot directly for

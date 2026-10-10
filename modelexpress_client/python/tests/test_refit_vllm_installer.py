@@ -2041,7 +2041,7 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(
 
 def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     monkeypatch,
-):
+) -> None:
     """install_streaming abandons the transfer with close(), not throw().
 
     The generator therefore sees GeneratorExit even while an install error is
@@ -2099,13 +2099,14 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         planned, {"w": source}, Transport()
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
-    transfer._descriptor_cache = None
     transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    from tests.test_refit_nixl_staged_transfer import _bind_iteration_workspace
+    _bind_iteration_workspace(transfer, prepared)
 
     class Owner(nn.Module):
         def __init__(self, dtype):

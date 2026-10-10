@@ -42,6 +42,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
     if isinstance(settings, tuple):
         settings, pack = settings
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_WORKSPACE", str(int(parameters.get("workspace_debug", False))))
     diagnostic = parameters.get("diagnostic")
     monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", str(int(diagnostic == "plan")))
     monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", str(int(diagnostic == "layout")))
@@ -67,32 +68,32 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
     events = []
 
     class Manager:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.registered = {}
 
-        def initialize(self):
+        def initialize(self) -> None:
             pass
 
-        def shutdown(self):
+        def shutdown(self) -> None:
             self.registered.clear()
 
         def add_remote_agent(self, metadata) -> str:
             events.append(f"connect:{metadata.decode()}")
             return metadata.decode()
 
-        def register_tensors(self, tensors):
+        def register_tensors(self, tensors) -> None:
             self.registered.update(tensors)
 
-        def register_dram_buffer(self, tensor):
+        def register_dram_buffer(self, tensor) -> object:
             handle = object()
             self.registered[handle] = tensor
             return handle
 
-        def deregister_memory(self, handle):
+        def deregister_memory(self, handle) -> None:
             del self.registered[handle]
 
     class Transport:
-        def __init__(self, manager, agents, devices, **kwargs):
+        def __init__(self, manager, agents, devices, **kwargs) -> None:
             self.posts = []
             self.posted = []
             self.awaited = []
@@ -102,7 +103,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             self.mem_type = kwargs["local_mem_type"] or NIXL_ACCELERATOR_MEM_TYPE
             transports.append(self)
 
-        def post_reads(self, descriptors):
+        def post_reads(self, descriptors) -> list[SimpleNamespace]:
             events.append("post")
             if self.fail_post:
                 raise RuntimeError("post failed")
@@ -117,7 +118,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             descriptors.clear()
             return [handle]
 
-        def await_reads(self, posted):
+        def await_reads(self, posted) -> None:
             events.append("await")
             if self.fail_wait:
                 raise RuntimeError("wait failed")
@@ -165,7 +166,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             )
         ]
 
-    def capture_layout(manifest):
+    def capture_layout(manifest) -> tuple[CaptureResult, dict]:
         captures.append(manifest)
         return capture, layout
 
@@ -188,7 +189,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             }) if envs.MX_RESHARD_PUBLISH_DIGEST else None,
         )
 
-    def collect(prepared):
+    def collect(prepared) -> tuple[dict, dict]:
         metrics, installed = {}, {}
         for tensors in transfer.iter_bounded(prepared, metrics):
             installed.update({name: value.clone() for name, value in tensors.items()})
@@ -273,12 +274,13 @@ def test_changed_source_addresses_rebuild_descriptors(harness) -> None:
     assert metrics["descriptor_builds"] == len(second.batches)
 
 
+@pytest.mark.parametrize("workspace_debug", [True])
 @pytest.mark.parametrize(
     "change", ["replace", "same_address", "reorder", "resize", "registration"]
 )
 @pytest.mark.parametrize("harness", [StreamingSettings(1024, "cpu", 2)], indirect=True)
 def test_arena_change_after_prepare_is_checked_before_each_post(
-    harness, change
+    harness, change, workspace_debug
 ) -> None:
     first = harness.prepare()
     harness.collect(first)
@@ -297,14 +299,13 @@ def test_arena_change_after_prepare_is_checked_before_each_post(
         harness.transfer._staging_registrations = [
             harness.transfer._manager.register_dram_buffer(arena) for arena in arenas
         ]
-    metrics, installed = harness.collect(prepared)
-    _check_values(harness, installed)
-    assert metrics["descriptor_cache_hits"] == 0
-    assert metrics["descriptor_builds"] == len(prepared.batches)
-    assert harness.transfer._descriptor_cache is None
+    with pytest.raises(RuntimeError, match="bounded workspace changed"):
+        harness.collect(prepared)
+    assert prepared.transport.posts == []
 
 
-def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
+@pytest.mark.parametrize("workspace_debug", [True])
+def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness, workspace_debug) -> None:
     harness.collect(harness.prepare())
     prepared = harness.prepare()
     metrics = {}
@@ -312,10 +313,11 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
     next(iterator)
     assert metrics["descriptor_cache_hits"] == 1
     harness.transfer._staging_arenas[0] = harness.transfer._staging_arenas[0].clone()
-    for tensors in iterator:
-        assert tensors
-    assert metrics["descriptor_cache_hits"] == 1
-    assert metrics["descriptor_builds"] == len(prepared.batches) - 1
+    posts_before_change = len(prepared.transport.posts)
+    with pytest.raises(RuntimeError, match="bounded workspace changed"):
+        next(iterator)
+    assert len(prepared.transport.posts) == posts_before_change
+    assert prepared.transport.awaited == prepared.transport.posted
 
 
 @pytest.mark.parametrize(
@@ -323,27 +325,31 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
 )
 def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure) -> None:
     harness.collect(harness.prepare())
-    assert harness.transfer._descriptor_cache is not None
-    if failure == "coverage":
-        harness.sources["exact"] = harness.sources["exact"].clone()
-        harness.layout["missing.weight"] = ((4,), torch.float32)
-        expected = IncompleteRefit
-    else:
-
-        def fail(*args, **kwargs):
-            raise RuntimeError("preparation failed")
-
-        if failure == "transport":
-            monkeypatch.setattr(module, "NixlReshardTransport", fail)
-        elif failure == "prepared":
-            monkeypatch.setattr(module, "_PreparedBoundedTransfer", fail)
+    with monkeypatch.context() as fault:
+        if failure == "coverage":
+            harness.sources["exact"] = harness.sources["exact"].clone()
+            harness.layout["missing.weight"] = ((4,), torch.float32)
+            expected = IncompleteRefit
         else:
-            harness.transfer.reset_workspace()
-            monkeypatch.setattr(harness.transfer._manager, "register_dram_buffer", fail)
-        expected = RuntimeError
-    with pytest.raises(expected):
-        harness.prepare(generation=2 if failure == "coverage" else 1)
-    assert harness.transfer._descriptor_cache is None
+            def fail(*args, **kwargs) -> None:
+                raise RuntimeError("preparation failed")
+
+            if failure == "transport":
+                fault.setattr(module, "NixlReshardTransport", fail)
+            elif failure == "prepared":
+                fault.setattr(module, "_PreparedBoundedTransfer", fail)
+            else:
+                harness.transfer.reset_workspace()
+                fault.setattr(harness.transfer._manager, "register_dram_buffer", fail)
+            expected = RuntimeError
+        with pytest.raises(expected):
+            harness.prepare(generation=2 if failure == "coverage" else 1)
+    harness.layout.pop("missing.weight", None)
+    prepared = harness.prepare(generation=2 if failure == "coverage" else 1)
+    metrics, installed = harness.collect(prepared)
+    _check_values(harness, installed)
+    assert metrics["descriptor_builds"] == len(prepared.batches)
+    assert prepared.transport.awaited == prepared.transport.posted
 
 
 @pytest.mark.parametrize("failure", ["post", "wait", "abandon", "drain"])
@@ -365,28 +371,36 @@ def test_incomplete_iteration_discards_cache_and_preserves_drain(
             prepared.transport.fail_wait = True
             with pytest.raises(RuntimeError, match="could not be drained"):
                 iterator.close()
+            assert len(prepared.transport.awaited) < len(prepared.transport.posted)
+            registered = harness.transfer._manager.registered.values()
+            assert all(
+                any(resource is arena for resource in registered)
+                for arena in harness.transfer._staging_arenas
+            )
+            return
         else:
             iterator.close()
             assert prepared.transport.awaited == prepared.transport.posted
-    assert harness.transfer._descriptor_cache is None
+    prepared = harness.prepare()
+    metrics, installed = harness.collect(prepared)
+    _check_values(harness, installed)
+    assert metrics["descriptor_builds"] == len(prepared.batches)
+    assert prepared.transport.awaited == prepared.transport.posted
 
 
 @pytest.mark.parametrize("cleanup", ["reset", "close"])
-def test_metadata_does_not_own_arenas_or_handles(harness, cleanup):
+def test_reset_and_close_release_arenas_and_handles(harness, cleanup) -> None:
     prepared = harness.prepare()
     harness.collect(prepared)
-    entry = harness.transfer._descriptor_cache
     arena_refs = [weakref.ref(arena) for arena in harness.transfer._staging_arenas]
     transport_ref = weakref.ref(prepared.transport)
     # Drop test-only observation lists and all prepared state.
     harness.transports.clear()
     del prepared
-    harness.transfer._active = None
     getattr(harness.transfer, cleanup if cleanup == "close" else "reset_workspace")()
     gc.collect()
     assert all(reference() is None for reference in arena_refs)
     assert transport_ref() is None
-    assert entry.batches and harness.transfer._descriptor_cache is None
 
 
 @pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu"), True)], indirect=True)
@@ -565,3 +579,23 @@ def test_failed_replica_setup_rebuilds_before_next_transfer(harness, monkeypatch
     _check_values(harness, installed)
     assert prepared.metrics["plan_cache_misses"] == 1
     assert prepared.metrics["initial_whole_plan_s"] > 0
+
+
+def test_registration_generation_drift_rejects_without_debug_validation(harness) -> None:
+    prepared = harness.prepare()
+    harness.transfer._release_staging_registrations()
+    with pytest.raises(RuntimeError, match="bounded workspace changed"):
+        harness.collect(prepared)
+    assert prepared.transport.posts == []
+
+
+def test_partial_iteration_reports_all_eager_descriptor_builds(harness) -> None:
+    prepared = harness.prepare()
+    assert prepared.metrics["descriptor_builds"] == len(prepared.batches)
+    metrics = {}
+    iterator = harness.transfer.iter_bounded(prepared, metrics)
+    next(iterator)
+    assert metrics["descriptor_builds"] == len(prepared.batches)
+    assert len(prepared.transport.posts) < len(prepared.batches)
+    iterator.close()
+    assert prepared.transport.awaited == prepared.transport.posted

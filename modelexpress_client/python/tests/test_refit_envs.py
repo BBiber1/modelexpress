@@ -149,9 +149,11 @@ def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
     for name in (
         "MX_REFIT_DEBUG_VALIDATE_PLAN",
         "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT",
+        "MX_REFIT_DEBUG_VALIDATE_WORKSPACE",
         "MX_REFIT_PACK_MODULES",
     ):
         monkeypatch.delenv(name, raising=False)
     assert refit_envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
     assert refit_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT is False
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_WORKSPACE is False
     assert refit_envs.MX_REFIT_PACK_MODULES is True
