@@ -3,6 +3,7 @@
 
 import hashlib
 import logging
+import os
 import time
 from concurrent import futures
 from contextlib import contextmanager
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 import grpc
 import modelexpress_rl.inference.client as client_module
 import pytest
-from modelexpress import p2p_pb2, p2p_pb2_grpc
+from modelexpress import p2p_pb2, p2p_pb2_grpc, telemetry
 from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.client import MxClient
 from modelexpress.types import ManifestMismatchError
@@ -54,6 +55,23 @@ from modelexpress_rl.inference.source import (
     ObjectStorageSourceResolver,
     TrainerSourceResolver,
 )
+
+
+@pytest.fixture
+def recording(monkeypatch):
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
+    monkeypatch.setattr(telemetry, "_configured_pid", os.getpid())
+    monkeypatch.setattr(telemetry, "_tracer", provider.get_tracer("generator-test"))
+    yield exporter
+    provider.shutdown()
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -898,14 +916,24 @@ def test_generator_lease_renewal_reregisters_lost_worker(monkeypatch):
     assert restored_at - rejected_at < 0.5
 
 
-def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch):
+@pytest.mark.parametrize("fail_publish", [False, True])
+def test_generator_republishes_runtime_tensors_around_first_install(
+    monkeypatch, recording, caplog, fail_publish
+):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     events = []
+    from opentelemetry import trace
+
     adapter.unpublish_runtime_tensors = lambda: events.append("unpublish")
-    adapter.publish_runtime_tensors = lambda version_id: events.append(
-        f"publish:{version_id}"
-    )
+
+    def publish_runtime_tensors(version_id):
+        events.append(f"publish:{version_id}")
+        assert trace.get_current_span().name == "mx.refit.runtime_tensor_publish"
+        if fail_publish:
+            raise RuntimeError("runtime tensor publication failed")
+
+    adapter.publish_runtime_tensors = publish_runtime_tensors
     generator = _initialize(monkeypatch, endpoint, adapter)
 
     original_apply = adapter.apply_weight
@@ -916,15 +944,37 @@ def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch)
 
     adapter.apply_weight = apply
     try:
-        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert generator.apply_weight(staged) == "installed"
-        assert generator.apply_weight(staged) == "installed"
-        staged.release()
+        with caplog.at_level(logging.ERROR, logger="modelexpress_rl.inference.client"):
+            staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert generator.apply_weight(staged) == "installed"
+            assert generator.apply_weight(staged) == "installed"
+            staged.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
 
     assert events == ["unpublish", "install", "publish:version-a"]
+    spans = recording.get_finished_spans()
+    runtime_publish = next(
+        span for span in spans if span.name == "mx.refit.runtime_tensor_publish"
+    )
+    assert runtime_publish.attributes["status"] == (
+        "error" if fail_publish else "ok"
+    )
+    assert runtime_publish.end_time >= runtime_publish.start_time
+    assert staged._timing.as_dict()["stages"]["post_install"]["metadata"][
+        "runtime_tensor_publish_s"
+    ] >= 0
+    assert staged._timing._emitted_payload["stages"]["post_install"]["count"] == 1
+    assert runtime_publish.status.status_code is (
+        trace.StatusCode.ERROR if fail_publish else trace.StatusCode.UNSET
+    )
+    assert any(span.name == "mx.refit.stage_weight" for span in spans)
+    assert any(span.name == "mx.refit.apply_weight" for span in spans)
+    assert any(span.name == "mx.refit.release_weight" for span in spans)
+    apply_spans = [span for span in spans if span.name == "mx.refit.apply_weight"]
+    assert all(span.status.status_code is trace.StatusCode.UNSET for span in apply_spans)
+    assert ("runtime tensor publication failed" in caplog.text) is fail_publish
 
 
 def test_generator_aborts_before_install_when_runtime_tensors_cannot_drain(
@@ -1911,15 +1961,23 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         server.stop(grace=None).wait()
 
 
-def test_generator_republishes_after_pretransfer_failure(monkeypatch):
+@pytest.mark.parametrize("fail_publish", [False, True])
+def test_generator_republishes_after_pretransfer_failure(monkeypatch, recording, fail_publish):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     adapter.installation_context_failure = True
     events = []
+    from opentelemetry import trace
+
     adapter.unpublish_runtime_tensors = lambda: events.append("unpublish")
-    adapter.publish_runtime_tensors = lambda version_id: events.append(
-        f"publish:{version_id}"
-    )
+
+    def publish_runtime_tensors(version_id):
+        events.append(f"publish:{version_id}")
+        assert trace.get_current_span().name == "mx.refit.runtime_tensor_publish"
+        if fail_publish:
+            raise RuntimeError("rollback publication failed")
+
+    adapter.publish_runtime_tensors = publish_runtime_tensors
     generator = _initialize(
         monkeypatch,
         endpoint,
@@ -1937,6 +1995,16 @@ def test_generator_republishes_after_pretransfer_failure(monkeypatch):
         server.stop(grace=None).wait()
 
     assert events == ["unpublish", "publish:base-a"]
+    spans = recording.get_finished_spans()
+    runtime_publish = next(
+        span for span in spans if span.name == "mx.refit.runtime_tensor_publish"
+    )
+    apply_span = next(span for span in spans if span.name == "mx.refit.apply_weight")
+    assert runtime_publish.parent.span_id == apply_span.context.span_id
+    assert runtime_publish.attributes["status"] == ("error" if fail_publish else "ok")
+    assert staged._timing.as_dict()["stages"]["post_install"]["metadata"][
+        "runtime_tensor_publish_s"
+    ] >= 0
 
 
 def test_generator_fences_when_installation_context_mutated_before_failure(monkeypatch):

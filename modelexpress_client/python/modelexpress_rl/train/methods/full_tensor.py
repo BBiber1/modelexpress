@@ -102,13 +102,14 @@ class FullTensorNixlPublicationMethod:
         if self._binding is None:
             raise RuntimeError("mesh publication requires bind_tensors()")
         logical_shard_id = self._binding.logical_shard_id
-        with refit_span(
-            "source_preparation",
-            metadata={"staging_syncs": 1},
-            accumulate_metadata=True,
-            duration_key="staging_sync_s",
-        ):
-            staged.publish_ready.wait()
+        if not staged.publish_ready_completed:
+            with refit_span(
+                "source_preparation",
+                metadata={"staging_syncs": 1},
+                accumulate_metadata=True,
+                duration_key="staging_sync_s",
+            ):
+                staged.publish_ready.wait()
         if staged.manifest.transport.upper() != "NIXL":
             raise ValueError(
                 f"unsupported shard transport {staged.manifest.transport!r}"

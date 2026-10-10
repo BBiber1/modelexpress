@@ -6,7 +6,7 @@
 -- KEYS[4]: trainer mesh version-reference set
 -- ARGV: uid, model_name, idempotency_key, payload_format,
 --       base_version_id,
---       s3_uri, initial_state, state, created_at_unix_ms, trainer_mesh_id, version_number
+--       s3_uri, initial_state, state, created_at_unix_ms, trainer_mesh_id, version_number, trace_context
 --
 -- Returns:
 --   CREATED              this invocation created the version
@@ -46,7 +46,8 @@ redis.call('HSET', KEYS[1],
   'state', ARGV[8],
   'created_at_unix_ms', ARGV[9],
   'trainer_mesh_id', ARGV[10],
-  'version_number', ARGV[11])
+  'version_number', ARGV[11],
+  'trace_context', ARGV[12])
 if ARGV[10] ~= '' then
   redis.call('SADD', KEYS[4], ARGV[1])
 end

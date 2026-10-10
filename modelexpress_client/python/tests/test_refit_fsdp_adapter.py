@@ -257,11 +257,27 @@ def test_warm_stage_reuses_structural_manifest(dist_ready, monkeypatch):
 
 
 def test_digest_mode_rebuilds_version_manifest(dist_ready, monkeypatch):
+    from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+    from modelexpress_rl.train.adapter import CompletionFence
+
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    clock = [0.0]
+
+    def wait():
+        clock[0] += 2.0
+
+    monkeypatch.setattr(f"{ADAPTER}.CompletionFence", lambda _: CompletionFence(wait))
     adapter = _adapter()
     state_dict = {"w": torch.ones(2, 4, dtype=torch.bfloat16)}
-
-    first = _stage(adapter, state_dict)
+    recorder = RefitTimingRecorder(
+        backend="rl_trainer", version="v1", clock=lambda: clock[0]
+    )
+    with use_refit_timing(recorder):
+        first = _stage(adapter, state_dict)
+    metadata = recorder.as_dict()["stages"]["source_preparation"]["metadata"]
+    assert metadata["staging_sync_s"] == 2.0
+    assert metadata["staging_syncs"] == 1
+    assert first.publish_ready_completed
     state_dict["w"].fill_(2)
     second = _stage(adapter, state_dict)
 
