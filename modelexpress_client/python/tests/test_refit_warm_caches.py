@@ -268,6 +268,108 @@ def test_bounded_plan_cache_snapshots_callback_inputs_and_revalidates(
     assert cache._entry is None
 
 
+def test_bounded_plan_compile_span_is_rank_level_and_records_outcome(monkeypatch):
+    class RecordingSpan:
+        def __init__(self, name):
+            self.name = name
+            self.attributes = {}
+            self.error = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, _exc, _traceback):
+            self.error = exc_type is not None
+            return False
+
+        def is_recording(self):
+            return True
+
+        def set_attributes(self, attributes):
+            self.attributes.update(attributes)
+
+    spans = []
+
+    def record_span(name, *_args, **_kwargs):
+        span = RecordingSpan(name)
+        spans.append(span)
+        return span
+
+    monkeypatch.setattr(transfer_module.telemetry, "span", record_span)
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "0")
+    args = _bounded_cache_inputs()
+    args["capture"] = CaptureResult(
+        copies=[
+            replace(args["capture"].copies[0], param_name="layer1.weight"),
+            replace(args["capture"].copies[0], param_name="layer2.weight"),
+        ]
+    )
+    args["parameter_layout"] = {
+        "layer1.weight": ((4,), torch.float32),
+        "layer2.weight": ((4,), torch.float32),
+    }
+    cache = _BoundedPlanCache()
+    compiled = cache.compile(
+        **args,
+        metrics={
+            "source_cache_enabled": 0,
+            "source_cache_hits": 0,
+            "source_cache_misses": 1,
+        },
+    )
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 1
+    assert bounded_spans[0].attributes["owner_plan_builds"] == 2
+    assert bounded_spans[0].attributes["module_batches"] == 2
+    assert bounded_spans[0].attributes["plan_cache.misses"] == 1
+    assert bounded_spans[0].attributes["source_cache.enabled"] is False
+    assert bounded_spans[0].attributes["source_cache.misses"] == 1
+
+    cache.compile(
+        **args,
+        metrics={
+            "source_cache_enabled": 1,
+            "source_cache_hits": 1,
+            "source_cache_misses": 0,
+        },
+    )
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 2
+    assert bounded_spans[1].attributes["plan_cache.hits"] == 1
+    assert bounded_spans[1].attributes["source_cache.enabled"] is True
+    assert bounded_spans[1].attributes["source_cache.hits"] == 1
+    plan = compiled.plan if hasattr(compiled, "plan") else compiled.transfer_plan
+    plan.fallback.append("injected-unsupported")
+    with pytest.raises(IncompleteRefit, match="cover every"):
+        cache.compile(**args, metrics={})
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 3
+    assert bounded_spans[-1].error
+
+    args["capture"] = CaptureResult(copies=[args["capture"].copies[0]])
+    args["parameter_layout"] = {"layer1.weight": ((4,), torch.float32)}
+    single = _BoundedPlanCache().compile(**args, metrics={})
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 4
+    assert (
+        len(
+            single.module_batches
+            if hasattr(single, "module_batches")
+            else single.modules
+        )
+        == 1
+    )
+
+
 def test_copy_plan_key_on_miss_keeps_exact_fingerprint_and_avoids_hit_deepcopy(
     monkeypatch,
 ):
