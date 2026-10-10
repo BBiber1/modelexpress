@@ -23,8 +23,9 @@ class _Agent:
         pass
 
 
-def _manager():
+def _manager() -> NixlTransferManager:
     mgr = object.__new__(NixlTransferManager)
+    mgr._transfer_traces = {}
     mgr._agent = _Agent()
     mgr._backends = ["UCX"]
     mgr._device_id = 3

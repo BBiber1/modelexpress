@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
+from modelexpress import telemetry
 from modelexpress.refit.timing import (
     add_refit_bytes,
     add_refit_duration,
@@ -101,6 +102,14 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             capture_layout=self._capture_layout,
         )
         metrics = dict(prepared.metrics)
+        for name in (
+            "plan_cache_hits",
+            "plan_cache_misses",
+            "source_cache_hits",
+            "source_cache_misses",
+        ):
+            if name in metrics:
+                telemetry.attribute(name, metrics[name])
         streamed = PreparedStreamingTensors(
             batches=lambda: self._transfer.iter_bounded(prepared, metrics),
             parameter_names=frozenset(
@@ -154,8 +163,18 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
 
 def _attribute_transfer(metrics: dict[str, float]) -> None:
     add_refit_bytes(metrics.get("bytes_received", 0))
-    if "wire_s" in metrics:
-        add_refit_duration("wire_transfer", metrics["wire_s"])
+    if "wire_host_s" in metrics:
+        wire_metadata = {
+            key: metrics[key]
+            for key in ("wire_host_s", "wire_wait_s")
+            if key in metrics
+        }
+        add_refit_duration(
+            "wire_transfer",
+            metrics["wire_host_s"],
+            metadata=wire_metadata,
+            accumulate_metadata=True,
+        )
     if "reconstruct_s" in metrics:
         add_refit_duration("receive_sync", metrics["reconstruct_s"])
 
