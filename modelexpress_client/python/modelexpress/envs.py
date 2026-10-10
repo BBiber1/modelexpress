@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     MX_REFIT_STAGE_RECORD: bool
     MX_REFIT_PACK_MODULES: bool
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
+    MX_REFIT_DEBUG_VALIDATE_WORKSPACE: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
     MX_RESHARD_MAX_GBPS: float
@@ -328,6 +329,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One JSON stage record per refit. On by default: the timings are already
     # computed, and at INFO they were never captured by a benchmark run.
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    "MX_REFIT_DEBUG_VALIDATE_WORKSPACE": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_WORKSPACE", False
+    ),
     "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: _env_bool(
         "MX_REFIT_DEBUG_VALIDATE_PLAN", False
     ),

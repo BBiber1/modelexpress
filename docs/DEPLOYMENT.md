@@ -1540,6 +1540,7 @@ separate from the public integration configuration.
 | --- | --- | --- |
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
 | `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Rebind the fixed engine load layout and detect drift for an unchanged physical source. |
+| `MX_REFIT_DEBUG_VALIDATE_WORKSPACE` | `0` | Recheck bounded arena identities and geometry before zeroing or posting each READ batch. |
 | `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
 
