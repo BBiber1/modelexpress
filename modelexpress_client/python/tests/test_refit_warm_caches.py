@@ -263,11 +263,15 @@ def test_metadata_reuse_requires_matching_manifests(monkeypatch) -> None:
     assert resolved.sources == first.sources
     assert metrics["source_cache_hits"] == 1
     assert metrics["source_manifest_bytes"] == sum(map(len, manifests))
-    for changed in (list(reversed(manifests)), manifests[:1]):
+    for changed, expected_shards in (
+        (list(reversed(manifests)), [(200, (2,)), (100, (0,))]),
+        (manifests[:1], [(100, (0,))]),
+    ):
         resolved, _ = transfer._resolve_metadata(changed, metrics)
-        assert [shard.addr for shard in resolved.sources["weight"].shards] == (
-            [200, 100] if len(changed) == 2 else [100]
-        )
+        assert [
+            (shard.addr, shard.shard_offset)
+            for shard in resolved.sources["weight"].shards
+        ] == expected_shards
         assert metrics["source_cache_hits"] == 0
 
 
