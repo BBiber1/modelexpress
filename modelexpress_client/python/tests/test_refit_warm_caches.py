@@ -97,7 +97,7 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
     )
     for version in range(3):
         source.add_(1)
-        transfer._complete_stage(prepared, [], time.perf_counter())
+        transfer._complete_stage(prepared, [], 0.0)
         assert torch.equal(target[:, offset : offset + 4], source.to(torch.bfloat16))
         assert torch.all(arena[:8] == -17) and torch.all(arena[-8:] == -17)
         if padded:

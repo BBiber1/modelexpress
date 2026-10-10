@@ -310,3 +310,15 @@ Performance claims must identify the exact implementation path. Reference transp
 - [Python client](../../README.md)
 - [ModelExpress architecture](../../../../docs/ARCHITECTURE.md)
 - [Deployment and NIXL configuration](../../../../docs/DEPLOYMENT.md)
+
+### Optional refit tracing
+
+OTLP tracing retains cycle, role, phase, and NIXL batch spans by default.
+Set `MX_REFIT_TRACE_DETAIL=1` to include individual transfers, layers, and owners.
+Transfer samples are captured before handle release; aggregation and detailed
+span emission happen after the completion sweep. Timing logs remain controlled
+by `MX_REFIT_TIMING`, independently of OTLP export.
+
+Use standard `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and
+`OTEL_TRACES_SAMPLER_ARG=0.1` to sample whole refit cycles at ten percent.
+Propagated parent sampling decisions apply across trainers and generators.
