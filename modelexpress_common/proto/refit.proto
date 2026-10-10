@@ -157,6 +157,8 @@ message WeightVersion {
   // Server-stamped trainer mesh generation at creation. Required and positive
   // for mesh-backed versions; zero only when no trainer mesh applies.
   uint64 trainer_mesh_generation = 14;
+  // W3C context of the refit cycle, retained across lifecycle reads.
+  map<string, string> trace_context = 13;
 }
 
 message CreateWeightVersionRequest {
@@ -176,6 +178,7 @@ message CreateWeightVersionRequest {
   // Required for worker publication; absent for object-storage versions.
   optional string trainer_mesh_id = 9;
   optional int64 version_number = 10;
+  map<string, string> trace_context = 11;
 }
 
 message ListWeightVersionsRequest {

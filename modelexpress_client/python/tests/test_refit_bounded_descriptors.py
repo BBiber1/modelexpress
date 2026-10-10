@@ -415,12 +415,12 @@ def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
     assert metrics["descriptor_cache_hits"] == 1
 
 
-def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
+def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch) -> None:
     now = [0.0]
     monkeypatch.setattr(module.time, "perf_counter", lambda: now[0])
     original = harness.transfer._descriptors
 
-    def delayed_descriptors(*args, **kwargs):
+    def delayed_descriptors(*args, **kwargs) -> list:
         now[0] += 100
         return original(*args, **kwargs)
 
@@ -428,7 +428,7 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     cold, _ = harness.collect(harness.prepare())
     warm, _ = harness.collect(harness.prepare())
     assert now[0] == 400
-    assert cold["wire_s"] == warm["wire_s"] == 0
+    assert cold["wire_host_s"] == warm["wire_host_s"] == 0
     assert warm["descriptor_builds"] == 0
 
 

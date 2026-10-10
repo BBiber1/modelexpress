@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -41,20 +42,6 @@ SLOW_WIRE_S = 10.741
 FAST_WIRE_S = 0.632
 FLOOR_GBPS = 50.0
 DEVICE_ID = 3
-
-
-class _Clock:
-    """A perf_counter that hands out a scripted sequence.
-
-    The rate under test is bytes over a measured span, so a real clock would make
-    the assertion depend on how fast the stub transport happens to return.
-    """
-
-    def __init__(self, *stamps: float) -> None:
-        self._stamps = iter(stamps)
-
-    def perf_counter(self) -> float:
-        return next(self._stamps)
 
 
 class _Transport:
@@ -118,17 +105,21 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
     )
 
 
-def _stage(monkeypatch, *, nbytes: int, wire_s: float):
+def _stage(monkeypatch, *, nbytes: int, wire_s: float) -> transfer_module._StagedNixlWeights:
     """Run stage() to completion on CPU with a scripted wire duration."""
+    now = [0.0]
     monkeypatch.setattr(
-        transfer_module,
-        "time",
-        # started, wait_started, wait end, wire end, reconstruct start, reconstruct end
-        _Clock(0.0, 0.0, wire_s, wire_s, wire_s, wire_s),
+        transfer_module, "time", SimpleNamespace(perf_counter=lambda: now[0])
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     tensor = torch.arange(64, dtype=torch.int32)
     prepared = _prepared(tensor, nbytes)
+
+    def await_reads(posted) -> None:
+        assert posted == []
+        now[0] += wire_s
+
+    monkeypatch.setattr(prepared.transport, "await_reads", await_reads)
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._closed = False
