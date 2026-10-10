@@ -263,7 +263,7 @@ def _manifest(
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "registration", "cleanup", "metadata", "metadata_drift", "capture", "malformed"]
+    "failure", [None, "registration", "cleanup", "metadata_identity", "metadata_drift", "capture", "malformed"]
 )
 @pytest.mark.parametrize("bounded", [False, True])
 def test_fixed_mode_updates_receive_changed_values(
@@ -444,13 +444,13 @@ def test_fixed_mode_updates_receive_changed_values(
             with pytest.raises(RuntimeError, match="release"):
                 method.prepare(version=None, source=ResolvedTrainerSource(source))
             method.release(prepared)
-            if index == 0 and failure in ("metadata", "metadata_drift", "capture", "malformed"):
+            if index == 0 and failure in ("metadata_identity", "metadata_drift", "capture", "malformed"):
                 addresses = {
                     name: tensor.data_ptr()
                     for name, tensor in transfer._manager.registered.items()
                 }
                 reads = events.count("read")
-                if failure in ("metadata", "metadata_drift"):
+                if failure in ("metadata_identity", "metadata_drift"):
                     payload = unwrap_rendezvous_blob(manifest)
                     changed = wrap_rendezvous_blob(
                         b"changed",
@@ -464,7 +464,7 @@ def test_fixed_mode_updates_receive_changed_values(
                         shards=(replace(source.shards[0], metadata=changed,
                             stable_metadata_digest=hashlib.sha256(changed).hexdigest()),),
                     )
-                    expected = "within a mesh generation" if failure == "metadata_drift" else "already connected source"
+                    expected = "within a mesh generation" if failure == "metadata_drift" else "does not match its manifest"
                 elif failure == "capture":
                     payload = unwrap_rendezvous_blob(manifest)
                     renamed = replace(payload.tensors[0], name="renamed")
@@ -504,18 +504,23 @@ def test_fixed_mode_updates_receive_changed_values(
                 finally:
                     if failure == "capture":
                         method._capture_layout = capture_layout
-                assert transfer._manager.ready
-                assert {
-                    name: tensor.data_ptr()
-                    for name, tensor in transfer._manager.registered.items()
-                } == addresses
                 assert events.count("read") == reads
-                assert "shutdown" not in events
-            if index != 0 or failure not in ("metadata", "metadata_drift", "capture", "malformed"):
+                if failure == "metadata_identity":
+                    assert not transfer._manager.ready
+                    assert not transfer._manager.registered
+                    assert events.count("shutdown") == 2
+                else:
+                    assert transfer._manager.ready
+                    assert {
+                        name: tensor.data_ptr()
+                        for name, tensor in transfer._manager.registered.items()
+                    } == addresses
+                    assert "shutdown" not in events
+            if index != 0 or failure not in ("metadata_identity", "metadata_drift", "capture", "malformed"):
                 source = method.cached_trainer_source()
                 assert source is not None
-        assert events.count("register") == (2 if failure == "registration" else 1)
-        assert events.count("shutdown") == int(failure == "registration")
+        assert events.count("register") == (2 if failure in ("registration", "metadata_identity") else 1)
+        assert events.count("shutdown") == (2 if failure == "metadata_identity" else int(failure == "registration"))
     finally:
         method.close()
         assert not transfer._manager.registered
