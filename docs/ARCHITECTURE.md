@@ -1832,6 +1832,12 @@ retain #877's physical-plan invalidation and storage cleanup.
 geometry before zeroing or posting each batch. Each round still owns fresh
 checksums, transport handles and source leases. Padding is zeroed before every
 READ, and synchronization, verification and drain rules remain unchanged.
+Loaded native agent metadata records also retain the mesh identity that last
+validated each required registration. Unused agents keep their prior identity.
+A changed registration from an earlier mesh identity resets an owned agent
+before reconnecting; same-identity conflicts still fail.
+Borrowed agents cannot be torn down. Identical required registrations preserve
+compatible native state and staging capacity across mesh changes.
 Typed views retain their arena storage until their plan or iteration is
 released; the binding owns no native manager or READ handles. Descriptor work
 stays outside the wire timer.

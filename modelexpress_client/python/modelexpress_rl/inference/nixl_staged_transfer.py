@@ -98,6 +98,11 @@ def _layout_values_match(left: Any, right: Any) -> bool:
     return left == right
 
 
+class _ConnectedAgent(NamedTuple):
+    metadata: bytes
+    mesh_identity: tuple[str, int]
+
+
 @dataclass(frozen=True)
 class _ResolvedSources:
     sources: dict
@@ -708,7 +713,7 @@ class _NixlStagedTransfer:
         self._convert_registered = False
         self._full_registered = False
         self._active: _PreparedNixlTransfer | _PreparedBoundedTransfer | None = None
-        self._loaded_agent_metadata: dict[str, bytes] = {}
+        self._loaded_agent_metadata: dict[str, _ConnectedAgent] = {}
         self._closed = False
         # Bounded staging: one or two byte arenas on CUDA or pinned host memory.
         # Host arenas are registered as NIXL DRAM and tracked here so they can be
@@ -1148,25 +1153,35 @@ class _NixlStagedTransfer:
         required_metadata: Mapping[str, bytes],
         *,
         host_staging: bool = False,
+        mesh_identity: tuple[str, int],
+        recreate_workspace: bool = False,
     ) -> NixlReshardTransport:
-        self._ensure_manager_initialized()
         changed = {
-            agent: metadata
-            for agent, metadata in required_metadata.items()
-            if self._loaded_agent_metadata.get(agent) != metadata
+            agent: metadata for agent, metadata in required_metadata.items()
+            if agent not in self._loaded_agent_metadata
+            or self._loaded_agent_metadata[agent].metadata != metadata
         }
-        conflicting = sorted(
-            agent for agent in changed if agent in self._loaded_agent_metadata
-        )
-        if conflicting:
+        conflicting = sorted(agent for agent in changed if agent in self._loaded_agent_metadata)
+        unsafe = [
+            agent for agent in conflicting
+            if self._loaded_agent_metadata[agent].mesh_identity == mesh_identity
+        ]
+        if unsafe:
             raise RuntimeError(
                 "NIXL metadata changed for an already connected source agent: "
-                f"{conflicting[:10]}"
+                f"{unsafe[:10]}"
             )
+        if conflicting or recreate_workspace:
+            self.reset_workspace()
+            changed = dict(required_metadata)
+        self._ensure_manager_initialized()
         if changed:
             self._native_setup_started = True
         _load_agent_metadata(self._manager, changed)
-        self._loaded_agent_metadata.update(changed)
+        for agent, metadata in required_metadata.items():
+            previous = self._loaded_agent_metadata.get(agent)
+            if previous is None or previous.mesh_identity != mesh_identity:
+                self._loaded_agent_metadata[agent] = _ConnectedAgent(metadata, mesh_identity)
         return NixlReshardTransport(
             self._manager,
             resolved.session_to_agent,
@@ -1300,7 +1315,10 @@ class _NixlStagedTransfer:
             cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, plan
             ))
-            transport = self._connect_sources(resolved, cached.required_agent_metadata)
+            transport = self._connect_sources(
+                resolved, cached.required_agent_metadata,
+                mesh_identity=(trainer.mesh_id, trainer.mesh_generation),
+            )
             self._ensure_workspace(plan, parameter_layout)
             if rebound is not None or not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
@@ -1376,10 +1394,13 @@ class _NixlStagedTransfer:
             cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, compiled
             ))
-            if self._staging_arenas and self._staging_arenas[0].numel() < compiled.arena_bytes:
-                self.reset_workspace()
             transport = self._connect_sources(
-                resolved, cached.required_agent_metadata, host_staging=staging_device == "cpu"
+                resolved, cached.required_agent_metadata, host_staging=staging_device == "cpu",
+                mesh_identity=(trainer.mesh_id, trainer.mesh_generation),
+                recreate_workspace=bool(
+                    self._staging_arenas
+                    and self._staging_arenas[0].numel() < compiled.arena_bytes
+                ),
             )
             if (
                 cached.bounded_workspace is None

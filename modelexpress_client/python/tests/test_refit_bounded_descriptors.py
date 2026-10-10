@@ -6,6 +6,7 @@ import hashlib
 import gc
 import weakref
 from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace, MappingProxyType
 
@@ -80,9 +81,10 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
 
         def add_remote_agent(self, metadata) -> str:
             events.append(f"connect:{metadata.decode()}")
-            return metadata.decode()
+            return metadata.decode().split(":", 1)[0]
 
         def register_tensors(self, tensors) -> None:
+            events.append("register")
             self.registered.update(tensors)
 
         def register_dram_buffer(self, tensor) -> object:
@@ -214,7 +216,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
     transfer.close()
 
 
-def _check_values(harness, installed, *, exact_rows: int | None = None) -> None:
+def _check_values(harness, installed, *, exact_rows: int | None = None, check_padding: bool = True) -> None:
     for source, name, dtype, transpose in (
         ("exact", "a.weight", torch.float32, False),
         ("full", "b.weight", torch.float32, True),
@@ -226,7 +228,10 @@ def _check_values(harness, installed, *, exact_rows: int | None = None) -> None:
         if source == "exact" and exact_rows is not None:
             value = value[:exact_rows]
         expected[2:18].copy_((value.T if transpose else value).reshape(-1))
-        assert torch.equal(installed[name], expected)
+        if check_padding:
+            assert torch.equal(installed[name], expected)
+        else:
+            assert torch.equal(installed[name][2:18], expected[2:18])
 
 
 @pytest.mark.parametrize(
@@ -725,3 +730,128 @@ def test_owned_growth_registration_failure_cleans_up_before_retry(harness, monke
     _, installed = harness.collect(recovered)
     _check_values(harness, installed)
     assert recovered.transport.awaited == recovered.transport.posted
+
+
+def _agent_registration_snapshot(
+    harness, *, generation: int, tokens: dict[str, bytes],
+    assignments: dict[str, str] | None = None, worker: str = "worker",
+) -> TrainerSourceSnapshot:
+    assignments = assignments or {name: "source" for name in harness.sources}
+    shards = []
+    for agent, token in tokens.items():
+        blob = wrap_rendezvous_blob(
+            token, agent, f"{agent}:19000",
+            [PublishedTensor(
+                name=name, dtype="torch.float32", elsize=4, full_shape=(4, 4),
+                shards=[PublishedShard(
+                    agent_name=agent, device_id=0, addr=tensor.data_ptr(),
+                    shard_offset=(0, 0), shape=(4, 4),
+                )],
+            ) for name, tensor in harness.sources.items() if assignments[name] == agent],
+        )
+        shards.append(TrainerSourceShard(agent, worker, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob))
+    return TrainerSourceSnapshot("registration-mesh", generation, tuple(shards))
+
+
+def _prepare_agent_registration(harness, snapshot) -> module._PreparedNixlTransfer | module._PreparedBoundedTransfer:
+    prepare = harness.transfer.prepare_full_copy if harness.streaming is None else harness.transfer.prepare_streaming
+    return prepare(
+        manifests=[shard.metadata for shard in snapshot.shards], trainer_snapshot=snapshot,
+        capture_layout=lambda _: (harness.capture, harness.layout),
+    )
+
+
+def _collect_agent_registration(harness, prepared) -> dict:
+    if harness.streaming is not None:
+        _, installed = harness.collect(prepared)
+        return installed
+    return {name: value.clone() for name, value in harness.transfer.stage(prepared).tensors.items()}
+
+
+@pytest.mark.parametrize("harness", [None, StreamingSettings(1024, "cpu")], indirect=True)
+def test_next_generation_replaces_agent_registration_before_read(harness, monkeypatch) -> None:
+    monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
+    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    first = _agent_registration_snapshot(harness, generation=1, tokens={"source": b"source"})
+    _check_values(harness, _collect_agent_registration(harness, _prepare_agent_registration(harness, first)), check_padding=harness.streaming is not None)
+    for tensor in harness.sources.values():
+        tensor.add_(5)
+    harness.events.clear()
+    second = _agent_registration_snapshot(harness, generation=2, tokens={"source": b"source:registration-v2"})
+    prepared = _prepare_agent_registration(harness, second)
+    _check_values(harness, _collect_agent_registration(harness, prepared), check_padding=harness.streaming is not None)
+    events = harness.events
+    assert events.index("shutdown") < events.index("initialize") < events.index("connect:source:registration-v2") < events.index("register") < events.index("post")
+    assert prepared.transport.awaited == prepared.transport.posted
+
+
+@pytest.mark.parametrize("worker", ["worker", "replacement"])
+def test_current_generation_registration_conflict_rejects_before_read(harness, worker) -> None:
+    first = _agent_registration_snapshot(harness, generation=1, tokens={"source": b"source"})
+    _collect_agent_registration(harness, _prepare_agent_registration(harness, first))
+    harness.events.clear()
+    changed = _agent_registration_snapshot(harness, generation=1, tokens={"source": b"source:registration-v2"}, worker=worker)
+    with pytest.raises(RuntimeError):
+        _prepare_agent_registration(harness, changed)
+    assert "post" not in harness.events
+    assert "connect:source:registration-v2" not in harness.events
+
+
+def test_borrowed_manager_registration_replacement_preserves_native_resources(harness, monkeypatch) -> None:
+    first = _agent_registration_snapshot(harness, generation=1, tokens={"source": b"source"})
+    _collect_agent_registration(harness, _prepare_agent_registration(harness, first))
+    registrations = [(tensor.data_ptr(), tensor.numel()) for tensor in harness.transfer._manager.registered.values()]
+    harness.events.clear()
+    second = _agent_registration_snapshot(harness, generation=2, tokens={"source": b"source:registration-v2"})
+    with monkeypatch.context() as borrowed:
+        borrowed.setattr(harness.transfer, "_owns_manager", False)
+        with pytest.raises(RuntimeError, match="transfer-owned NIXL agent"):
+            _prepare_agent_registration(harness, second)
+    assert not any(event in harness.events for event in ("shutdown", "post", "deregister"))
+    assert [(tensor.data_ptr(), tensor.numel()) for tensor in harness.transfer._manager.registered.values()] == registrations
+
+
+@pytest.mark.parametrize("current_conflict", [False, True])
+def test_required_agent_generations_distinguish_unused_and_current_conflicts(harness, current_conflict) -> None:
+    split = {"exact": "source", "full": "other", "convert": "other"}
+    first = _agent_registration_snapshot(harness, generation=1, tokens={"source": b"source", "other": b"other"}, assignments=split)
+    _check_values(harness, _collect_agent_registration(harness, _prepare_agent_registration(harness, first)))
+    second = _agent_registration_snapshot(harness, generation=2, tokens={"other": b"other"}, assignments={name: "other" for name in harness.sources})
+    _check_values(harness, _collect_agent_registration(harness, _prepare_agent_registration(harness, second)))
+    harness.events.clear()
+    tokens = {"source": b"source:registration-v2", "other": b"other:registration-v2" if current_conflict else b"other"}
+    third = _agent_registration_snapshot(harness, generation=2, tokens=tokens, assignments=split, worker="replacement")
+    if current_conflict:
+        with pytest.raises(RuntimeError, match="already connected source"):
+            _prepare_agent_registration(harness, third)
+        assert not any(event in harness.events for event in ("shutdown", "post", "initialize"))
+    else:
+        prepared = _prepare_agent_registration(harness, third)
+        _check_values(harness, _collect_agent_registration(harness, prepared))
+        assert harness.events.index("shutdown") < harness.events.index("connect:source:registration-v2") < harness.events.index("post")
+        assert "connect:other" in harness.events
+
+
+def test_registration_replacement_failure_cleans_up_and_retries_current_bytes(harness, monkeypatch) -> None:
+    first = _agent_registration_snapshot(harness, generation=1, tokens={"source": b"source"})
+    _collect_agent_registration(harness, _prepare_agent_registration(harness, first))
+    for tensor in harness.sources.values():
+        tensor.add_(5)
+    second = _agent_registration_snapshot(harness, generation=2, tokens={"source": b"source:registration-v2"})
+    harness.events.clear()
+
+    def failed_connection(_metadata: bytes) -> None:
+        harness.events.append("connect_failed")
+        raise RuntimeError("registration replacement failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(harness.transfer._manager, "add_remote_agent", failed_connection)
+        with pytest.raises(RuntimeError, match="registration replacement failed"):
+            _prepare_agent_registration(harness, second)
+    assert "post" not in harness.events
+    assert harness.transfer._manager.registered == {}
+    assert harness.events.index("shutdown") < harness.events.index("initialize") < harness.events.index("connect_failed")
+    assert harness.events[-1] == "shutdown"
+    prepared = _prepare_agent_registration(harness, second)
+    _check_values(harness, _collect_agent_registration(harness, prepared))
+    assert prepared.transport.awaited == prepared.transport.posted
