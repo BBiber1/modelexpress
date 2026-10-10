@@ -11,14 +11,12 @@ how an inference engine captures its load layout or installs received weights.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import threading
 import time
 import weakref
 from collections.abc import Callable, Iterator, Mapping
-from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from types import MappingProxyType
@@ -65,7 +63,6 @@ from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 from modelexpress_rl.inference._source_snapshot import (
     _freeze_sources,
-    _snapshot_structure,
     _source_structure,
     _SourceSnapshot,
 )
@@ -114,8 +111,6 @@ class _WeightUpdatePlan:
     generator_capture_snapshot: CaptureResult
     parameter_layout: MappingProxyType
     transfer_plan: TensorTransferPlan | _StreamingSchedule
-    key: tuple | None
-    manifests: tuple[bytes, ...]
 
 
 @dataclass(frozen=True)
@@ -235,189 +230,7 @@ class _BoundedDescriptors:
         )
 
 
-class _BoundedPlanCache:
-    """Keep one validated plan without transport handles or destination views."""
 
-    def __init__(self) -> None:
-        self._entry: tuple[tuple, _StreamingSchedule] | None = None
-        self._compile_lock = threading.Lock()
-
-    def clear(self) -> None:
-        self._entry = None
-
-    def compile(
-        self,
-        *,
-        manifests,
-        resolved,
-        capture,
-        parameter_layout,
-        max_staging_bytes,
-        enabled,
-        metrics,
-        staging_device="cuda",
-        staging_buffers=1,
-        total_staging_bytes=None,
-        source_snapshot=None,
-    ) -> _StreamingSchedule:
-        """Compile a bounded plan, copying inputs when caching is enabled.
-
-        Keep capture/layout stable during compilation. Uncached plans retain
-        capture records, which must stay unchanged until transfer completes.
-        The optional guard serializes compilation, not arbitrary input writers.
-        """
-        copy_key_on_miss = envs.MX_REFIT_COPY_PLAN_KEY_ON_MISS
-        if copy_key_on_miss and not self._compile_lock.acquire(blocking=False):
-            raise RuntimeError("bounded plan compilation is already in progress")
-        try:
-            return self._compile(
-                manifests=manifests,
-                resolved=resolved,
-                capture=capture,
-                parameter_layout=parameter_layout,
-                max_staging_bytes=max_staging_bytes,
-                enabled=enabled,
-                metrics=metrics,
-                copy_key_on_miss=copy_key_on_miss,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=total_staging_bytes,
-                source_snapshot=source_snapshot,
-            )
-        finally:
-            if copy_key_on_miss:
-                self._compile_lock.release()
-
-    def _compile(
-        self,
-        *,
-        manifests,
-        resolved,
-        capture,
-        parameter_layout,
-        max_staging_bytes,
-        enabled,
-        metrics,
-        copy_key_on_miss,
-        staging_device,
-        staging_buffers,
-        total_staging_bytes,
-        source_snapshot,
-    ) -> _StreamingSchedule:
-        entry = self._entry
-        self.clear()
-        metrics.update(
-            plan_cache_enabled=int(enabled),
-            plan_cache_copy_key_on_miss_enabled=int(copy_key_on_miss),
-            plan_cache_key_copies=0,
-            plan_cache_hits=0,
-            plan_cache_misses=0,
-            plan_cache_lookup_s=0.0,
-            plan_cache_validate_s=0.0,
-            plan_cache_fingerprint_s=0.0,
-            initial_whole_plan_s=0.0,
-            initial_whole_validation_s=0.0,
-            bounded_whole_plan_s=0.0,
-            bounded_whole_plan_builds=0,
-            bounded_whole_validation_s=0.0,
-            owner_plan_s=0.0,
-            owner_validation_s=0.0,
-            owner_plan_builds=0,
-        )
-        pack = envs.MX_REFIT_PACK_MODULES
-        reuse_complete = envs.MX_REFIT_REUSE_COMPLETE_PLAN
-        key = None
-        if enabled:
-            started = time.perf_counter()
-            if any(not isinstance(blob, bytes) for blob in manifests):
-                raise TypeError("cached plan manifests must be immutable bytes")
-            capture_key = (capture, tuple(parameter_layout.items()))
-            if not copy_key_on_miss:
-                capture_key = deepcopy(capture_key)
-                metrics["plan_cache_key_copies"] = 1
-            source_key = _snapshot_structure(resolved, source_snapshot)
-            if source_key is None:
-                source_key = tuple(
-                    (name, _source_structure(source))
-                    for name, source in resolved.sources.items()
-                )
-            key = (
-                tuple(manifests),
-                source_key,
-                tuple(resolved.session_to_agent.items()),
-                tuple(resolved.session_to_device.items()),
-                tuple(resolved.agent_metadata.items()),
-                capture_key,
-                max_staging_bytes,
-                pack,
-                reuse_complete,
-                envs.MX_RESHARD_PUBLISH_DIGEST,
-                envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY,
-                staging_device,
-                staging_buffers,
-                total_staging_bytes,
-            )
-            hit = entry is not None and _layout_values_match(entry[0], key)
-            if not hit and copy_key_on_miss:
-                key = (*key[:5], deepcopy(capture_key), *key[6:])
-                metrics["plan_cache_key_copies"] = 1
-            metrics["plan_cache_lookup_s"] = time.perf_counter() - started
-            metrics["plan_cache_hits"] = int(hit)
-            metrics["plan_cache_misses"] = int(not hit)
-            if hit:
-                assert entry is not None
-                compiled = entry[1]
-                started = time.perf_counter()
-                _NixlStagedTransfer._validate_complete(
-                    capture, parameter_layout, compiled.transfer_plan
-                )
-                metrics["bounded_whole_validation_s"] = time.perf_counter() - started
-                owner_started = time.perf_counter()
-                for batch in compiled.module_batches:
-                    _NixlStagedTransfer._validate_complete(
-                        batch.capture, batch.layouts[0], batch.transfer_plan
-                    )
-                metrics["owner_validation_s"] = time.perf_counter() - owner_started
-                metrics["plan_cache_validate_s"] = time.perf_counter() - started
-                self._entry = entry
-                logger.info("reusing bounded physical plan %s", compiled.fingerprint)
-                return compiled
-        if enabled:
-            # Plan copies/layouts must not alias the callback or key snapshots.
-            capture, parameter_layout = deepcopy((capture, parameter_layout))
-        started = time.perf_counter()
-        plan = _plan_staged_transfer(capture, resolved.sources)
-        metrics["initial_whole_plan_s"] = time.perf_counter() - started
-        started = time.perf_counter()
-        if not reuse_complete:
-            _NixlStagedTransfer._validate_complete(capture, parameter_layout, plan)
-        metrics["initial_whole_validation_s"] = time.perf_counter() - started
-        modules = _bounded_batches(
-            capture,
-            parameter_layout,
-            resolved.sources,
-            max_staging_bytes,
-            complete_plan=plan if reuse_complete else None,
-            metrics=metrics,
-            total_staging_bytes=total_staging_bytes,
-            staging_buffers=staging_buffers,
-        )
-        batches = _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
-        fingerprint = None
-        if key is not None:
-            started = time.perf_counter()
-            digest = hashlib.sha256()
-            for blob in key[0]:
-                digest.update(len(blob).to_bytes(8, "big"))
-                digest.update(blob)
-            digest.update(repr(key[1:]).encode())
-            fingerprint = digest.hexdigest()
-            metrics["plan_cache_fingerprint_s"] = time.perf_counter() - started
-        compiled = _StreamingSchedule(plan, modules, batches, fingerprint)
-        if key is not None:
-            self._entry = (key, compiled)
-            logger.info("compiled bounded physical plan %s", fingerprint)
-        return compiled
 
 
 def _bounded_batches(
@@ -793,6 +606,9 @@ class _NixlStagedTransfer:
         self._manager_ready = True
         self._weight_update_plan: _WeightUpdatePlan | None = None
         self._full_copy_descriptors: tuple[ReadDescriptor, ...] | None = None
+        self._debug_validate_plan = envs.MX_REFIT_DEBUG_VALIDATE_PLAN
+        self._debug_validate_layout = envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        self._pack_modules = envs.MX_REFIT_PACK_MODULES
         self._plan_compile_lock = threading.Lock()
         self._workspace_generation = 0
         self._descriptor_cache: _BoundedDescriptors | None = None
@@ -868,11 +684,10 @@ class _NixlStagedTransfer:
     def _resolve_metadata(
         self, manifests: list[bytes], metrics: dict
     ) -> tuple[_ResolvedSources, _SourceSnapshot | None]:
-        enabled = envs.MX_REFIT_CACHE_RESOLVED_SOURCES
-        if enabled and any(not isinstance(blob, bytes) for blob in manifests):
+        if any(not isinstance(blob, bytes) for blob in manifests):
             raise TypeError("cached source manifests must be immutable bytes")
         metrics.update(
-            source_cache_enabled=int(enabled),
+            source_cache_enabled=1,
             source_cache_hits=0,
             source_cache_misses=0,
             source_cache_lookup_s=0.0,
@@ -881,30 +696,28 @@ class _NixlStagedTransfer:
             source_build_s=0.0,
             source_manifest_bytes=sum(len(blob) for blob in manifests),
         )
-        if enabled:
-            started = time.perf_counter()
-            previous = self._weight_update_plan
-            hit = previous is not None and previous.manifests == tuple(manifests)
-            metrics["source_cache_lookup_s"] = time.perf_counter() - started
-            metrics["source_cache_hits"] = int(hit)
-            metrics["source_cache_misses"] = int(not hit)
-            if hit:
-                trainer = previous.trainer_source_snapshot
-                frozen = (
-                    _SourceSnapshot(
-                        trainer.resolved_metadata.sources, trainer.resolved_structure
-                    )
-                    if trainer.resolved_structure is not None
-                    else None
+        started = time.perf_counter()
+        previous = self._weight_update_plan
+        hit = previous is not None and tuple(source.metadata for source in previous.trainer_source_snapshot.shards) == tuple(manifests)
+        metrics["source_cache_lookup_s"] = time.perf_counter() - started
+        metrics["source_cache_hits"] = int(hit)
+        metrics["source_cache_misses"] = int(not hit)
+        if hit:
+            trainer = previous.trainer_source_snapshot
+            frozen = (
+                _SourceSnapshot(
+                    trainer.resolved_metadata.sources, trainer.resolved_structure
                 )
-                return trainer.resolved_metadata, frozen
+                if trainer.resolved_structure is not None
+                else None
+            )
+            return trainer.resolved_metadata, frozen
         resolved = _resolve_sources(manifests, metrics=metrics)
         started = time.perf_counter()
         frozen = _freeze_sources(resolved.sources)
         if frozen is not None:
             resolved = replace(resolved, sources=frozen.sources)
-        if enabled:
-            metrics["source_build_s"] += time.perf_counter() - started
+        metrics["source_build_s"] += time.perf_counter() - started
         resolved = replace(
             resolved,
             session_to_agent=MappingProxyType(dict(resolved.session_to_agent)),
@@ -948,6 +761,7 @@ class _NixlStagedTransfer:
                 (name, source.dtype, tuple(source.global_shape))
                 for name, source in previous_metadata.sources.items()
             )
+            and not self._debug_validate_layout
         ):
             metrics["source_metadata_s"] = time.perf_counter() - started
             return (
@@ -959,8 +773,118 @@ class _NixlStagedTransfer:
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
         capture, parameter_layout = capture_layout(list(source_schema))
+        if (
+            self._debug_validate_layout
+            and previous is not None
+            and trainer.physical_fingerprint == previous.trainer_source_snapshot.physical_fingerprint
+            and (
+                not _layout_values_match(previous.generator_capture_snapshot, capture)
+                or previous.parameter_layout != parameter_layout
+            )
+        ):
+            raise RuntimeError("engine load layout changed for an unchanged source")
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout, frozen
+
+    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
+        plan = self._weight_update_plan
+        if (
+            plan is None
+            or self._closed
+            or self._debug_validate_plan
+            or self._debug_validate_layout
+        ):
+            return None
+        return plan.trainer_source_snapshot
+
+    def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
+        previous = self._weight_update_plan
+        return (
+            previous is not None
+            and trainer is previous.trainer_source_snapshot
+            and not self._debug_validate_plan
+            and not self._debug_validate_layout
+        )
+
+    def _compile_streaming(
+        self,
+        trainer: TrainerSourceSnapshot,
+        capture: CaptureResult,
+        parameter_layout: Mapping,
+        metrics: dict,
+    ) -> _StreamingSchedule:
+        if not self._plan_compile_lock.acquire(blocking=False):
+            raise RuntimeError("bounded plan compilation is already in progress")
+        try:
+            metrics.update(
+                plan_cache_enabled=1,
+                plan_cache_hits=0,
+                plan_cache_misses=0,
+                plan_cache_lookup_s=0.0,
+                plan_cache_validate_s=0.0,
+                initial_whole_plan_s=0.0,
+                initial_whole_validation_s=0.0,
+                bounded_whole_plan_s=0.0,
+                bounded_whole_plan_builds=0,
+                bounded_whole_validation_s=0.0,
+                owner_plan_s=0.0,
+                owner_validation_s=0.0,
+                owner_plan_builds=0,
+            )
+            started = time.perf_counter()
+            previous = self._weight_update_plan
+            hit = (
+                previous is not None
+                and isinstance(previous.transfer_plan, _StreamingSchedule)
+                and previous.trainer_source_snapshot.physical_fingerprint == trainer.physical_fingerprint
+                and tuple(source.metadata for source in trainer.shards)
+                == tuple(source.metadata for source in previous.trainer_source_snapshot.shards)
+                and _layout_values_match(previous.generator_capture_snapshot, capture)
+                and previous.parameter_layout == parameter_layout
+            )
+            metrics["plan_cache_lookup_s"] = time.perf_counter() - started
+            metrics["plan_cache_hits"] = int(hit)
+            metrics["plan_cache_misses"] = int(not hit)
+            if hit:
+                compiled = previous.transfer_plan
+                if self._debug_validate_plan:
+                    started = time.perf_counter()
+                    _NixlStagedTransfer._validate_complete(
+                        capture, parameter_layout, compiled.transfer_plan
+                    )
+                    metrics["bounded_whole_validation_s"] = time.perf_counter() - started
+                    owner_started = time.perf_counter()
+                    for batch in compiled.module_batches:
+                        _NixlStagedTransfer._validate_complete(
+                            batch.capture, batch.layouts[0], batch.transfer_plan
+                        )
+                    metrics["owner_validation_s"] = time.perf_counter() - owner_started
+                    metrics["plan_cache_validate_s"] = time.perf_counter() - started
+                logger.info("reusing bounded physical plan")
+                return compiled
+            started = time.perf_counter()
+            plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
+            metrics["initial_whole_plan_s"] = time.perf_counter() - started
+            modules = _bounded_batches(
+                capture,
+                parameter_layout,
+                trainer.resolved_metadata.sources,
+                self._buffer_budget,
+                complete_plan=plan,
+                metrics=metrics,
+                total_staging_bytes=self._streaming.max_staging_bytes,
+                staging_buffers=self._streaming.staging_buffers,
+            )
+            batches = (
+                _pack_bounded_batches(modules, self._buffer_budget)
+                if self._pack_modules else modules
+            )
+            compiled = _StreamingSchedule(plan, modules, batches)
+            logger.info("compiled bounded physical plan")
+            return compiled
+
+        finally:
+            self._plan_compile_lock.release()
 
     def _connect_sources(
         self,
@@ -1040,23 +964,42 @@ class _NixlStagedTransfer:
         with self._preparing():
             self._descriptor_cache = None
             previous = self._weight_update_plan
+            metrics = {}
+            warm = self._can_reuse_plan(trainer_snapshot)
+            layout = (
+                self._resolve_layout(manifests, capture_layout, metrics, trainer_snapshot)
+                if self._debug_validate_layout and not warm else None
+            )
             reusable = (
                 previous is not None
                 and isinstance(previous.transfer_plan, TensorTransferPlan)
-                and previous.key == trainer_snapshot.physical_fingerprint
+                and (warm or previous.trainer_source_snapshot.physical_fingerprint
+                     == trainer_snapshot.physical_fingerprint)
+                and (layout is None or (
+                    _layout_values_match(previous.generator_capture_snapshot, layout[1])
+                    and previous.parameter_layout == layout[2]
+                ))
             )
-            metrics = {
-                "plan_cache_hits": int(reusable),
-                "plan_cache_misses": int(not reusable),
-            }
+            metrics.update(
+                plan_cache_hits=int(reusable), plan_cache_misses=int(not reusable)
+            )
             if reusable:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.generator_capture_snapshot
                 parameter_layout = previous.parameter_layout
                 plan = previous.transfer_plan
-                if tuple(manifests) != previous.manifests:
-                    resolved, frozen = self._resolve_metadata(manifests, metrics)
-                    old = trainer.resolved_metadata
+                if layout is not None:
+                    trainer, capture, parameter_layout, _ = layout
+                if not warm and tuple(manifests) != tuple(
+                    source.metadata
+                    for source in previous.trainer_source_snapshot.shards
+                ):
+                    if layout is None:
+                        resolved, frozen = self._resolve_metadata(manifests, metrics)
+                    else:
+                        resolved = trainer.resolved_metadata
+                        frozen = layout[3]
+                    old = previous.trainer_source_snapshot.resolved_metadata
                     if set(resolved.sources) != set(old.sources) or any(
                         _source_structure(source)
                         != _source_structure(old.sources[name])
@@ -1073,9 +1016,14 @@ class _NixlStagedTransfer:
                         ),
                     )
                     metrics["manifest_refreshes"] = 1
+                if self._debug_validate_plan:
+                    self._validate_complete(capture, dict(parameter_layout), plan)
             else:
-                trainer, capture, parameter_layout, _ = self._resolve_layout(
-                    manifests, capture_layout, metrics, trainer_snapshot
+                trainer, capture, parameter_layout, _ = (
+                    layout
+                    or self._resolve_layout(
+                        manifests, capture_layout, metrics, trainer_snapshot
+                    )
                 )
                 started = time.perf_counter()
                 plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
@@ -1087,9 +1035,11 @@ class _NixlStagedTransfer:
                 )
                 metrics["transfer_planning_s"] = time.perf_counter() - started
             resolved = trainer.resolved_metadata
-            transport = self._connect_sources(
-                resolved, _required_agent_metadata(plan, resolved)
+            required_metadata = _required_agent_metadata(plan, resolved)
+            cached = previous if warm else _WeightUpdatePlan(
+                trainer, capture, parameter_layout, plan
             )
+            transport = self._connect_sources(resolved, required_metadata)
             self._ensure_workspace(plan, parameter_layout)
             if not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
@@ -1106,14 +1056,6 @@ class _NixlStagedTransfer:
                 metrics=metrics,
                 checksums=checksums if checksums is not None else MappingProxyType({}),
             )
-            cached = _WeightUpdatePlan(
-                trainer,
-                capture,
-                MappingProxyType(parameter_layout),
-                plan,
-                trainer_snapshot.physical_fingerprint,
-                tuple(manifests),
-            )
             self._publish_prepared(cached, prepared)
             return prepared
 
@@ -1129,38 +1071,37 @@ class _NixlStagedTransfer:
         streaming = self._streaming
         if streaming is None:
             raise RuntimeError("this transfer owns full-copy staging storage")
-        max_staging_bytes = streaming.max_staging_bytes
         staging_device = streaming.staging_device
-        staging_buffers = streaming.staging_buffers
-        buffer_budget = self._buffer_budget
-        assert buffer_budget is not None
+        assert self._buffer_budget is not None
         with self._preparing():
             previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
             previous = self._weight_update_plan
             metrics = {}
-            trainer, capture, parameter_layout, frozen = self._resolve_layout(
-                manifests, capture_layout, metrics, trainer_snapshot
+            warm = (
+                previous is not None
+                and isinstance(previous.transfer_plan, _StreamingSchedule)
+                and self._can_reuse_plan(trainer_snapshot)
             )
-            compiler = _BoundedPlanCache()
-            compiler._compile_lock = self._plan_compile_lock
-            if previous is not None and isinstance(
-                previous.transfer_plan, _StreamingSchedule
-            ):
-                compiler._entry = (previous.key, previous.transfer_plan)
             started = time.perf_counter()
-            compiled = compiler.compile(
-                manifests=manifests,
-                resolved=trainer.resolved_metadata,
-                capture=capture,
-                parameter_layout=dict(parameter_layout),
-                max_staging_bytes=buffer_budget,
-                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-                metrics=metrics,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=max_staging_bytes,
-                source_snapshot=frozen,
-            )
+            if warm:
+                trainer = previous.trainer_source_snapshot
+                capture = previous.generator_capture_snapshot
+                parameter_layout = previous.parameter_layout
+                compiled = previous.transfer_plan
+                metrics.update(plan_cache_enabled=1, plan_cache_hits=1, plan_cache_misses=0)
+            else:
+                trainer, capture, parameter_layout, _ = (
+                    self._resolve_layout(
+                        manifests,
+                        capture_layout,
+                        metrics,
+                        trainer_snapshot,
+                    )
+                )
+                started = time.perf_counter()
+                compiled = self._compile_streaming(
+                    trainer, capture, parameter_layout, metrics
+                )
             metrics["transfer_planning_s"] = time.perf_counter() - started
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
@@ -1171,6 +1112,9 @@ class _NixlStagedTransfer:
                 required_metadata.update(
                     _required_agent_metadata(batch.transfer_plan, resolved)
                 )
+            cached = previous if warm else _WeightUpdatePlan(
+                trainer, capture, parameter_layout, compiled
+            )
             transport = self._connect_sources(
                 resolved, required_metadata, host_staging=staging_device == "cpu"
             )
@@ -1182,17 +1126,11 @@ class _NixlStagedTransfer:
                 enabled=bool(metrics["plan_cache_enabled"]),
             )
             prepared = _PreparedBoundedTransfer(
-                compiled.batches, resolved.sources, transport, metrics,
+                compiled.batches,
+                resolved.sources,
+                transport,
+                metrics,
                 checksums if checksums is not None else MappingProxyType({}),
-            )
-            key = compiler._entry[0] if compiler._entry is not None else None
-            cached = _WeightUpdatePlan(
-                trainer,
-                capture,
-                MappingProxyType(parameter_layout),
-                compiled,
-                key,
-                tuple(manifests),
             )
             self._publish_prepared(cached, prepared)
             self._descriptor_cache = descriptors

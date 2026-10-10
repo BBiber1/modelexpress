@@ -254,9 +254,8 @@ def _manifest(
     "failure", [None, "registration", "cleanup", "metadata", "capture", "malformed"]
 )
 @pytest.mark.parametrize("bounded", [False, True])
-@pytest.mark.parametrize("warm_cache", [False, True])
 def test_fixed_mode_updates_receive_changed_values(
-    monkeypatch, bounded, warm_cache, failure
+    monkeypatch, bounded, failure
 ) -> None:
     """Receive changing weights in each fixed mode with real plans and CPU copies."""
     events = []
@@ -264,13 +263,6 @@ def test_fixed_mode_updates_receive_changed_values(
     source_tensor = torch.arange(4, dtype=torch.float32)
     real_empty = torch.empty
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    for flag in (
-        "MX_REFIT_CACHE_RESOLVED_SOURCES",
-        "MX_REFIT_CACHE_BOUNDED_PLANS",
-        "MX_REFIT_COPY_PLAN_KEY_ON_MISS",
-        "MX_REFIT_REUSE_COMPLETE_PLAN",
-    ):
-        monkeypatch.setenv(flag, str(int(warm_cache)))
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
 
@@ -503,6 +495,9 @@ def test_fixed_mode_updates_receive_changed_values(
                 } == addresses
                 assert events.count("read") == reads
                 assert "shutdown" not in events
+            if index != 0 or failure not in ("metadata", "capture", "malformed"):
+                source = method.cached_trainer_source()
+                assert source is not None
         assert events.count("register") == (2 if failure == "registration" else 1)
         assert events.count("shutdown") == int(failure == "registration")
     finally:
@@ -751,7 +746,7 @@ def test_full_tensor_plan_fails_before_transfer_when_capture_has_holes() -> None
         )
 
 
-def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch):
+def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch) -> None:
     calls = []
 
     class _Manager:
@@ -786,7 +781,6 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     transfer._full_buffers = {}
     transfer._staging_arenas = []
     transfer._staging_registrations = []
-    transfer._plan_cache = transfer_module._BoundedPlanCache()
     transfer.close()
     transfer.close()
     assert calls == ["initialize", "shutdown", "shutdown"]

@@ -765,7 +765,7 @@ def test_generator_stages_applies_and_releases_across_versions(monkeypatch) -> N
     assert len(adapter.publish_calls) == 1
     assert len(adapter.release_calls) == 2
     assert adapter.close_calls == 1
-    assert len(service.worker.requests) == 1
+    assert len(service.worker.requests) == 2
     assert [source.source_slot_id for source in adapter.stage_calls[0].sources] == [
         "rank:0",
         "rank:1",
@@ -839,6 +839,9 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
     if bounded:
 
         class Transfer:
+            def cached_trainer_source(self) -> None:
+                return None
+
             def prepare_streaming(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
                     metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
@@ -1875,6 +1878,9 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     recovered = False
 
     class Transfer:
+        def cached_trainer_source(self) -> None:
+            return None
+
         def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             prepare_calls.append(kwargs)
@@ -2582,6 +2588,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise cleanup_error
 
     class Transfer:
+        def cached_trainer_source(self) -> None:
+            return None
+
         def __init__(self):
             self.arena = arena
 
@@ -2785,6 +2794,9 @@ def test_streaming_creates_and_emits_one_timing_cycle(
         observed.append(recorder)
 
     class Transfer:
+        def cached_trainer_source(self) -> None:
+            return None
+
         def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             observe_cycle()
             with refit_span("transfer_planning"):

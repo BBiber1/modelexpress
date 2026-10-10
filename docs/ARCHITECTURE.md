@@ -671,13 +671,22 @@ storage. Receive-arena views are never passed to engine callbacks. For trainer
 sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
 
+Trainer plan reuse checks the current mesh and lists publications for the
+requested version under its lease. A matching selected worker, slot, endpoint,
+and stable metadata digest reuse the validated plan without fetching or parsing
+stable metadata or rebinding the fixed engine load layout. Missing or changed
+publications use normal replica discovery from the same listing. Mesh identity
+alone cannot prove that a selected replica published the requested version.
+Read handles and content checksums belong to the current version round. Failed
+native preparation and manager reset invalidate the physical plan; the client's
+canonical engine load layout remains available for the next preparation.
+
 `MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
 same staging limit, trading a larger arena residency for fewer of them. It never
 changes which source bytes are read: the packed batch preserves source ranges,
 byte counts and descriptor counts, while destination offsets follow the packed
 arena layout. Modules that pull the same complete source stay in separate
-batches. It is off by default because one module per batch is the smallest arena
-a model can refit through.
+batches. It is on by default; disabling it retains one owning module per batch.
 
 Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
 shared parameter objects and reconnects those aliases afterward. Alias owners
@@ -1799,16 +1808,13 @@ incomplete iteration and workspace teardown discard the descriptors. Private
 transfer counters report hits, misses and builds; descriptor work stays outside
 the wire timer on both cold and warm updates.
 
-The manifest-byte cache owns an immutable snapshot of ordinary parsed source
-and shard rows. A warm bounded-plan lookup reuses its structural key only while
-the resolved source table is the snapshot's table. All other resolved fields
-and maps keep their original schema and ownership. The snapshot contains only
-host metadata; it owns no tensors, transport handles or source leases. Custom
-or mutable source rows retain the original field-by-field checks. Ordered
-manifest bytes, agent and device maps,
-captured layouts and the staging configuration still participate in invalidation,
-and current source coverage is checked before transfer. Snapshot construction is
-charged to source preparation on a cache miss.
+The compiled plan owns an immutable snapshot of ordinary parsed source and
+shard rows. A validated publication match returns that snapshot directly for
+warm preparation. Cold discovery validates and freezes new metadata before
+planning. The snapshot contains only host metadata; it owns no tensors,
+transport handles, current version checksums or source leases. Custom or mutable
+source rows retain field-by-field validation on the cold path. Snapshot
+construction is charged to source preparation on a miss.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back
@@ -1844,7 +1850,8 @@ update plan. The engine capture callback transfers ownership of its returned
 capture and layout to that plan and does not mutate them after returning.
 `TensorTransferPlan` describes physical reads and conversions, and a
 bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
-Each preparation resolves current metadata according to the source-cache setting.
+Each round checks the requested version’s publications under its lease. A matching
+validated trainer snapshot skips metadata parsing and physical compilation.
 The captured layout is reused when the ordered resolved source names, dtypes and
 global shapes match the previous plan. Current resolved metadata remains the basis
 for physical reads, so changed addresses or mesh generations do not reuse stale
@@ -1853,8 +1860,8 @@ Full-copy and bounded preparation share metadata/layout resolution, connection
 and registration, descriptor binding, and publication phases while retaining
 their separate compilation and transfer algorithms. Prepared plans publish only
 after all setup succeeds. Internal batching consumes the fixed validated budget;
-coverage and capacity checks remain at the compilation boundary. Existing cache
-switches and lazy descriptor bindings retain their behavior at this layer.
+coverage and capacity checks remain at the compilation boundary. Plan reuse is unconditional; debug plan and layout validation are opt-in.
+Descriptor bindings remain lazy at this layer.
 
 The transfer owns cleanup of partial native preparation. Metadata, layout and
 compilation failures leave registered storage and existing connections intact.

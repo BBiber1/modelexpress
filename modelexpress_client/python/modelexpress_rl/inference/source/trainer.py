@@ -8,7 +8,7 @@ import json
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 
 import grpc
 from modelexpress import envs
@@ -94,12 +94,12 @@ class TrainerSourceResolver(SourceResolver):
         *,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
+        cached_source: Callable[[], TrainerSourceSnapshot | None] | None = None,
     ) -> None:
         self._service = service
+        self._cached_source = cached_source
         self._rpc_timeout_seconds = rpc_timeout_seconds
-        self._metadata_cache: dict[
-            tuple[str, str], tuple[bytes, dict[tuple[str, int], ShardChecksumKey]]
-        ] = {}
+
 
     @property
     def kind(self) -> WeightSource:
@@ -170,17 +170,77 @@ class TrainerSourceResolver(SourceResolver):
                 continue
             published[shard.logical_shard_id].append(shard)
 
+        cached = self._cached_source() if self._cached_source is not None else None
+        stable_sources = {
+            (source.metadata_endpoint, source.stable_metadata_digest): source
+            for source in cached.shards
+        } if cached is not None else {}
+        round_sources = {}
+        failed_sources = set()
         round_checksums = {}
 
         def resolve(shard: refit_pb2.WeightVersionShard) -> TrainerSourceShard:
-            source, checksums = self._resolve_source(shard)
-            round_checksums[(source.source_slot_id, source.worker_id)] = checksums
+            identity = (shard.logical_shard_id, shard.worker_id)
+            if identity in round_sources:
+                return round_sources[identity]
+            key = (shard.metadata_endpoint, shard.stable_metadata_digest)
+            source, checksums = self._resolve_source(shard, stable_sources.get(key))
+            stable_sources[key] = source
+            round_sources[identity] = source
+            round_checksums[identity] = checksums
             return source
+
+        selection = None
+        if (
+            cached is not None
+            and cached.mesh_id == version.trainer_mesh_id
+            and cached.mesh_generation == mesh_generation
+            and tuple(sorted(source.source_slot_id for source in cached.shards)) == expected_slots
+        ):
+            matching = []
+            for source in cached.shards:
+                member = mesh_workers.get(source.worker_id)
+                publication = next((
+                    item for item in published[source.source_slot_id]
+                    if item.worker_id == source.worker_id
+                    and item.metadata_endpoint == source.metadata_endpoint
+                    and item.stable_metadata_digest == source.stable_metadata_digest
+                ), None)
+                if (
+                    member is None
+                    or member.logical_shard_id != source.source_slot_id
+                    or member.metadata_endpoint != source.metadata_endpoint
+                    or publication is None
+                ):
+                    break
+                matching.append(publication)
+            if len(matching) == len(cached.shards):
+                try:
+                    for publication in matching:
+                        resolve(publication)
+                except (grpc.RpcError, RuntimeError) as error:
+                    failed_sources.add((publication.logical_shard_id, publication.worker_id))
+                    logger.warning("cached trainer source %s failed: %s", publication.worker_id, error)
+                else:
+                    if envs.MX_RESHARD_PUBLISH_DIGEST:
+                        self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
+                    selection = tuple(
+                        (source.source_slot_id, source.worker_id) for source in cached.shards
+                    )
+                    yield ResolvedTrainerSource(
+                        snapshot=cached,
+                        checksums={
+                            key: digest for identity in selection
+                            for key, digest in round_checksums[identity].items()
+                        },
+                    )
 
         slots = []
         for source_slot_id in expected_slots:
             ordered = sorted(
-                published[source_slot_id], key=lambda item: item.worker_id
+                (item for item in published[source_slot_id]
+                 if (item.logical_shard_id, item.worker_id) not in failed_sources),
+                key=lambda item: item.worker_id
             )
             if not ordered:
                 logger.warning(
@@ -190,7 +250,9 @@ class TrainerSourceResolver(SourceResolver):
                 return
             slots.append(_SlotReplicas(source_slot_id, ordered, resolve))
 
-        seen: set[tuple[tuple[str, str], ...]] = set()
+        seen: set[tuple[tuple[str, str], ...]] = (
+            {selection} if selection is not None else set()
+        )
         offset = 0
         while True:
             selected = []
@@ -212,17 +274,7 @@ class TrainerSourceResolver(SourceResolver):
                 (source.source_slot_id, source.worker_id) for source in selected
             )
             if selection not in seen:
-                # Fetching worker manifests can outlive the original mesh snapshot.
-                current = self._service().GetTrainerMesh(
-                    refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
-                    timeout=self._rpc_timeout_seconds,
-                )
-                if (
-                    not current.HasField("mesh")
-                    or current.mesh.mesh_id != version.trainer_mesh_id
-                    or current.mesh.generation != mesh_generation
-                ):
-                    raise RuntimeError("trainer mesh generation changed during source resolution")
+                self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
                 seen.add(selection)
                 yield ResolvedTrainerSource(
                     snapshot=TrainerSourceSnapshot(
@@ -243,15 +295,27 @@ class TrainerSourceResolver(SourceResolver):
                 return
             offset += 1
 
+    def _check_current_mesh(self, mesh_id: str, generation: int) -> None:
+        current = self._service().GetTrainerMesh(
+            refit_pb2.GetTrainerMeshRequest(mesh_id=mesh_id),
+            timeout=self._rpc_timeout_seconds,
+        )
+        if (
+            not current.HasField("mesh")
+            or current.mesh.mesh_id != mesh_id
+            or current.mesh.generation != generation
+        ):
+            raise RuntimeError("trainer mesh generation changed during source resolution")
+
     def _resolve_source(
-        self, shard: refit_pb2.WeightVersionShard
+        self,
+        shard: refit_pb2.WeightVersionShard,
+        cached: TrainerSourceShard | None = None,
     ) -> tuple[TrainerSourceShard, dict[ShardChecksumKey, str]]:
         if not shard.metadata_endpoint:
             raise RuntimeError("NIXL source is missing its metadata endpoint")
         if not shard.stable_metadata_digest:
             raise RuntimeError("source is missing its stable metadata digest")
-        key = (shard.metadata_endpoint, shard.stable_metadata_digest)
-        cached = self._metadata_cache.get(key)
         checksums = {}
         with refit_span(
             "source_preparation",
@@ -270,23 +334,30 @@ class TrainerSourceResolver(SourceResolver):
                 ) as channel:
                     stub = refit_pb2_grpc.RefitWorkerServiceStub(channel)
                     if cached is None:
-                        cached = self._fetch_stable_metadata(stub, shard)
-                        self._metadata_cache[key] = cached
-                        counters.update(
-                            manifest_fetch_bytes=len(cached[0]), manifest_fetch_count=1
+                        blob, keys = self._fetch_stable_metadata(stub, shard)
+                        cached = TrainerSourceShard(
+                            source_slot_id=shard.logical_shard_id,
+                            worker_id=shard.worker_id,
+                            stable_metadata_digest=shard.stable_metadata_digest,
+                            metadata_endpoint=shard.metadata_endpoint,
+                            metadata=blob,
+                            checksum_keys=keys,
                         )
+                        counters.update(manifest_fetch_bytes=len(blob), manifest_fetch_count=1)
                     if envs.MX_RESHARD_PUBLISH_DIGEST:
-                        checksums = self._fetch_version_metadata(stub, shard, cached[1])
+                        checksums = self._fetch_version_metadata(stub, shard, cached.checksum_keys)
                         counters["version_metadata_fetch_count"] = 1
-            blob, _ = cached
-            counters["manifest_bytes"] = len(blob)
-        return TrainerSourceShard(
-            source_slot_id=shard.logical_shard_id,
-            worker_id=shard.worker_id,
-            stable_metadata_digest=shard.stable_metadata_digest,
-            metadata_endpoint=shard.metadata_endpoint,
-            metadata=blob,
-        ), checksums
+            counters["manifest_bytes"] = len(cached.metadata)
+        if cached.source_slot_id != shard.logical_shard_id or cached.worker_id != shard.worker_id:
+            cached = TrainerSourceShard(
+                source_slot_id=shard.logical_shard_id,
+                worker_id=shard.worker_id,
+                stable_metadata_digest=shard.stable_metadata_digest,
+                metadata_endpoint=shard.metadata_endpoint,
+                metadata=cached.metadata,
+                checksum_keys=cached.checksum_keys,
+            )
+        return cached, checksums
 
     def _fetch_stable_metadata(
         self, stub: refit_pb2_grpc.RefitWorkerServiceStub, shard: refit_pb2.WeightVersionShard
@@ -346,7 +417,7 @@ class TrainerSourceResolver(SourceResolver):
         self,
         stub: refit_pb2_grpc.RefitWorkerServiceStub,
         shard: refit_pb2.WeightVersionShard,
-        keys: dict[tuple[str, int], ShardChecksumKey],
+        keys: Mapping[tuple[str, int], ShardChecksumKey],
     ) -> dict[ShardChecksumKey, str]:
         if not shard.version_metadata_digest:
             raise RuntimeError("source did not publish version verification metadata")

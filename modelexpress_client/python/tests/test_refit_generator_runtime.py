@@ -350,7 +350,7 @@ def test_runtime_validates_streaming_support_before_allocating_transfers(
             transfer.close.assert_called_once_with()
 
 
-def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
+def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch) -> None:
     context = GeneratorEngineContext()
     monkeypatch.setattr(
         engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
@@ -362,18 +362,17 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
         return object()
 
     monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
-    full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     method_kwargs = {}
 
-    def create_method(**kwargs):
-        method_kwargs.update(kwargs)
-        return full_tensor
+    class Method(_Method):
+        def __init__(self, **kwargs) -> None:
+            method_kwargs.update(kwargs)
+            super().__init__({WeightSource.GENERATOR, WeightSource.TRAINER})
 
-    monkeypatch.setattr(
-        runtime_module,
-        "LoadTimeTensorNixlUpdateMethod",
-        create_method,
-    )
+        def cached_trainer_source(self) -> None:
+            return None
+
+    monkeypatch.setattr(runtime_module, "LoadTimeTensorNixlUpdateMethod", Method)
 
     runtime = initialize_generator_runtime(
         engine_context=context,

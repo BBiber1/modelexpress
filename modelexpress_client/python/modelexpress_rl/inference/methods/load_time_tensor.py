@@ -27,6 +27,7 @@ from ..plan import (
     PreparedStreamingTensors,
     ResolvedSource,
     ResolvedTrainerSource,
+    TrainerSourceSnapshot,
     UpdateMethod,
     WeightSource,
 )
@@ -45,6 +46,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._capture_layout = capture_layout
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
+
+    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
+        return self._transfer.cached_trainer_source()
 
     @property
     def capabilities(self) -> MethodCapabilities:

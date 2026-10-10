@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 from abc import ABC
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+
+from ..shard_metadata import ShardChecksumKey
 
 
 class GeneratorEngineContext(ABC):
@@ -22,6 +26,13 @@ class TrainerSourceShard:
     stable_metadata_digest: str
     metadata_endpoint: str
     metadata: bytes
+    checksum_keys: Mapping[tuple[str, int], ShardChecksumKey] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.checksum_keys, MappingProxyType):
+            object.__setattr__(self, "checksum_keys", MappingProxyType(dict(self.checksum_keys)))
 
     @property
     def physical_fingerprint(self) -> tuple:

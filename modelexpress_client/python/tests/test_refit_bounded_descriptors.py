@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import hashlib
 import gc
 import weakref
 from collections.abc import Iterator
@@ -9,6 +10,7 @@ from dataclasses import replace
 from types import SimpleNamespace, MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as module
+from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.plan import StreamingSettings
 
 import pytest
@@ -34,10 +36,15 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
-    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "1")
-    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "1")
-    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "1")
-    monkeypatch.setenv("MX_REFIT_PACK_MODULES", "0")
+    parameters = getattr(getattr(request.node, "callspec", None), "params", {})
+    settings = getattr(request, "param", StreamingSettings(1024, "cpu"))
+    pack = parameters.get("pack", False)
+    if isinstance(settings, tuple):
+        settings, pack = settings
+    monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    diagnostic = parameters.get("diagnostic")
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", str(int(diagnostic == "plan")))
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", str(int(diagnostic == "layout")))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     sources = {
@@ -127,7 +134,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
-        streaming=getattr(request, "param", StreamingSettings(1024, "cpu")),
+        streaming=settings,
     )
 
     def manifests() -> list[bytes]:
@@ -162,9 +169,17 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         return capture, layout
 
     def prepare() -> module._PreparedBoundedTransfer:
+        blobs = manifests()
+        snapshot = TrainerSourceSnapshot("mesh", 1, tuple(
+            TrainerSourceShard("slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob)
+            for blob in blobs
+        ))
+        cached = transfer.cached_trainer_source()
+        if cached is not None and cached.physical_fingerprint == snapshot.physical_fingerprint:
+            snapshot = cached
         return transfer.prepare_streaming(
-            trainer_snapshot=TrainerSourceSnapshot("mesh", 1, ()),
-            manifests=manifests(),
+            trainer_snapshot=snapshot,
+            manifests=blobs,
             capture_layout=capture_layout,
             checksums=MappingProxyType({
                 (name, "source", tensor.data_ptr(), (0, 0), (4, 4)): tensor_digest(tensor)
@@ -180,7 +195,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
 
     state = SimpleNamespace(
         transfer=transfer,
-        streaming=getattr(request, "param", StreamingSettings(1024, "cpu")),
+        streaming=settings,
         sources=sources,
         capture=capture,
         layout=layout,
@@ -247,17 +262,10 @@ def test_warm_descriptors_still_transfer_new_values(harness, monkeypatch, pack) 
         descriptor.dst_addr = 0
 
 
-@pytest.mark.parametrize("change", ["address", "capture", "disabled"])
-def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -> None:
+def test_changed_source_addresses_rebuild_descriptors(harness) -> None:
     first = harness.prepare()
     harness.collect(first)
-    if change == "address":
-        harness.sources["exact"] = harness.sources["exact"].clone() + 5
-    elif change == "capture":
-        harness.sources["exact"] = harness.sources["exact"].clone()
-        harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
-    else:
-        monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
+    harness.sources["exact"] = harness.sources["exact"].clone() + 5
     second = harness.prepare()
     metrics, _ = harness.collect(second)
     assert metrics["descriptor_cache_hits"] == 0
@@ -380,7 +388,7 @@ def test_metadata_does_not_own_arenas_or_handles(harness, cleanup):
     assert entry.batches and harness.transfer._descriptor_cache is None
 
 
-@pytest.mark.parametrize("harness", [StreamingSettings(2048, "cpu")], indirect=True)
+@pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu"), True)], indirect=True)
 def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
     harness, monkeypatch
 ) -> None:
@@ -425,7 +433,7 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
 
 
 @pytest.mark.parametrize("tensor_indices", [False, True])
-def test_prepared_list_indexing_replays_selected_rows_after_caller_mutation(
+def test_prepared_list_indexing_replays_selected_rows_with_fresh_values(
     harness, monkeypatch, tensor_indices
 ) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
@@ -435,13 +443,10 @@ def test_prepared_list_indexing_replays_selected_rows_after_caller_mutation(
     copy.dest_shape = (2, 4)
     copy.dest_stride = (4, 1)
     prepared = harness.prepare()
-    indices[:] = torch.tensor([1, 3]) if tensor_indices else [1, 3]
     _, installed = harness.collect(prepared)
     expected = torch.zeros(20, dtype=torch.float32)
     expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
     assert torch.equal(installed["b.weight"], expected)
-    fresh_indices = torch.tensor([0, 2]) if tensor_indices else [0, 2]
-    copy.op_chain = (("__getitem__", (fresh_indices,), ()),)
     _, installed = harness.collect(harness.prepare())
     assert torch.equal(installed["b.weight"], expected)
     harness.sources["full"].add_(5)

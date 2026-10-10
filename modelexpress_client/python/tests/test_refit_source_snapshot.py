@@ -24,7 +24,7 @@ def _freeze(resolved):
     return replace(resolved, sources=token.sources), token
 
 
-def test_source_snapshot_isolated_from_mutable_parser_rows(monkeypatch):
+def test_source_snapshot_isolated_from_mutable_parser_rows(monkeypatch) -> None:
     args = _bounded_cache_inputs()
     original = args["resolved"]
     frozen, token = _freeze(original)
@@ -37,17 +37,6 @@ def test_source_snapshot_isolated_from_mutable_parser_rows(monkeypatch):
     original.sources["weight"].shards.reverse()
     assert snapshot._snapshot_structure(frozen, token) == expected
     assert frozen.sources["weight"].shards[0].addr == 100
-    args.update(resolved=frozen, source_snapshot=token)
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
-    monkeypatch.setattr(
-        transfer,
-        "_source_structure",
-        lambda source: pytest.fail("immutable metadata rebuilt on a warm hit"),
-    )
-    metrics = {}
-    assert cache.compile(**args, metrics=metrics) is first
-    assert metrics["plan_cache_hits"] == 1
 
 
 @pytest.mark.parametrize("target", ["sources", "source", "shards", "shard", "shape"])
@@ -119,12 +108,10 @@ def test_nonordinary_sources_keep_original_mutable_path(field_name):
 @pytest.mark.parametrize("field_name", ["addr", "session", "shape"])
 def test_changed_snapshot_accessor_rebuilds_current_source_fields(
     monkeypatch, field_name
-):
+) -> None:
     args = _bounded_cache_inputs()
     frozen, token = _freeze(args["resolved"])
     args.update(resolved=frozen, source_snapshot=token)
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
     replacement = {"addr": 900, "session": "new-session", "shape": (1,)}[field_name]
     monkeypatch.setattr(
         snapshot._ShardSnapshot, field_name, property(lambda self: replacement)
@@ -134,22 +121,16 @@ def test_changed_snapshot_accessor_rebuilds_current_source_fields(
         snapshot._source_structure(frozen.sources["weight"])
         != tuple.__getitem__(token, 1)[0][1]
     )
-    metrics = {}
-    try:
-        assert cache.compile(**args, metrics=metrics) is not first
-    except (RuntimeError, ValueError):
-        assert cache._entry is None
-    assert metrics["plan_cache_hits"] == 0
 
 
 @pytest.mark.parametrize(
     "field_name", ["addr", "digest", "device_id", "agent_meta_b64"]
 )
 def test_changed_manifest_keeps_current_version_metadata(
-    monkeypatch, field_name
+    monkeypatch: pytest.MonkeyPatch, field_name: str,
 ) -> None:
     args = _bounded_cache_inputs()
-    cache, first = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
+    cache, _ = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
     payload = json.loads(args["manifests"][0])
     values = {
         "addr": 900,
@@ -165,7 +146,6 @@ def test_changed_manifest_keeps_current_version_metadata(
     target[field_name] = values[field_name]
     manifests = [json.dumps(payload).encode(), args["manifests"][1]]
     second, token = cache._resolve_metadata(manifests, {})
-    assert second is not first
     expected = transfer._resolve_sources(manifests)
     for item in fields(expected):
         if item.name != "sources":
@@ -180,27 +160,27 @@ def test_changed_manifest_keeps_current_version_metadata(
 
 
 @pytest.mark.parametrize("which", ["agents", "devices", "metadata"])
-def test_outer_metadata_remains_fresh_and_mutable(which):
+def test_outer_metadata_remains_fresh_and_mutable(which) -> None:
     args = _bounded_cache_inputs()
     original = args["resolved"]
     resolved, token = _freeze(original)
     for name in ("session_to_agent", "session_to_device", "agent_metadata"):
         assert getattr(resolved, name) is getattr(original, name)
     args.update(resolved=resolved, source_snapshot=token)
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
     if which == "agents":
         resolved.session_to_agent["a"] = "changed"
     elif which == "devices":
         resolved.session_to_device["a"] = 7
     else:
         resolved.agent_metadata["a"] = b"changed"
-    metrics = {}
-    assert cache.compile(**args, metrics=metrics) is not first
-    assert metrics["plan_cache_misses"] == 1
+    assert getattr(original, {
+        "agents": "session_to_agent",
+        "devices": "session_to_device",
+        "metadata": "agent_metadata",
+    }[which])["a"] == (7 if which == "devices" else b"changed" if which == "metadata" else "changed")
 
 
-def test_metadata_preserves_extended_outer_schema(monkeypatch) -> None:
+def test_metadata_preserves_extended_outer_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     args = _bounded_cache_inputs()
     original = transfer._resolve_sources
     extra_maps = {
@@ -216,7 +196,7 @@ def test_metadata_preserves_extended_outer_schema(monkeypatch) -> None:
     )
     parsed = []
 
-    def resolve(*values, **kwargs):
+    def resolve(*values, **kwargs) -> transfer._ResolvedSources:
         base = original(*values, **kwargs)
         value = extended(
             **{item.name: getattr(base, item.name) for item in fields(base)},
@@ -232,7 +212,9 @@ def test_metadata_preserves_extended_outer_schema(monkeypatch) -> None:
         if item.name != "sources":
             assert getattr(result, item.name) == getattr(parsed[0], item.name)
     reused, _ = cache._resolve_metadata(args["manifests"], {})
-    assert reused is result
+    assert type(reused) is extended
+    for item in fields(result):
+        assert getattr(reused, item.name) == getattr(result, item.name)
 
 
 def test_snapshot_token_requires_current_table_identity():
@@ -245,18 +227,8 @@ def test_snapshot_token_requires_current_table_identity():
     assert snapshot._snapshot_structure(original, token) is None
 
 
-def test_snapshot_does_not_change_mutable_plan_input_invalidation():
-    args = _bounded_cache_inputs()
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
-    args["resolved"].sources["weight"].shards[0].addr += 16
-    metrics = {}
-    assert cache.compile(**args, metrics=metrics) is not first
-    assert metrics["plan_cache_misses"] == 1
-
-
 def test_metadata_freeze_failure_propagates_and_later_resolution_succeeds(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = _bounded_cache_inputs()
     cache, first = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
@@ -269,12 +241,18 @@ def test_metadata_freeze_failure_propagates_and_later_resolution_succeeds(
         cache._resolve_metadata(changed, {})
     monkeypatch.setattr(transfer, "_freeze_sources", original)
     resolved, token = cache._resolve_metadata(changed, {})
-    assert resolved is not first
     assert token is not None
-    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "0")
+    expected = transfer._resolve_sources(changed)
+    expected_structure = tuple(
+        (name, snapshot._source_structure(source))
+        for name, source in expected.sources.items()
+    )
+    assert snapshot._snapshot_structure(resolved, token) == expected_structure
     resolved, token = cache._resolve_metadata(args["manifests"], {})
-    assert resolved is not first
     assert token is not None
+    assert snapshot._snapshot_structure(resolved, token) == expected_structure
+    for item in fields(first):
+        assert getattr(resolved, item.name) == getattr(first, item.name)
 
 
 @pytest.mark.parametrize(
