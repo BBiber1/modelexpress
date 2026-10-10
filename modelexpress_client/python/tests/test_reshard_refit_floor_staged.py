@@ -110,7 +110,7 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
         ],
     )
     return _PreparedNixlTransfer(
-        plan=TransferPlan(),
+        transfer_plan=TransferPlan(),
         capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),

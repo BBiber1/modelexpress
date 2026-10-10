@@ -157,6 +157,7 @@ def build_fsdp_reshard_manifest(
     shards: list[LocalTensorShard],
     metadata_endpoint: str,
     metrics: dict[str, int | float] | None = None,
+    include_digests: bool = True,
 ) -> bytes:
     """Describe already-registered FSDP source shards as an MX manifest blob.
 
@@ -186,7 +187,7 @@ def build_fsdp_reshard_manifest(
             addr=addr,
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),
-            digest=published_digest(served),
+            digest=published_digest(served) if include_digests else None,
             memory_type=(
                 NIXL_DRAM_MEM_TYPE
                 if served.device.type == "cpu"

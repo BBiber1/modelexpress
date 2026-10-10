@@ -450,7 +450,17 @@ resolution compares the recorded generation with the current mesh. Stored versio
 require the generation field; decoding parses it as a uint64 without repeating
 creation-time consistency checks. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
-generation differs from the current trainer mesh fails source resolution.
+generation differs from the current trainer mesh fails trainer source resolution.
+The session tries configured source kinds in order, so this failure can fall back
+to a generator peer serving the requested version. Bounded staging applies to
+trainer transfers; peers retain their normal runtime-tensor preparation path.
+An engine left uncertain by a failed installation can recover through a complete
+peer tensor transfer even when the requested version was published as a delta.
+The publication format does not determine the peer's transfer representation;
+failed-handle and undrained-transfer protections still apply.
+Trainer and peer paths check compatibility during plan selection without a
+separate preflight pass. Object-storage replay retains preflight validation of
+every revision before acquiring the chain's leases.
 
 Any trainer mesh update that changes its generation is rejected while a linked
 weight version has an active consumer lease, including additive replicas that
@@ -517,7 +527,7 @@ flowchart LR
         TA["Explicit engine context<br/>Megatron or FSDP"]
         PM["Publication method<br/>full tensor NIXL or canonical checkpoint"]
         B["Registered source buffers"]
-        M["RefitWorkerService<br/>manifest endpoint"]
+        M["RefitWorkerService<br/>metadata endpoint"]
         C["Canonical HF gather<br/>XOR staging"]
     end
 
@@ -552,27 +562,43 @@ flowchart LR
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
-The manifest is an opaque description of the exact published source buffers;
-the generator uses it to compile and validate its receiver-local transfer plan.
-Trainers serve canonical, address-independent coverage after `bind_tensors()`.
-`GetWeightVersionShardManifest` with an empty version ID retrieves this binding
-by logical shard ID. Mesh creation resolves idempotent retries before contacting trainers and validates
-every binding only for a new mesh; mesh updates validate
-new workers and changed endpoints or logical shards. Unchanged members are not
-refetched. Shard publication retains atomic registration, membership, endpoint,
-and conflict checks in Redis without fetching or parsing a trainer manifest.
-Per-version tensor counts and coverage are trusted at publication; generators
-still verify versioned manifest digests and validate transfer coverage.
-Full-tensor trainers reuse manifest bytes while registrations, addresses, and
-tensor geometry remain stable and content digests are disabled. Generators
-cache each selected worker manifest by endpoint and digest. A changed endpoint,
-registration metadata,
-address, dtype, shape, or sharding changes the structural fingerprint and
-rebuilds the transfer plan. Content-only digest changes refresh verification
-metadata without rebuilding that plan. Releasing a trainer shard evicts its
-worker-local version entry only after the central service accepts the deletion;
-the service rejects deletion while a version lease is active.
+For NIXL, `RefitWorkerService` exposes stable trainer metadata separately from
+version checksums. `GetTrainerShardMetadata` takes a content digest and returns
+immutable bytes: address-independent coverage is available after `bind_tensors()`,
+and physical metadata is available once buffers and NIXL registrations are initialized.
+Physical metadata contains tensor geometry, addresses, registrations, and cached tensor
+counts and byte totals; it contains neither publisher steps nor content checksums.
+Mesh creation resolves idempotent retries before contacting trainers and validates
+every binding only for a new mesh. Mesh updates validate new workers and changed
+endpoints or logical shards; unchanged members are not refetched.
+
+`GetWeightVersionShardMetadata` takes a version ID and logical shard ID. Its typed
+response binds the version, worker, and logical shard to the stable metadata digest,
+with ordered per-tensor shard checksums. Publications carry both metadata digests
+and the trainer endpoint. Generators validate the identities, hashes, and checksum
+coverage before reading tensor bytes, and keep fresh version checksums separate from
+cached source geometry and transfer plans. With checksum verification disabled,
+trainers publish no version checksum record and generators make no version metadata RPC.
+The first publication pins each worker/logical-shard stable metadata digest in the
+current mesh generation. Redis rejects a different digest before publishing that
+shard or advancing readiness. Pins survive version release and unchanged or failed
+mesh updates; only a successful generation change clears them.
+The worker publisher serves stable physical metadata without a version ID through
+`publish_metadata()`. It separately publishes a checksum record with
+`publish_version_metadata()` only after the referenced stable metadata is available;
+both stores are ready before central shard advertisement. Canonical metadata helpers
+and the worker service live together in `modelexpress_rl/train/manifest.py`.
+The worker serves one current physical metadata record and a distinct current
+coverage binding for admission. Repeated publication of the same physical record is
+idempotent; replacement explicitly releases it after all trainer publication owners
+retire. A mesh identity, generation, or physical digest change cannot replace metadata
+while any owned version remains, including when checksum verification is disabled.
+Releasing a trainer shard removes its optional checksum record only after central
+deletion passes the version lease fence. An ambiguous publication RPC retains buffer
+ownership even after a later successful retry; cleanup first requires the version to
+be RELEASING, preventing an outstanding publication from committing after deletion.
+Ordinary version retirement keeps the current physical metadata available for reuse;
+retired or replaced physical digests are not served as historical records.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
 typed location and does not contact S3.
@@ -658,13 +684,22 @@ storage. Receive-arena views are never passed to engine callbacks. For trainer
 sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
 
+Trainer plan reuse checks the current mesh and lists publications for the
+requested version under its lease. A matching selected worker, slot, endpoint,
+and stable metadata digest reuse the validated plan without fetching or parsing
+stable metadata or rebinding the fixed engine load layout. Missing or changed
+publications use normal replica discovery from the same listing. Mesh identity
+alone cannot prove that a selected replica published the requested version.
+Read handles and content checksums belong to the current version round. Failed
+native preparation and manager reset invalidate the physical plan; the client's
+canonical engine load layout remains available for the next preparation.
+
 `MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
 same staging limit, trading a larger arena residency for fewer of them. It never
 changes which source bytes are read: the packed batch preserves source ranges,
 byte counts and descriptor counts, while destination offsets follow the packed
 arena layout. Modules that pull the same complete source stay in separate
-batches. It is off by default because one module per batch is the smallest arena
-a model can refit through.
+batches. It is on by default; disabling it retains one owning module per batch.
 
 Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
 shared parameter objects and reconnects those aliases afterward. Alias owners
@@ -706,15 +741,15 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker metadata reference for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
 | `DeleteVersionLease` | `DeleteVersionLeaseRequest` | `DeleteVersionLeaseResponse` | Release a generator's protection of the version shards |
 
-`RefitWorkerService.GetWeightVersionShardManifest` is also unary and returns
-`GetWeightVersionShardManifestResponse`; tensor bytes remain on the advertised
-data-plane transport.
+`RefitWorkerService.GetTrainerShardMetadata` and
+`RefitWorkerService.GetWeightVersionShardMetadata` are unary metadata RPCs; tensor
+bytes remain on the advertised data-plane transport.
 
 The final missing NIXL source slot atomically changes the version to `READY`.
 For S3, the orchestrator marks the version `READY` after publication completes.
@@ -876,7 +911,7 @@ index's `metadata.version` and `metadata.base_version` are optional descriptive
 fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
 MX lineage checks and payload validation remain enabled. The registering caller
 is responsible for selecting the correct S3 artifacts and base mapping.
-`WeightVersionShard` remains the name of the per-worker manifest publication.
+`WeightVersionShard` identifies a per-worker version publication.
 Its identity is `(version_id, worker_id, logical_shard_id)`: `logical_shard_id`
 identifies the logical shard covered by the publication, and
 `worker_id` identifies the publishing process. The trainer engine adapter
@@ -885,7 +920,9 @@ the logical tensor names and shard geometry, excluding physical process and DP
 replica identity. The orchestrator deduplicates those adapter-defined logical shards when
 declaring the version's expected contributions. Multiple DP workers may therefore
 advertise the same logical shard; generators rotate through those publications on
-transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
+transfer retry. Each shard carries `metadata_endpoint`, `stable_metadata_digest`, and an optional
+`version_metadata_digest`. Tensor counts and byte totals live in stable metadata,
+where they are computed once when the physical metadata is initialized.
 Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
@@ -1788,16 +1825,22 @@ incomplete iteration and workspace teardown discard the descriptors. Private
 transfer counters report hits, misses and builds; descriptor work stays outside
 the wire timer on both cold and warm updates.
 
-The manifest-byte cache owns an immutable snapshot of ordinary parsed source
-and shard rows. A warm bounded-plan lookup reuses its structural key only while
-the resolved source table is the snapshot's table. All other resolved fields
-and maps keep their original schema and ownership. The snapshot contains only
-host metadata; it owns no tensors, transport handles or source leases. Custom
-or mutable source rows retain the original field-by-field checks. Ordered
-manifest bytes, agent and device maps,
-captured layouts and the staging configuration still participate in invalidation,
-and current source coverage is checked before transfer. Snapshot construction is
-charged to source preparation on a cache miss.
+The compiled plan owns an immutable snapshot of ordinary parsed source and
+shard rows. A validated publication match returns that snapshot directly for
+warm preparation. Cold discovery validates and freezes new metadata before
+planning. The snapshot contains only host metadata; it owns no tensors,
+transport handles, current version checksums or source leases. Custom or mutable
+source rows retain field-by-field validation on the cold path. Snapshot
+construction is charged to source preparation on a miss. Stable source rows are
+retained without a second structural key. The installer owns the retained
+source-to-engine mapping; preparation borrows that binding when physical source
+metadata changes. Trainer discovery
+accumulates cache, fetch and verification counters across the sources needed
+for each candidate and flushes them before yielding, on failure or on close.
+Stable RPC time is reported separately within resolution time; waiting for the
+consumer to transfer or install a yielded candidate is excluded. Failed RPCs
+retain elapsed time, while fetch and verification counts record successful
+validation.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back
@@ -1814,6 +1857,45 @@ post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
+
+Full-copy and bounded updates enter one session staging flow. Immutable streaming
+settings bind the mode, placement, buffer count and total budget at runtime
+construction; each transfer retains that configuration for its lifetime. Public
+`staging_buffer_bytes` remains the capacity of each buffer, multiplied by the
+buffer count for the internal total budget. Bounded device compatibility is
+checked before creating its NIXL manager. Streaming installer support is checked
+once during runtime initialization, before allocating transfers. Runtime
+construction selects the trainer method; per-update candidate selection does not
+repeat method-type or streaming-installer checks. Generator peer reads retain a separate
+full-copy transfer borrowing the engine manager. The version lease remains held through
+installation or release. Preparation retry and recovery behavior stays scoped
+to the selected update strategy; failures after a possible write fence the engine.
+
+The weight update plan owns immutable trainer source rows and borrows the
+installer's retained capture and layout. Neither preparation nor installation
+mutates those bindings.
+`TransferPlan` describes physical reads and conversions, and a
+bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
+Each round checks the requested version’s publications under its lease. A matching
+validated trainer snapshot skips metadata parsing and physical compilation.
+The installer reuses its mapping when the ordered resolved source names, dtypes
+and global shapes match its retained schema. Current resolved metadata remains the basis
+for physical reads, so changed addresses or mesh generations do not reuse stale
+transport data.
+Full-copy and bounded preparation share metadata/layout resolution, connection
+and registration, descriptor binding, and publication phases while retaining
+their separate compilation and transfer algorithms. Prepared plans publish only
+after all setup succeeds. Internal batching consumes the fixed validated budget;
+coverage and capacity checks remain at the compilation boundary. Plan reuse is unconditional; debug plan and layout validation are opt-in.
+Descriptor bindings remain lazy at this layer.
+
+The transfer owns cleanup of partial native preparation. Metadata, layout and
+compilation failures leave registered storage and existing connections intact.
+A failed preparation that attempted manager initialization, source connection or
+registration resets an owned manager before releasing its storage; cleanup failure
+remains fatal with its cause retained. Borrowed managers cannot be reset by the
+transfer. Streaming READ drain, retained leases and uncertain-resource quarantine
+keep their existing installation behavior.
 
 ## RL refit CI harness
 
