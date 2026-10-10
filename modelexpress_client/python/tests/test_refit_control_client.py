@@ -214,13 +214,13 @@ def test_control_client_owns_global_weight_version_lifecycle(monkeypatch) -> Non
     try:
         control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
         context = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01", "baggage": "step=4"}
-        with telemetry.extracted(context):
-            created = control.create_weight_version(
-                model_name="test/model",
-                idempotency_key="training-step-7",
-                payload_format=WeightPayloadFormat.FULL_TENSOR,
-                trainer_mesh_id="mesh-a",
-            )
+        created = control.create_weight_version(
+            model_name="test/model",
+            idempotency_key="training-step-7",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            trainer_mesh_id="mesh-a",
+            trace_context=context,
+        )
         fetched = control.get_weight_version(created.version_id)
         service.mesh.generation = 2
         retried = control.create_weight_version(

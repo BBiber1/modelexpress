@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -270,6 +271,7 @@ class ModelExpressControlClient:
         base_version_id: str | None = None,
         object_storage: ObjectStorageSource | None = None,
         state: WeightVersionState = WeightVersionState.STAGING,
+        trace_context: Mapping[str, str] | None = None,
     ) -> WeightVersion:
         """Create one global version with its initial lifecycle state."""
         _required(model_name, "model_name")
@@ -303,7 +305,10 @@ class ModelExpressControlClient:
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
             }[state],
         )
-        telemetry.inject(request.trace_context)
+        if trace_context is None:
+            telemetry.inject(request.trace_context)
+        else:
+            request.trace_context.update(trace_context)
         if uid is not None:
             request.uid = _required(uid, "uid")
         if trainer_mesh_id is not None:
