@@ -686,6 +686,16 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
         uid: None,
         trainer_mesh_id: Some(mesh.mesh_id.clone()),
         version_number: Some(7),
+        trace_context: HashMap::from([
+            (
+                "traceparent".to_string(),
+                "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
+            ),
+            (
+                "baggage".to_string(),
+                "step=7,experiment=refit-test".to_string(),
+            ),
+        ]),
     };
     let mut missing_mesh = request.clone();
     missing_mesh.idempotency_key = unique_id("missing-mesh");
@@ -720,6 +730,17 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
         Some(mesh.mesh_id.as_str())
     );
     assert_eq!(version.version_number, Some(7));
+    assert_eq!(version.trace_context, request.trace_context);
+    let fetched = client
+        .get_weight_version(GetWeightVersionRequest {
+            uid: version.uid.clone(),
+        })
+        .await
+        .expect("fetch linked version context")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(fetched.trace_context, request.trace_context);
     assert_eq!(
         client
             .delete_trainer_mesh(DeleteTrainerMeshRequest {
@@ -1368,6 +1389,7 @@ async fn version_becomes_ready_across_server_replicas() {
         uid: None,
         trainer_mesh_id: Some(mesh_id),
         version_number: None,
+        trace_context: Default::default(),
     };
     let create_a = client_a.create_weight_version(create_request.clone());
     let create_b = client_b.create_weight_version(create_request);
@@ -1509,6 +1531,16 @@ async fn caller_selected_version_uid_is_unique_and_idempotency_bound() {
         uid: Some(requested_uid.clone()),
         trainer_mesh_id: None,
         version_number: None,
+        trace_context: HashMap::from([
+            (
+                "traceparent".to_string(),
+                "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
+            ),
+            (
+                "baggage".to_string(),
+                "step=7,experiment=staging-test".to_string(),
+            ),
+        ]),
     };
 
     let mut blank_uid = request.clone();
@@ -1528,9 +1560,22 @@ async fn caller_selected_version_uid_is_unique_and_idempotency_bound() {
         .version
         .expect("version in response");
     assert_eq!(created.uid, requested_uid);
+    assert_eq!(created.trace_context, request.trace_context);
+    let observed = client
+        .get_weight_version(GetWeightVersionRequest {
+            uid: created.uid.clone(),
+        })
+        .await
+        .expect("read persisted trace context")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(observed.trace_context, request.trace_context);
 
+    let mut repeated_request = request.clone();
+    repeated_request.trace_context.clear();
     let repeated = client
-        .create_weight_version(request.clone())
+        .create_weight_version(repeated_request)
         .await
         .expect("an identical request is idempotent")
         .into_inner()
@@ -1589,6 +1634,7 @@ async fn caller_selected_version_uids_do_not_collide_with_derived_keys() {
         uid: Some(version_uid.clone()),
         trainer_mesh_id: Some(mesh_id),
         version_number: None,
+        trace_context: Default::default(),
     };
     client
         .create_weight_version(request.clone())
@@ -1643,6 +1689,7 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         uid: None,
         trainer_mesh_id: None,
         version_number: None,
+        trace_context: Default::default(),
     };
     let staged = client
         .create_weight_version(staged_request.clone())
@@ -1770,6 +1817,7 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
             uid: None,
             trainer_mesh_id: None,
             version_number: None,
+            trace_context: Default::default(),
         })
         .await
         .expect("create directly ready S3 version")
@@ -1845,6 +1893,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
             uid: None,
             trainer_mesh_id: Some(mesh_id),
             version_number: None,
+            trace_context: Default::default(),
         })
         .await
         .expect("create version")
@@ -1929,6 +1978,7 @@ async fn live_lease_protects_releasing_version_shards() {
             uid: None,
             trainer_mesh_id: Some(mesh_id.clone()),
             version_number: None,
+            trace_context: Default::default(),
         })
         .await
         .expect("create version")
@@ -2039,6 +2089,7 @@ async fn live_lease_protects_releasing_version_shards() {
             uid: None,
             trainer_mesh_id: Some(mesh_id.clone()),
             version_number: None,
+            trace_context: Default::default(),
         })
         .await
         .expect("create version protected by an expiring lease")
@@ -2130,6 +2181,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             uid: None,
             trainer_mesh_id: Some(mesh_id.clone()),
             version_number: None,
+            trace_context: Default::default(),
         })
         .await
         .expect("create version")
@@ -2156,6 +2208,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             uid: None,
             trainer_mesh_id: Some(mesh_id.clone()),
             version_number: None,
+            trace_context: Default::default(),
         })
         .await
         .expect("create version after worker expiry")

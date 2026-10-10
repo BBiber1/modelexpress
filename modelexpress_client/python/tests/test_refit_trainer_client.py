@@ -5,6 +5,7 @@ import time
 import json
 import hashlib
 from concurrent import futures
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import grpc
@@ -206,7 +207,10 @@ def test_released_manifests_do_not_accumulate():
     assert service._manifests == {}
 
 
-def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
+@pytest.mark.parametrize("publish_ready_completed", [False, True])
+def test_trainer_stages_then_publishes_one_rank_local_shard(
+    monkeypatch, publish_ready_completed
+):
     service = _RefitService()
     service.mesh_id = "mesh-a"
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -216,6 +220,17 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
     server.start()
     adapter = _Adapter()
+    waits = []
+    stage_shard = adapter.stage_shard
+
+    def stage(**kwargs):
+        return replace(
+            stage_shard(**kwargs),
+            publish_ready=CompletionFence(lambda: waits.append(None)),
+            publish_ready_completed=publish_ready_completed,
+        )
+
+    monkeypatch.setattr(adapter, "stage_shard", stage)
     monkeypatch.setattr(
         runtime_module, "_create_trainer_adapter", lambda *_args, **_kwargs: adapter
     )
@@ -269,6 +284,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         metrics = trainer.pop_metrics()
         assert metrics["trainer_refit_e2e_s"] >= 0
         assert metrics["publication_rpc_s"] >= 0
+        assert ("staging_sync_s" in metrics) is not publish_ready_completed
 
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
             grpc.insecure_channel(service.shards[0].manifest_endpoint)
@@ -324,6 +340,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         ),
     ]
     assert retained_owners == ["model", "model"]
+    assert len(waits) == (0 if publish_ready_completed else 2)
     assert len(service.shards) == 2
     assert len(service.deleted_shards) == 1
     assert service.deleted_shards[0].logical_shard_id == metadata.logical_shard_id

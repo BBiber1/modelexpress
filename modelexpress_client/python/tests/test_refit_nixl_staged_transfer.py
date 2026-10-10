@@ -22,6 +22,7 @@ from modelexpress.refit.reshard.types import (
     IncompleteRefit,
     RecordedCopy,
 )
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl import WeightPayloadFormat
 from modelexpress_rl.inference.adapter import (
@@ -680,6 +681,43 @@ def test_staged_verification_rejects_missing_or_mismatched_digest():
         transfer._verify(_prepared(tensor, None))
 
 
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_digest_verification_has_its_own_receive_sync_timing(
+    monkeypatch, mismatch
+) -> None:
+    monkeypatch.setattr(transfer_module.envs, "MX_RESHARD_PUBLISH_DIGEST", True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    tensor = torch.arange(64, dtype=torch.int32)
+    class Transport:
+        def await_reads(self, _posted) -> None:
+            pass
+
+    prepared = replace(
+        _prepared(tensor, tensor_digest(tensor + 1 if mismatch else tensor)),
+        transport=Transport(),
+    )
+
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("cpu")
+    transfer._device_id = 0
+    transfer._recv_buffers = {"weight": tensor}
+    transfer._convert_buffers = {}
+    transfer._full_buffers = {}
+    recorder = RefitTimingRecorder(backend="test", version=1, rank=0)
+
+    with use_refit_timing(recorder):
+        if mismatch:
+            with pytest.raises(RuntimeError, match="digest mismatch"):
+                transfer._complete_stage(prepared, [], 0.0)
+        else:
+            transfer._complete_stage(prepared, [], 0.0)
+
+    stage = recorder.as_dict()["stages"]["receive_sync"]
+    assert stage["count"] == 1
+    assert stage["status"] == ("error" if mismatch else "ok")
+    assert stage["metadata"]["digest_verification_s"] >= 0
+
+
 def test_full_tensor_plan_fails_before_transfer_when_capture_has_holes():
     capture = CaptureResult(copies=[])
     with pytest.raises(IncompleteRefit, match="must cover every engine parameter"):
@@ -977,9 +1015,28 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
     assert len(batches) == 3
     events = []
 
+    class Clock:
+        now = 0.0
+
+        def perf_counter(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(transfer_module, "time", clock)
+    warnings = []
+    monkeypatch.setattr(
+        transfer_module.throughput,
+        "warn_if_below_floor",
+        lambda **kwargs: warnings.append(kwargs),
+    )
+
     class Transport:
         def post_reads(self, descriptors):
             events.append("post")
+            clock.advance(0.2)
             for d in descriptors:
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
             return ["posted"]
@@ -987,6 +1044,7 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
         def await_reads(self, posted):
             assert posted == ["posted"]
             events.append("await")
+            clock.advance(0.3)
 
     prepared = transfer_module._PreparedBoundedTransfer(
         batches, {"w": source}, Transport()
@@ -1005,6 +1063,7 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
     addresses = []
     for tensors in transfer.iter_bounded(prepared, metrics):
         events.append("commit")
+        clock.advance(10.0)
         (tensor,) = tensors.values()
         addresses.append(tensor.data_ptr())
         assert torch.equal(tensor, source_tensor)
@@ -1028,6 +1087,8 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
     assert metrics["staging_buffers"] == 2
     assert metrics["staging_peak_bytes"] == 512
     assert metrics["batches"] == 3
+    assert metrics["wire_host_s"] == pytest.approx(1.5)
+    assert len(warnings) == 1
     assert transfer._active is prepared
 
 
