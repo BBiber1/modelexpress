@@ -233,20 +233,59 @@ class _BoundedPlanCache:
         if copy_key_on_miss and not self._compile_lock.acquire(blocking=False):
             raise RuntimeError("bounded plan compilation is already in progress")
         try:
-            return self._compile(
-                manifests=manifests,
-                resolved=resolved,
-                capture=capture,
-                parameter_layout=parameter_layout,
-                max_staging_bytes=max_staging_bytes,
-                enabled=enabled,
-                metrics=metrics,
-                copy_key_on_miss=copy_key_on_miss,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=total_staging_bytes,
-                source_snapshot=source_snapshot,
-            )
+            with telemetry.span("mx.refit.bounded_plan_compile") as span:
+                compiled = self._compile(
+                    manifests=manifests,
+                    resolved=resolved,
+                    capture=capture,
+                    parameter_layout=parameter_layout,
+                    max_staging_bytes=max_staging_bytes,
+                    enabled=enabled,
+                    metrics=metrics,
+                    copy_key_on_miss=copy_key_on_miss,
+                    staging_device=staging_device,
+                    staging_buffers=staging_buffers,
+                    total_staging_bytes=total_staging_bytes,
+                    source_snapshot=source_snapshot,
+                )
+                if span.is_recording():
+                    span.set_attributes(
+                        {
+                            "plan_cache.enabled": bool(metrics["plan_cache_enabled"]),
+                            "plan_cache.hits": metrics["plan_cache_hits"],
+                            "plan_cache.misses": metrics["plan_cache_misses"],
+                            "plan_cache.lookup_s": metrics["plan_cache_lookup_s"],
+                            "plan_cache.validate_s": metrics["plan_cache_validate_s"],
+                            "plan_cache.fingerprint_s": metrics[
+                                "plan_cache_fingerprint_s"
+                            ],
+                            "plan_cache.key_copies": metrics["plan_cache_key_copies"],
+                            "source_cache.enabled": bool(
+                                metrics.get("source_cache_enabled", 0)
+                            ),
+                            "source_cache.hits": metrics.get("source_cache_hits", 0),
+                            "source_cache.misses": metrics.get(
+                                "source_cache_misses", 0
+                            ),
+                            "initial_whole_plan_s": metrics["initial_whole_plan_s"],
+                            "initial_whole_validation_s": metrics[
+                                "initial_whole_validation_s"
+                            ],
+                            "bounded_whole_plan_s": metrics["bounded_whole_plan_s"],
+                            "bounded_whole_plan_builds": metrics[
+                                "bounded_whole_plan_builds"
+                            ],
+                            "bounded_whole_validation_s": metrics[
+                                "bounded_whole_validation_s"
+                            ],
+                            "owner_plan_s": metrics["owner_plan_s"],
+                            "owner_validation_s": metrics["owner_validation_s"],
+                            "owner_plan_builds": metrics["owner_plan_builds"],
+                            "module_batches": len(compiled.module_batches),
+                            "batches": len(compiled.batches),
+                        }
+                    )
+                return compiled
         finally:
             if copy_key_on_miss:
                 self._compile_lock.release()
@@ -962,20 +1001,19 @@ class _NixlStagedTransfer:
                 raise ValueError(
                     "max_staging_bytes must cover at least one byte per staging buffer"
                 )
-            with telemetry.span("mx.refit.transfer_planning"):
-                compiled = self._plan_cache.compile(
-                    manifests=manifests,
-                    resolved=resolved,
-                    capture=capture,
-                    parameter_layout=parameter_layout,
-                    max_staging_bytes=buffer_budget,
-                    enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-                    metrics=metrics,
-                    staging_device=staging_device,
-                    staging_buffers=staging_buffers,
-                    total_staging_bytes=max_staging_bytes,
-                    source_snapshot=self._source_cache._snapshot,
-                )
+            compiled = self._plan_cache.compile(
+                manifests=manifests,
+                resolved=resolved,
+                capture=capture,
+                parameter_layout=parameter_layout,
+                max_staging_bytes=buffer_budget,
+                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
+                metrics=metrics,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
+                total_staging_bytes=max_staging_bytes,
+                source_snapshot=self._source_cache._snapshot,
+            )
             plan, batches = compiled.plan, compiled.batches
         else:
             self._plan_cache.clear()
