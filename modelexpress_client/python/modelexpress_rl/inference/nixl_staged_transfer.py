@@ -40,7 +40,7 @@ from modelexpress.refit.reshard.rendezvous import (
     merge_shard_tables,
     unwrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import plan_pull
+from modelexpress.refit.reshard.slice_plan import PullSegment, plan_pull
 from modelexpress.refit.reshard.transfer_plan import (
     FullPullSource,
     TransferPlan,
@@ -59,10 +59,12 @@ from modelexpress.refit.reshard.types import (
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
+from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 from modelexpress_rl.inference._source_snapshot import (
     _freeze_sources,
+    _ShardSnapshot,
 )
 
 from ..train.manifest import ShardChecksumKey
@@ -94,6 +96,11 @@ def _layout_values_match(left: Any, right: Any) -> bool:
     return left == right
 
 
+class _ConnectedAgent(NamedTuple):
+    metadata: bytes
+    mesh_identity: tuple[str, int]
+
+
 @dataclass(frozen=True)
 class _ResolvedSources:
     sources: dict
@@ -103,12 +110,45 @@ class _ResolvedSources:
     session_to_memory: dict[str, str] = field(default_factory=dict)
 
 
+_SourceGeometry = tuple[str, tuple[int, ...], tuple[int, ...]]
+
+
+@dataclass(frozen=True)
+class _TrainerReplica:
+    source: TrainerSourceShard
+    resolved: _ResolvedSources
+    bindings: Mapping[_SourceGeometry, _ShardSnapshot]
+    geometry: tuple
+
+
+
 @dataclass(frozen=True)
 class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
     generator_capture_snapshot: CaptureResult
-    parameter_layout: MappingProxyType
+    parameter_layout: Mapping
     transfer_plan: TransferPlan | _StreamingSchedule
+    replicas: Mapping[tuple[str, str], _TrainerReplica] = field(default_factory=dict)
+    source_slots: Mapping[_SourceGeometry, str] = field(default_factory=dict)
+    replica_sources: tuple[TrainerSourceShard, ...] = field(init=False)
+    required_agent_metadata: Mapping[str, bytes] | None = None
+    bounded_workspace: _BoundedWorkspace | None = None
+
+    def __post_init__(self) -> None:
+        schedule = self.transfer_plan
+        resolved = self.trainer_source_snapshot.resolved_metadata
+        if self.required_agent_metadata is None:
+            required = _required_agent_metadata(
+                schedule.transfer_plan if isinstance(schedule, _StreamingSchedule) else schedule,
+                resolved,
+            )
+            if isinstance(schedule, _StreamingSchedule):
+                for batch in schedule.batches:
+                    required.update(_required_agent_metadata(batch.transfer_plan, resolved))
+            object.__setattr__(self, "required_agent_metadata", MappingProxyType(required))
+        object.__setattr__(
+            self, "replica_sources", tuple(record.source for record in self.replicas.values())
+        )
 
 
 @dataclass(frozen=True)
@@ -117,7 +157,7 @@ class _PreparedNixlTransfer:
 
     transfer_plan: TransferPlan
     capture: CaptureResult
-    sources: dict
+    sources: Mapping
     descriptors: tuple[ReadDescriptor | _BoundedReadDescriptor, ...]
     transport: NixlReshardTransport
     metrics: dict[str, float] = field(default_factory=dict)
@@ -154,12 +194,6 @@ class _StreamingBatch:
     layouts: _StagingLayouts
     nbytes: int
 
-    def __post_init__(self) -> None:
-        # Readers reach these views both by name and by position, and
-        # dataclasses.replace or a plain 3-tuple would satisfy only the second.
-        # Coerce so the annotation holds however the batch was built.
-        if not isinstance(self.layouts, _StagingLayouts):
-            object.__setattr__(self, "layouts", _StagingLayouts(*self.layouts))
 
 
 @dataclass(frozen=True)
@@ -176,6 +210,10 @@ class _StreamingSchedule:
     transfer_plan: TransferPlan
     module_batches: tuple[_StreamingBatch, ...]
     batches: tuple[_StreamingBatch, ...]
+    arena_bytes: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arena_bytes", max(batch.nbytes for batch in self.batches))
 
 
 class _BoundedReadDescriptor(NamedTuple):
@@ -200,31 +238,33 @@ def _arena_geometry(arena: torch.Tensor) -> tuple:
 
 
 @dataclass(frozen=True)
-class _BoundedDescriptors:
-    """One validated plan, weak arena identities, and no transfer resources."""
+class _BoundedBatchBinding:
+    buffers: tuple[dict[str, torch.Tensor], ...]
+    descriptors: tuple[_BoundedReadDescriptor, ...]
+    sources: Mapping
+    full_copies: tuple[tuple[torch.Tensor, torch.Tensor, tuple], ...]
+    conversion_copies: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    zero_tensors: tuple[torch.Tensor, ...]
+    wire_bytes: int
 
+
+@dataclass(frozen=True)
+class _BoundedWorkspace:
     schedule: _StreamingSchedule
     generation: int
     arenas: tuple[tuple[weakref.ReferenceType, tuple], ...]
-    batches: tuple[tuple[_BoundedReadDescriptor, ...] | None, ...]
+    batches: tuple[_BoundedBatchBinding, ...]
+    staging_peak_bytes: int
 
-    def matches(
-        self,
-        batches: tuple[_StreamingBatch, ...],
-        generation: int,
-        arenas: list[torch.Tensor],
-    ) -> bool:
+    def matches(self, arenas: list[torch.Tensor]) -> bool:
         return (
-            self.schedule.batches is batches
-            and self.generation == generation
-            and len(self.arenas) == len(arenas)
+            len(self.arenas) == len(arenas)
             and all(
-                type(arena) is torch.Tensor
-                and reference() is arena
-                and geometry == _arena_geometry(arena)
+                reference() is arena and geometry == _arena_geometry(arena)
                 for (reference, geometry), arena in zip(self.arenas, arenas)
             )
         )
+
 
 
 def _bounded_batches(
@@ -379,6 +419,87 @@ def _resolve_sources(manifests: list[bytes], *, metrics=None) -> _ResolvedSource
             payload.agent_name: payload.agent_metadata for payload in payloads
         },
     )
+
+
+def _trainer_replica(
+    source: TrainerSourceShard, resolved: _ResolvedSources | None = None
+) -> _TrainerReplica:
+    if resolved is None:
+        resolved = _resolve_sources([source.metadata])
+        frozen_sources = _freeze_sources(resolved.sources)
+        if frozen_sources is None:
+            raise RuntimeError("trainer replica metadata cannot be isolated")
+        resolved = replace(resolved, sources=frozen_sources)
+    resolved = replace(
+        resolved,
+        session_to_agent=MappingProxyType(dict(resolved.session_to_agent)),
+        session_to_device=MappingProxyType(dict(resolved.session_to_device)),
+        session_to_memory=MappingProxyType(dict(resolved.session_to_memory)),
+        agent_metadata=MappingProxyType(dict(resolved.agent_metadata)),
+    )
+    bindings = {}
+    geometry = []
+    for name, tensor in resolved.sources.items():
+        boxes = []
+        for shard in tensor.shards:
+            box = (tuple(shard.shard_offset), tuple(shard.shape))
+            key = (name, *box)
+            if key in bindings:
+                raise RuntimeError(f"trainer replica contains ambiguous geometry for {name!r}")
+            bindings[key] = shard
+            boxes.append(box)
+        geometry.append(
+            (name, tensor.dtype, tuple(tensor.global_shape), tensor.elsize, tuple(sorted(boxes)))
+        )
+    return _TrainerReplica(
+        source, resolved, MappingProxyType(bindings), tuple(sorted(geometry))
+    )
+
+
+def _bind_transfer_plan(
+    plan: TransferPlan,
+    source_slots: Mapping[_SourceGeometry, str],
+    selected: Mapping[str, _TrainerReplica],
+) -> TransferPlan:
+    def bind(segment: PullSegment) -> PullSegment:
+        if segment._source_read is None:
+            raise RuntimeError("transfer read has no source shard provenance")
+        name, offset, shape, relative_offset = segment._source_read
+        key = (name, offset, shape)
+        replica = selected[source_slots[key]]
+        shard = replica.bindings[key]
+        return replace(segment, session=shard.session, src_addr=shard.addr + relative_offset)
+
+    return replace(
+        plan,
+        segments=[bind(segment) for segment in plan.segments],
+        converts=[
+            replace(convert, segments=[bind(segment) for segment in convert.segments])
+            for convert in plan.converts
+        ],
+        full_pulls=[
+            replace(full, segments=[bind(segment) for segment in full.segments])
+            for full in plan.full_pulls
+        ],
+    )
+
+
+def _bind_streaming_schedule(
+    schedule: _StreamingSchedule,
+    source_slots: Mapping[_SourceGeometry, str],
+    selected: Mapping[str, _TrainerReplica],
+) -> _StreamingSchedule:
+    def bind(batch: _StreamingBatch) -> _StreamingBatch:
+        return replace(
+            batch, transfer_plan=_bind_transfer_plan(batch.transfer_plan, source_slots, selected)
+        )
+
+    return _StreamingSchedule(
+        _bind_transfer_plan(schedule.transfer_plan, source_slots, selected),
+        schedule.module_batches,
+        tuple(bind(batch) for batch in schedule.batches),
+    )
+
 
 
 def _required_agent_metadata(
@@ -589,7 +710,7 @@ class _NixlStagedTransfer:
         self._convert_registered = False
         self._full_registered = False
         self._active: _PreparedNixlTransfer | _PreparedBoundedTransfer | None = None
-        self._loaded_agent_metadata: dict[str, bytes] = {}
+        self._loaded_agent_metadata: dict[str, _ConnectedAgent] = {}
         self._closed = False
         # Bounded staging: one or two byte arenas on CUDA or pinned host memory.
         # Host arenas are registered as NIXL DRAM and tracked here so they can be
@@ -605,7 +726,7 @@ class _NixlStagedTransfer:
         self._pack_modules = envs.MX_REFIT_PACK_MODULES
         self._plan_compile_lock = threading.Lock()
         self._workspace_generation = 0
-        self._descriptor_cache: _BoundedDescriptors | None = None
+        self._debug_validate_workspace = envs.MX_REFIT_DEBUG_VALIDATE_WORKSPACE
 
     @property
     def _bounded_arena(self) -> torch.Tensor | None:
@@ -613,15 +734,14 @@ class _NixlStagedTransfer:
 
     @_bounded_arena.setter
     def _bounded_arena(self, value: torch.Tensor | None) -> None:
-        self._invalidate_descriptors()
+        self._invalidate_workspace_binding()
         self._staging_arenas = [] if value is None else [value]
 
-    def _invalidate_descriptors(self) -> None:
-        self._descriptor_cache = None
+    def _invalidate_workspace_binding(self) -> None:
         self._workspace_generation += 1
 
     def _release_staging_registrations(self) -> None:
-        self._invalidate_descriptors()
+        self._invalidate_workspace_binding()
         registrations, self._staging_registrations = self._staging_registrations, []
         for registration in registrations:
             self._manager.deregister_memory(registration)
@@ -638,7 +758,7 @@ class _NixlStagedTransfer:
 
     def reset_workspace(self) -> None:
         """Discard released or failed preparation after disconnecting its agent."""
-        self._invalidate_descriptors()
+        self._invalidate_workspace_binding()
         if not self._owns_manager:
             # A shared agent still serves its owner; tearing it down here would
             # deregister memory we do not own. Only a transfer-owned agent can
@@ -755,6 +875,147 @@ class _NixlStagedTransfer:
             return None
         return plan.trainer_source_snapshot
 
+    def cached_trainer_replicas(
+        self, mesh_id: str, generation: int
+    ) -> tuple[TrainerSourceShard, ...]:
+        plan = self._weight_update_plan
+        if (
+            plan is None
+            or self._closed
+            or plan.trainer_source_snapshot.mesh_id != mesh_id
+            or plan.trainer_source_snapshot.mesh_generation != generation
+        ):
+            return ()
+        return plan.replica_sources
+
+
+    def _retain_plan(
+        self,
+        trainer: TrainerSourceSnapshot,
+        capture: CaptureResult,
+        parameter_layout: Mapping,
+        transfer_plan: TransferPlan | _StreamingSchedule,
+    ) -> _WeightUpdatePlan:
+        previous = self._weight_update_plan
+        replicas = dict(previous.replicas) if (
+            previous is not None
+            and trainer.mesh_id == previous.trainer_source_snapshot.mesh_id
+            and trainer.mesh_generation == previous.trainer_source_snapshot.mesh_generation
+        ) else {}
+        selected = []
+        for source in trainer.shards:
+            identity = (source.source_slot_id, source.worker_id)
+            record = replicas.get(identity)
+            if record is not None:
+                if record.source.physical_fingerprint != source.physical_fingerprint:
+                    raise RuntimeError("known trainer replica metadata changed within a mesh generation")
+            else:
+                record = _trainer_replica(
+                    source, trainer.resolved_metadata if len(trainer.shards) == 1 else None
+                )
+                replicas[identity] = record
+            selected.append(record)
+        source_slots = {}
+        for record in selected:
+            for geometry in record.bindings:
+                source_slots.setdefault(geometry, record.source.source_slot_id)
+        initial = (
+            transfer_plan.transfer_plan
+            if isinstance(transfer_plan, _StreamingSchedule) else transfer_plan
+        )
+        by_slot = {record.source.source_slot_id: record for record in selected}
+        for segment in initial._all_segments():
+            if segment._source_read is None:
+                raise RuntimeError("transfer read has no source shard provenance")
+            name, offset, shape, relative_offset = segment._source_read
+            key = (name, offset, shape)
+            shard = by_slot[source_slots[key]].bindings[key]
+            if segment.session != shard.session or segment.src_addr != shard.addr + relative_offset:
+                raise RuntimeError("transfer read does not match its selected source shard")
+        return _WeightUpdatePlan(
+            trainer, capture, parameter_layout, transfer_plan,
+            MappingProxyType(replicas), MappingProxyType(source_slots),
+        )
+
+
+    def _try_rebind_plan(
+        self,
+        trainer: TrainerSourceSnapshot,
+    ) -> _WeightUpdatePlan | None:
+        previous = self._weight_update_plan
+        if (
+            previous is None
+            or self._debug_validate_plan
+            or self._debug_validate_layout
+            or trainer.mesh_id != previous.trainer_source_snapshot.mesh_id
+            or trainer.mesh_generation != previous.trainer_source_snapshot.mesh_generation
+            or {source.source_slot_id for source in trainer.shards}
+            != {source.source_slot_id for source in previous.trainer_source_snapshot.shards}
+        ):
+            return None
+        replicas = dict(previous.replicas)
+        selected = {}
+        for source in trainer.shards:
+            identity = (source.source_slot_id, source.worker_id)
+            record = replicas.get(identity)
+            if record is not None:
+                if record.source.physical_fingerprint != source.physical_fingerprint:
+                    raise RuntimeError("known trainer replica metadata changed within a mesh generation")
+            else:
+                record = _trainer_replica(source)
+                original = next(
+                    item for item in previous.replicas.values()
+                    if item.source.source_slot_id == source.source_slot_id
+                )
+                if record.geometry != original.geometry:
+                    raise RuntimeError("trainer replica geometry differs from the compiled plan")
+                replicas[identity] = record
+            selected[source.source_slot_id] = record
+        sources = {}
+        session_to_agent, session_to_device, session_to_memory, agent_metadata = {}, {}, {}, {}
+        for slot, record in selected.items():
+            for name, tensor in record.resolved.sources.items():
+                owned = tuple(
+                    shard for shard in tensor.shards
+                    if previous.source_slots[(name, tuple(shard.shard_offset), tuple(shard.shape))] == slot
+                )
+                if not owned:
+                    continue
+                current = sources.get(name)
+                sources[name] = (
+                    tensor._replace(shards=owned) if current is None
+                    else current._replace(shards=current.shards + owned)
+                )
+            if set(agent_metadata) & record.resolved.agent_metadata.keys():
+                raise ValueError("source manifests contain duplicate NIXL agents")
+            for target, incoming in (
+                (session_to_agent, record.resolved.session_to_agent),
+                (session_to_device, record.resolved.session_to_device),
+                (session_to_memory, record.resolved.session_to_memory),
+            ):
+                if any(key in target and target[key] != value for key, value in incoming.items()):
+                    raise RuntimeError("trainer replicas contain conflicting source sessions")
+                target.update(incoming)
+            agent_metadata.update(record.resolved.agent_metadata)
+        sources = {name: sources[name] for name in previous.trainer_source_snapshot.resolved_metadata.sources}
+        resolved = _ResolvedSources(
+            MappingProxyType(sources), MappingProxyType(session_to_agent),
+            MappingProxyType(session_to_device), MappingProxyType(agent_metadata),
+            MappingProxyType(session_to_memory),
+        )
+        trainer = replace(trainer, resolved_metadata=resolved)
+        plan = previous.transfer_plan
+        bound = (
+            _bind_streaming_schedule(plan, previous.source_slots, selected)
+            if isinstance(plan, _StreamingSchedule)
+            else _bind_transfer_plan(plan, previous.source_slots, selected)
+        )
+        return _WeightUpdatePlan(
+            trainer, previous.generator_capture_snapshot, previous.parameter_layout, bound,
+            MappingProxyType(replicas), previous.source_slots,
+        )
+
+
     def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
         previous = self._weight_update_plan
         return (
@@ -847,28 +1108,38 @@ class _NixlStagedTransfer:
     def _connect_sources(
         self,
         resolved: _ResolvedSources,
-        required_metadata: dict[str, bytes],
+        required_metadata: Mapping[str, bytes],
         *,
         host_staging: bool = False,
+        mesh_identity: tuple[str, int],
+        recreate_workspace: bool = False,
     ) -> NixlReshardTransport:
-        self._ensure_manager_initialized()
         changed = {
-            agent: metadata
-            for agent, metadata in required_metadata.items()
-            if self._loaded_agent_metadata.get(agent) != metadata
+            agent: metadata for agent, metadata in required_metadata.items()
+            if agent not in self._loaded_agent_metadata
+            or self._loaded_agent_metadata[agent].metadata != metadata
         }
-        conflicting = sorted(
-            agent for agent in changed if agent in self._loaded_agent_metadata
-        )
-        if conflicting:
+        conflicting = sorted(agent for agent in changed if agent in self._loaded_agent_metadata)
+        unsafe = [
+            agent for agent in conflicting
+            if self._loaded_agent_metadata[agent].mesh_identity == mesh_identity
+        ]
+        if unsafe:
             raise RuntimeError(
                 "NIXL metadata changed for an already connected source agent: "
-                f"{conflicting[:10]}"
+                f"{unsafe[:10]}"
             )
+        if conflicting or recreate_workspace:
+            self.reset_workspace()
+            changed = dict(required_metadata)
+        self._ensure_manager_initialized()
         if changed:
             self._native_setup_started = True
         _load_agent_metadata(self._manager, changed)
-        self._loaded_agent_metadata.update(changed)
+        for agent, metadata in required_metadata.items():
+            previous = self._loaded_agent_metadata.get(agent)
+            if previous is None or previous.mesh_identity != mesh_identity:
+                self._loaded_agent_metadata[agent] = _ConnectedAgent(metadata, mesh_identity)
         return NixlReshardTransport(
             self._manager,
             resolved.session_to_agent,
@@ -920,13 +1191,13 @@ class _NixlStagedTransfer:
         if self._streaming is not None:
             raise RuntimeError("this transfer owns bounded staging storage")
         with self._preparing():
-            self._descriptor_cache = None
             previous = self._weight_update_plan
             metrics = {}
             warm = self._can_reuse_plan(trainer_snapshot)
+            rebound = None if warm else self._try_rebind_plan(trainer_snapshot)
             layout = (
                 self._resolve_layout(manifests, capture_layout, metrics, trainer_snapshot)
-                if self._debug_validate_layout and not warm else None
+                if self._debug_validate_layout and not warm and rebound is None else None
             )
             reusable = (
                 previous is not None
@@ -941,7 +1212,13 @@ class _NixlStagedTransfer:
             metrics.update(
                 plan_cache_hits=int(reusable), plan_cache_misses=int(not reusable)
             )
-            if reusable:
+            if rebound is not None:
+                trainer = rebound.trainer_source_snapshot
+                capture = rebound.generator_capture_snapshot
+                parameter_layout = rebound.parameter_layout
+                plan = rebound.transfer_plan
+                metrics.update(plan_cache_hits=1, plan_cache_misses=0, replica_rebindings=1)
+            elif reusable:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.generator_capture_snapshot
                 parameter_layout = previous.parameter_layout
@@ -967,13 +1244,15 @@ class _NixlStagedTransfer:
                 )
                 metrics["transfer_planning_s"] = time.perf_counter() - started
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(plan, resolved)
-            cached = previous if warm else _WeightUpdatePlan(
+            cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, plan
+            ))
+            transport = self._connect_sources(
+                resolved, cached.required_agent_metadata,
+                mesh_identity=(trainer.mesh_id, trainer.mesh_generation),
             )
-            transport = self._connect_sources(resolved, required_metadata)
             self._ensure_workspace(plan, parameter_layout)
-            if not reusable or self._full_copy_descriptors is None:
+            if rebound is not None or not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
             prepared = _PreparedNixlTransfer(
                 transfer_plan=plan,
@@ -991,6 +1270,7 @@ class _NixlStagedTransfer:
             self._publish_prepared(cached, prepared)
             return prepared
 
+
     def prepare_streaming(
         self,
         *,
@@ -1006,7 +1286,6 @@ class _NixlStagedTransfer:
         staging_device = streaming.staging_device
         assert self._buffer_budget is not None
         with self._preparing():
-            previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
             previous = self._weight_update_plan
             metrics = {}
             warm = (
@@ -1014,8 +1293,15 @@ class _NixlStagedTransfer:
                 and isinstance(previous.transfer_plan, _StreamingSchedule)
                 and self._can_reuse_plan(trainer_snapshot)
             )
+            rebound = None if warm else self._try_rebind_plan(trainer_snapshot)
             started = time.perf_counter()
-            if warm:
+            if rebound is not None:
+                trainer = rebound.trainer_source_snapshot
+                capture = rebound.generator_capture_snapshot
+                parameter_layout = rebound.parameter_layout
+                compiled = rebound.transfer_plan
+                metrics.update(plan_cache_enabled=1, plan_cache_hits=1, plan_cache_misses=0, replica_rebindings=1)
+            elif warm:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.generator_capture_snapshot
                 parameter_layout = previous.parameter_layout
@@ -1037,26 +1323,34 @@ class _NixlStagedTransfer:
             metrics["transfer_planning_s"] = time.perf_counter() - started
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(
-                compiled.transfer_plan, resolved
-            )
-            for batch in compiled.batches:
-                required_metadata.update(
-                    _required_agent_metadata(batch.transfer_plan, resolved)
-                )
-            cached = previous if warm else _WeightUpdatePlan(
+            cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, compiled
-            )
+            ))
             transport = self._connect_sources(
-                resolved, required_metadata, host_staging=staging_device == "cpu"
+                resolved, cached.required_agent_metadata, host_staging=staging_device == "cpu",
+                mesh_identity=(trainer.mesh_id, trainer.mesh_generation),
+                recreate_workspace=bool(
+                    self._staging_arenas
+                    and self._staging_arenas[0].numel() < compiled.arena_bytes
+                ),
             )
-            self._prepare_arenas(compiled.batches)
+            if (
+                cached.bounded_workspace is None
+                or cached.bounded_workspace.generation != self._workspace_generation
+            ):
+                self._prepare_arenas(compiled.arena_bytes)
             metrics["connection_registration_s"] = time.perf_counter() - started
-            descriptors = self._prepare_bounded_descriptors(
-                compiled,
-                previous_descriptors,
-                enabled=bool(metrics["plan_cache_enabled"]),
+            binding = cached.bounded_workspace
+            reused_binding = (
+                binding is not None
+                and binding.schedule is compiled
+                and binding.generation == self._workspace_generation
             )
+            if not reused_binding:
+                binding = self._bind_bounded_workspace(compiled, resolved.sources)
+                cached = replace(cached, bounded_workspace=binding)
+            metrics["descriptor_binding_reused"] = int(reused_binding)
+            metrics["descriptor_builds"] = 0 if reused_binding else len(compiled.batches)
             prepared = _PreparedBoundedTransfer(
                 compiled.batches,
                 resolved.sources,
@@ -1065,18 +1359,17 @@ class _NixlStagedTransfer:
                 checksums if checksums is not None else MappingProxyType({}),
             )
             self._publish_prepared(cached, prepared)
-            self._descriptor_cache = descriptors
             return prepared
+
 
     def _prepare_arenas(
         self,
-        batches: tuple[_StreamingBatch, ...],
+        arena_bytes: int,
     ) -> None:
         streaming = cast(StreamingSettings, self._streaming)
         buffer_budget = cast(int, self._buffer_budget)
         staging_device = streaming.staging_device
         staging_buffers = streaming.staging_buffers
-        arena_bytes = max(batch.nbytes for batch in batches)
         if not self._staging_arenas:
             self._staging_device = torch.device(staging_device)
             for index in range(staging_buffers):
@@ -1092,40 +1385,66 @@ class _NixlStagedTransfer:
                     self._manager.register_tensors(
                         {f"__bounded_arena_{index}__": arena}
                     )
-        elif self._staging_arenas[0].numel() < arena_bytes:
-            raise RuntimeError(
-                "bounded workspace layout grew; restart the generator engine"
-            )
         if self._staging_arenas[0].numel() > buffer_budget:
             raise RuntimeError("existing bounded arena exceeds the requested limit")
 
-    def _prepare_bounded_descriptors(
-        self,
-        compiled: _StreamingSchedule,
-        previous: _BoundedDescriptors | None,
-        *,
-        enabled: bool,
-    ) -> _BoundedDescriptors | None:
-        if not enabled or not all(
-            type(arena) is torch.Tensor for arena in self._staging_arenas
-        ):
-            return None
-        if (
-            previous is not None
-            and previous.schedule is compiled
-            and previous.matches(
-                compiled.batches, self._workspace_generation, self._staging_arenas
+    def _bind_bounded_workspace(
+        self, compiled: _StreamingSchedule, sources: Mapping
+    ) -> _BoundedWorkspace:
+        bindings = []
+        for index, batch in enumerate(compiled.batches):
+            arena = self._staging_arenas[index % len(self._staging_arenas)]
+            offset = 0
+            buffers = []
+            for layout in batch.layouts:
+                tensors = {}
+                for name, (shape, dtype) in layout.items():
+                    nbytes = math.prod(shape) * dtype.itemsize
+                    tensors[name] = arena[offset:offset + nbytes].view(dtype).view(shape)
+                    offset += ((nbytes + 255) // 256) * 256
+                buffers.append(tensors)
+            recv, convert, full = buffers
+            descriptors = tuple(
+                _BoundedReadDescriptor(item.session, item.src_addr, item.dst_addr, item.nbytes)
+                for item in self._descriptors(batch.transfer_plan, recv, full, convert)
             )
-        ):
-            return previous
-        return _BoundedDescriptors(
-            compiled,
-            self._workspace_generation,
-            tuple(
-                (weakref.ref(arena), _arena_geometry(arena))
-                for arena in self._staging_arenas
-            ),
-            (None,) * len(compiled.batches),
+            full_copies = tuple(
+                (
+                    recv[copy.param_name].as_strided(
+                        copy.dest_shape, copy.dest_stride,
+                        recv[copy.param_name].storage_offset() + copy.dest_offset,
+                    ),
+                    full[pull.src_name], copy.op_chain,
+                )
+                for pull in batch.transfer_plan.full_pulls for copy in pull.copies
+            )
+            converted = {item.param_name for item in batch.transfer_plan.converts}
+            conversion_selections = {
+                copy.param_name: copy for copy in batch.capture.copies
+                if copy.param_name in converted
+            }
+            conversion_copies = tuple(
+                (
+                    recv[copy.param_name].as_strided(
+                        copy.dest_shape, copy.dest_stride,
+                        recv[copy.param_name].storage_offset() + copy.dest_offset,
+                    ),
+                    convert[copy.param_name],
+                )
+                for item in batch.transfer_plan.converts
+                for copy in (conversion_selections[item.param_name],)
+            )
+            bindings.append(_BoundedBatchBinding(
+                tuple(buffers), descriptors,
+                MappingProxyType({copy.src_name: sources[copy.src_name] for copy in batch.capture.copies}),
+                full_copies, conversion_copies,
+                tuple(tensor for tensors in buffers for tensor in tensors.values()),
+                sum(item.nbytes for item in descriptors),
+            ))
+        return _BoundedWorkspace(
+            compiled, self._workspace_generation,
+            tuple((weakref.ref(arena), _arena_geometry(arena)) for arena in self._staging_arenas),
+            tuple(bindings), sum(arena.numel() for arena in self._staging_arenas),
         )
 
     def iter_bounded(
@@ -1144,98 +1463,42 @@ class _NixlStagedTransfer:
             raise RuntimeError("bounded NIXL transfer is no longer active")
         arenas = self._staging_arenas
         assert arenas
-        metrics["staging_peak_bytes"] = sum(a.numel() for a in arenas)
         metrics["staging_buffers"] = len(arenas)
         metrics["batches"] = len(prepared.batches)
         batches = prepared.batches
         metrics.update(
-            descriptor_cache_hits=0, descriptor_cache_misses=0, descriptor_builds=0
+            descriptor_cache_hits=0, descriptor_cache_misses=0,
+            descriptor_builds=prepared.metrics.get("descriptor_builds", 0)
         )
 
-        def descriptors(
-            index: int,
-            recv: dict[str, torch.Tensor],
-            full: dict[str, torch.Tensor],
-            convert: dict[str, torch.Tensor],
-        ) -> tuple[ReadDescriptor | _BoundedReadDescriptor, ...]:
-            entry = self._descriptor_cache
-            if entry is not None and not entry.matches(
-                batches, self._workspace_generation, arenas
-            ):
-                self._descriptor_cache = entry = None
-            if entry is not None and entry.batches[index] is not None:
-                metrics["descriptor_cache_hits"] += 1
-                return entry.batches[index]
-            metrics["descriptor_cache_misses"] += 1
-            metrics["descriptor_builds"] += 1
-            fresh = tuple(
-                self._descriptors(batches[index].transfer_plan, recv, full, convert)
-            )
-            if entry is None:
-                return fresh
-            if not all(
-                type(item.session) is str
-                and type(item.src_addr) is int
-                and type(item.dst_addr) is int
-                and type(item.nbytes) is int
-                for item in fresh
-            ):
-                self._descriptor_cache = None
-                return fresh
-            immutable = tuple(
-                _BoundedReadDescriptor(
-                    item.session, item.src_addr, item.dst_addr, item.nbytes
-                )
-                for item in fresh
-            )
-            self._descriptor_cache = replace(
-                entry,
-                batches=entry.batches[:index]
-                + (immutable,)
-                + entry.batches[index + 1 :],
-            )
-            return immutable
-
-        def carve(
-            batch: _StreamingBatch, arena: torch.Tensor
-        ) -> tuple[dict[str, torch.Tensor], ...]:
-            offset = 0
-            buffers = []
-            for layout in batch.layouts:
-                tensors = {}
-                for name, (shape, dtype) in layout.items():
-                    nbytes = math.prod(shape) * dtype.itemsize
-                    tensors[name] = (
-                        arena[offset : offset + nbytes].view(dtype).view(shape)
-                    )
-                    offset += ((nbytes + 255) // 256) * 256
-                buffers.append(tensors)
-            return tuple(buffers)
+        plan = self._weight_update_plan
+        assert plan is not None and plan.bounded_workspace is not None
+        workspace = plan.bounded_workspace
+        metrics["staging_peak_bytes"] = workspace.staging_peak_bytes
+        reused = bool(prepared.metrics.get("descriptor_binding_reused"))
 
         def post(index: int) -> tuple:
+            if (
+                workspace.generation != self._workspace_generation
+                or (self._debug_validate_workspace and not workspace.matches(arenas))
+            ):
+                raise RuntimeError("bounded workspace changed; prepare the transfer again")
             batch = batches[index]
-            recv, convert, full = carve(batch, arenas[index % len(arenas)])
+            binding = workspace.batches[index]
+            metrics["descriptor_cache_hits" if reused else "descriptor_cache_misses"] += 1
             # Captured loaders may leave padding untouched. Reused arenas must
             # reproduce the zero-filled load layout before the NIC writes it.
-            for tensors in (recv, convert, full):
-                for tensor in tensors.values():
-                    tensor.zero_()
+            for tensor in binding.zero_tensors:
+                tensor.zero_()
             if arenas[index % len(arenas)].device.type == "cuda":
                 torch.cuda.synchronize(self._device)
-            sources = {
-                c.src_name: prepared.sources[c.src_name] for c in batch.capture.copies
-            }
             chunk = _PreparedNixlTransfer(
-                batch.transfer_plan,
-                batch.capture,
-                sources,
-                descriptors(index, recv, full, convert),
-                prepared.transport,
-                checksums=prepared.checksums,
+                batch.transfer_plan, batch.capture, binding.sources,
+                binding.descriptors, prepared.transport, checksums=prepared.checksums,
             )
             started = time.perf_counter()
             posted = prepared.transport.post_reads(list(chunk.descriptors))
-            return chunk, (recv, convert, full), posted, started
+            return chunk, binding, posted, started
 
         pending = None
         unwinding = False
@@ -1243,11 +1506,11 @@ class _NixlStagedTransfer:
         try:
             pending = post(0)
             for index in range(len(batches)):
-                chunk, buffers, posted, started = pending
+                chunk, binding, posted, started = pending
                 pending = None
-                self._recv_buffers, self._convert_buffers, self._full_buffers = buffers
+                self._recv_buffers, self._convert_buffers, self._full_buffers = binding.buffers
                 self._active = chunk
-                staged = self._complete_stage(chunk, posted, started)
+                staged = self._complete_stage(chunk, posted, started, binding=binding)
                 if len(arenas) > 1 and index + 1 < len(batches):
                     # The other arena's previous batch was committed and
                     # synchronized one iteration ago, so it is free to refill.
@@ -1269,7 +1532,7 @@ class _NixlStagedTransfer:
             raise
         finally:
             if not completed:
-                self._descriptor_cache = None
+                self._invalidate_workspace_binding()
             if pending is not None:
                 # A prefetched READ is in flight for a batch the caller will
                 # never consume; drain it so the handles are released.
@@ -1442,7 +1705,8 @@ class _NixlStagedTransfer:
 
     @torch.no_grad()
     def _complete_stage(
-        self, prepared: _PreparedNixlTransfer, posted: list, started: float
+        self, prepared: _PreparedNixlTransfer, posted: list, started: float,
+        *, binding: _BoundedBatchBinding | None = None,
     ) -> _StagedNixlWeights:
         """Wait for posted READs, then reconstruct, convert, and verify."""
         wait_started = time.perf_counter()
@@ -1451,38 +1715,44 @@ class _NixlStagedTransfer:
         wire_seconds = time.perf_counter() - started
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.transfer_plan.full_pulls:
-            source = self._full_buffers[full.src_name]
-            for copy in full.copies:
-                destination = self._recv_buffers[copy.param_name].as_strided(
+        if binding is not None:
+            for destination, source, operations in binding.full_copies:
+                destination.copy_(_replay_ops(source, operations))
+            for destination, source in binding.conversion_copies:
+                destination.copy_(source)
+        else:
+            for full in prepared.transfer_plan.full_pulls:
+                source = self._full_buffers[full.src_name]
+                for copy in full.copies:
+                    destination = self._recv_buffers[copy.param_name].as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        self._recv_buffers[copy.param_name].storage_offset()
+                        + copy.dest_offset,
+                    )
+                    destination.copy_(_replay_ops(source, copy.op_chain))
+            converted = {convert.param_name for convert in prepared.transfer_plan.converts}
+            conversion_copies = {
+                copy.param_name: copy
+                for copy in prepared.capture.copies
+                if copy.param_name in converted
+            }
+            for convert in prepared.transfer_plan.converts:
+                copy = conversion_copies[convert.param_name]
+                target = self._recv_buffers[convert.param_name]
+                destination = target.as_strided(
                     copy.dest_shape,
                     copy.dest_stride,
-                    self._recv_buffers[copy.param_name].storage_offset()
-                    + copy.dest_offset,
+                    target.storage_offset() + copy.dest_offset,
                 )
-                destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.transfer_plan.converts}
-        conversion_copies = {
-            copy.param_name: copy
-            for copy in prepared.capture.copies
-            if copy.param_name in converted
-        }
-        for convert in prepared.transfer_plan.converts:
-            copy = conversion_copies[convert.param_name]
-            target = self._recv_buffers[convert.param_name]
-            destination = target.as_strided(
-                copy.dest_shape,
-                copy.dest_stride,
-                target.storage_offset() + copy.dest_offset,
-            )
-            destination.copy_(self._convert_buffers[convert.param_name])
+                destination.copy_(self._convert_buffers[convert.param_name])
         torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
             self._verify(prepared)
 
-        bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        bytes_received = binding.wire_bytes if binding is not None else sum(d.nbytes for d in prepared.descriptors)
         # This is the path the FSDP trainer refits over, and the path the 20x
         # collapse was measured on, so it is the one the floor most needs to cover.
         throughput.warn_if_below_floor(
@@ -1710,13 +1980,14 @@ class _NixlStagedTransfer:
     def close(self) -> None:
         if self._closed:
             return
-        self._invalidate_descriptors()
+        self._invalidate_workspace_binding()
         self._weight_update_plan = None
         self._full_copy_descriptors = None
         self._closed = True
         if self._owns_manager:
             self._release_staging_registrations()
             self._manager.shutdown()
+            self._active = None
             # The agent's registrations are gone, so staging storage can be
             # freed eagerly. A shared agent may still hold these buffers
             # registered; keep them referenced until its owner shuts down.

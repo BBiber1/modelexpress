@@ -16,6 +16,7 @@ from modelexpress.refit.timing import (
 )
 
 from ...train import WeightPayloadFormat
+from ..adapter import TrainerSourceShard
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
     _StagedNixlWeights,
@@ -49,6 +50,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
 
     def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
         return self._transfer.cached_trainer_source()
+
+    def cached_trainer_replicas(
+        self, mesh_id: str, generation: int
+    ) -> tuple[TrainerSourceShard, ...]:
+        return self._transfer.cached_trainer_replicas(mesh_id, generation)
 
     @property
     def capabilities(self) -> MethodCapabilities:

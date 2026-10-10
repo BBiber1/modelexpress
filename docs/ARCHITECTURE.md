@@ -687,9 +687,18 @@ independent copy before installation.
 Trainer plan reuse checks the current mesh and lists publications for the
 requested version under its lease. A matching selected worker, slot, endpoint,
 and stable metadata digest reuse the validated plan without fetching or parsing
-stable metadata or rebinding the fixed engine load layout. Missing or changed
-publications use normal replica discovery from the same listing. Mesh identity
-alone cannot prove that a selected replica published the requested version.
+stable metadata or rebinding the fixed engine load layout. Missing selected
+publications use normal replica discovery from the same listing. A first-seen
+compatible replica extends per-slot physical bindings without repeating logical
+planning. Returning to a learned replica reuses its validated metadata. Reads
+retain their original owning slot, source tensor, shard box and byte offset,
+including replicated or aliased tensors. Known-replica physical metadata drift
+within the same generation rejects the round; a new generation rebuilds the
+physical plan. Each compiled physical binding caches the required agent metadata
+from the whole plan and its executed packed batches. Warm preparation does not
+rescan reads for agent selection. A reset rebuilds the physical plan and reconnects
+the required agents against fresh native registration state. Mesh identity alone
+cannot prove that a selected replica published the requested version.
 Read handles and content checksums belong to the current version round. Failed
 native preparation and manager reset invalidate the physical plan; the client's
 canonical engine load layout remains available for the next preparation.
@@ -1814,16 +1823,28 @@ therefore not a total GPU-memory bound. Two arenas can overlap the next READ wit
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
-Bounded transfer can reuse immutable READ addresses and sizes for the currently
-validated compiled plan. The one-entry cache checks the workspace generation and
-the identity, order and geometry of all receive arenas before every batch. It
-holds only weak arena references; source leases, tensor views and transport
-handles remain owned by the update. Preparation still validates current source
-metadata and coverage, and every batch still creates views, zeroes padding,
-posts fresh READs and completes the existing fences. Failed preparation,
-incomplete iteration and workspace teardown discard the descriptors. Private
-transfer counters report hits, misses and builds; descriptor work stays outside
-the wire timer on both cold and warm updates.
+The compiled bounded plan owns a destination binding with typed arena views,
+READ descriptors, selected source rows, reconstruction and conversion views,
+and byte totals prepared before the first READ. Warm preparations reuse that
+binding without rebuilding views or scanning arena geometry. Sufficient arena capacity is reused without shrinking across compatible
+successful preparations. A larger validated schedule grows within the fixed
+budget by resetting the owned agent before reconnecting and registering new
+arenas; a borrowed agent cannot be torn down for growth. Workspace
+registration changes invalidate the binding; reset and failed preparation
+retain #877's physical-plan invalidation and storage cleanup.
+`MX_REFIT_DEBUG_VALIDATE_WORKSPACE=1` additionally checks arena identities and
+geometry before zeroing or posting each batch. Each round still owns fresh
+checksums, transport handles and source leases. Padding is zeroed before every
+READ, and synchronization, verification and drain rules remain unchanged.
+Loaded native agent metadata records also retain the mesh identity that last
+validated each required registration. Unused agents keep their prior identity.
+A changed registration from an earlier mesh identity resets an owned agent
+before reconnecting; same-identity conflicts still fail.
+Borrowed agents cannot be torn down. Identical required registrations preserve
+compatible native state and staging capacity across mesh changes.
+Typed views retain their arena storage until their plan or iteration is
+released; the binding owns no native manager or READ handles. Descriptor work
+stays outside the wire timer.
 
 The compiled plan owns an immutable snapshot of ordinary parsed source and
 shard rows. A validated publication match returns that snapshot directly for
