@@ -76,7 +76,8 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         def shutdown(self):
             self.registered.clear()
 
-        def add_remote_agent(self, metadata):
+        def add_remote_agent(self, metadata) -> str:
+            events.append(f"connect:{metadata.decode()}")
             return metadata.decode()
 
         def register_tensors(self, tensors):
@@ -497,8 +498,12 @@ def test_replica_binding_preserves_original_slot_owner(harness, conflicting_agen
         return TrainerSourceShard(slot, worker, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob)
 
     def prepare(shards: tuple) -> module._PreparedBoundedTransfer:
+        snapshot = TrainerSourceSnapshot("owners", 1, shards)
+        cached = harness.transfer.cached_trainer_source()
+        if cached is not None and cached.physical_fingerprint == snapshot.physical_fingerprint:
+            snapshot = cached
         return harness.transfer.prepare_streaming(
-            trainer_snapshot=TrainerSourceSnapshot("owners", 1, shards),
+            trainer_snapshot=snapshot,
             manifests=[source.metadata for source in shards],
             capture_layout=lambda _: (harness.capture, harness.layout),
         )
@@ -510,6 +515,8 @@ def test_replica_binding_preserves_original_slot_owner(harness, conflicting_agen
     z = shard("second", "Z", "agentZ", ignored)
     _, installed = harness.collect(prepare((a, z)))
     _check_values(harness, installed)
+    assert "connect:agentA" in harness.events
+    assert "connect:agentZ" not in harness.events
     b = shard("first", "B", "agentZ" if conflicting_agent else "agentB", replacement)
     harness.events.clear()
     if conflicting_agent:
@@ -522,6 +529,21 @@ def test_replica_binding_preserves_original_slot_owner(harness, conflicting_agen
         _, installed = harness.collect(prepared)
         _check_values(harness, installed)
         assert prepared.metrics.get("owner_plan_builds", 0) == 0
+        assert "connect:agentB" in harness.events
+        assert "connect:agentZ" not in harness.events
+        harness.events.clear()
+        for tensor in replacement.values():
+            tensor.add_(1)
+        _, installed = harness.collect(prepare((z, b)))
+        _check_values(harness, installed)
+        assert not any(event.startswith("connect:") for event in harness.events)
+        harness.transfer.reset_workspace()
+        prepared = prepare((b, z))
+        _, installed = harness.collect(prepared)
+        _check_values(harness, installed)
+        assert prepared.metrics["plan_cache_misses"] == 1
+        assert "connect:agentB" in harness.events
+        assert "connect:agentZ" not in harness.events
 
 
 def test_failed_replica_setup_rebuilds_before_next_transfer(harness, monkeypatch) -> None:

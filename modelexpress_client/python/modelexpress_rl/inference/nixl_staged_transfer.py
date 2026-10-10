@@ -128,8 +128,19 @@ class _WeightUpdatePlan:
     replicas: Mapping[tuple[str, str], _TrainerReplica] = field(default_factory=dict)
     source_slots: Mapping[_SourceGeometry, str] = field(default_factory=dict)
     replica_sources: tuple[TrainerSourceShard, ...] = field(init=False)
+    required_agent_metadata: Mapping[str, bytes] = field(init=False)
 
     def __post_init__(self) -> None:
+        schedule = self.transfer_plan
+        resolved = self.trainer_source_snapshot.resolved_metadata
+        required = _required_agent_metadata(
+            schedule.transfer_plan if isinstance(schedule, _StreamingSchedule) else schedule,
+            resolved,
+        )
+        if isinstance(schedule, _StreamingSchedule):
+            for batch in schedule.batches:
+                required.update(_required_agent_metadata(batch.transfer_plan, resolved))
+        object.__setattr__(self, "required_agent_metadata", MappingProxyType(required))
         object.__setattr__(
             self, "replica_sources", tuple(record.source for record in self.replicas.values())
         )
@@ -1136,7 +1147,7 @@ class _NixlStagedTransfer:
     def _connect_sources(
         self,
         resolved: _ResolvedSources,
-        required_metadata: dict[str, bytes],
+        required_metadata: Mapping[str, bytes],
         *,
         host_staging: bool = False,
     ) -> NixlReshardTransport:
@@ -1289,11 +1300,10 @@ class _NixlStagedTransfer:
                 )
                 metrics["transfer_planning_s"] = time.perf_counter() - started
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(plan, resolved)
             cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, plan
             ))
-            transport = self._connect_sources(resolved, required_metadata)
+            transport = self._connect_sources(resolved, cached.required_agent_metadata)
             self._ensure_workspace(plan, parameter_layout)
             if rebound is not None or not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
@@ -1367,18 +1377,11 @@ class _NixlStagedTransfer:
             metrics["transfer_planning_s"] = time.perf_counter() - started
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(
-                compiled.transfer_plan, resolved
-            )
-            for batch in compiled.batches:
-                required_metadata.update(
-                    _required_agent_metadata(batch.transfer_plan, resolved)
-                )
             cached = previous if warm else (rebound or self._retain_plan(
                 trainer, capture, parameter_layout, compiled
             ))
             transport = self._connect_sources(
-                resolved, required_metadata, host_staging=staging_device == "cpu"
+                resolved, cached.required_agent_metadata, host_staging=staging_device == "cpu"
             )
             self._prepare_arenas(compiled.batches)
             metrics["connection_registration_s"] = time.perf_counter() - started

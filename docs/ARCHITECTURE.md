@@ -694,8 +694,11 @@ planning. Returning to a learned replica reuses its validated metadata. Reads
 retain their original owning slot, source tensor, shard box and byte offset,
 including replicated or aliased tensors. Known-replica physical metadata drift
 within the same generation rejects the round; a new generation rebuilds the
-physical plan. Mesh identity alone cannot prove that a selected replica published
-the requested version.
+physical plan. Each compiled physical binding caches the required agent metadata
+from the whole plan and its executed packed batches. Warm preparation does not
+rescan reads for agent selection. A reset rebuilds the physical plan and reconnects
+the required agents against fresh native registration state. Mesh identity alone
+cannot prove that a selected replica published the requested version.
 Read handles and content checksums belong to the current version round. Failed
 native preparation and manager reset invalidate the physical plan; the client's
 canonical engine load layout remains available for the next preparation.
