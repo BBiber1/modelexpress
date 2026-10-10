@@ -6,7 +6,7 @@ import torch
 
 from modelexpress.refit.reshard.rendezvous import build_sources, merge_shard_tables
 from modelexpress.refit.reshard.transfer_plan import plan_transfer
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.refit.reshard.types import SourceToEngineMapping, RecordedCopy
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     build_hf_aliases,
@@ -273,11 +273,11 @@ def test_divisible_global_descriptors_match_legacy_aliases_byte_for_byte():
         assert global_aliases == legacy
 
 
-def test_sparse_kv_tables_merge_into_a_complete_bounded_plan():
+def test_sparse_kv_tables_merge_into_a_complete_bounded_plan() -> None:
     _, _, published = _publish_all_ranks(64, 2, 8, 128)
     merged = merge_shard_tables(_tables_by_agent(published))
     sources, _, _ = build_sources(merged)
-    capture = CaptureResult(
+    capture = SourceToEngineMapping(
         copies=[
             _full_copy(name, tuple(sources[name].global_shape)) for name in HF_NAMES
         ]
@@ -293,11 +293,11 @@ def test_sparse_kv_tables_merge_into_a_complete_bounded_plan():
     )
 
 
-def test_missing_kv_publishers_fail_closed_instead_of_silently_falling_back():
+def test_missing_kv_publishers_fail_closed_instead_of_silently_falling_back() -> None:
     _, _, published = _publish_all_ranks(64, 2, 8, 128)
     q_only = [tensor for tensor in published if tensor.name == HF_NAMES[0]]
     sources, _, _ = build_sources(merge_shard_tables(_tables_by_agent(q_only)))
-    capture = CaptureResult(
+    capture = SourceToEngineMapping(
         copies=[
             _full_copy(HF_NAMES[0], (64 * 128, 3)),
             _full_copy(HF_NAMES[1], (2 * 128, 3)),

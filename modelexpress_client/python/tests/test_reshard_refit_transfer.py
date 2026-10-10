@@ -31,7 +31,7 @@ from modelexpress.refit.reshard.transport import (
     InMemoryReferenceTransport,
     ReadDescriptor,
 )
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.refit.reshard.types import SourceToEngineMapping, RecordedCopy
 
 # Reuse the ToyModel + manifest from the geometry test (same package, same dir).
 from tests.test_reshard_refit_geometry import ToyModel, _manifest
@@ -228,7 +228,7 @@ def test_descriptor_heavy_slice_full_pulls_then_replays_locally():
     assert torch.equal(reconstructed, truth_row)
 
 
-def test_non_dim0_source_keeps_exact_descriptors():
+def test_non_dim0_source_keeps_exact_descriptors() -> None:
     source_tensor = torch.arange(32, dtype=torch.float32).reshape(4, 8)
     left = source_tensor[:, :4].contiguous()
     right = source_tensor[:, 4:].contiguous()
@@ -251,7 +251,7 @@ def test_non_dim0_source_keeps_exact_descriptors():
         ],
     )
     plan = plan_transfer(
-        CaptureResult(copies=[copy]),
+        SourceToEngineMapping(copies=[copy]),
         {"row": source},
         max_segments_per_copy=1,
     )

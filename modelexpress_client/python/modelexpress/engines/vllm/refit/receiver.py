@@ -33,7 +33,7 @@ from torch.nn import Module
 
 from modelexpress.refit.reshard.geometry import capture_geometry
 from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.types import CaptureResult
+from modelexpress.refit.reshard.types import SourceToEngineMapping
 
 logger = logging.getLogger("modelexpress.engines.vllm.refit.receiver")
 
@@ -95,7 +95,7 @@ class VllmReshardReceiver(ReshardReceiver):
         )
         return twin
 
-    def _capture(self, manifest: list) -> "tuple[CaptureResult, dict]":
+    def _capture(self, manifest: list) -> "tuple[SourceToEngineMapping, dict]":
         from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
         # Always capture on a fresh meta twin (uniform for bf16 + quantized): its

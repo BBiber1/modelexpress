@@ -41,7 +41,7 @@ from typing import Any
 import torch
 
 from modelexpress.refit.reshard.types import (
-    CaptureResult,
+    SourceToEngineMapping,
     OpChain,
     OpSpec,
     RecordedCopy,
@@ -52,7 +52,7 @@ from modelexpress.refit.reshard.types import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "CaptureResult",
+    "SourceToEngineMapping",
     "LazyWeight",
     "OpChain",
     "OpSpec",
@@ -324,7 +324,7 @@ def capture_weights(
     model: torch.nn.Module,
     weights: dict[str, Any],
     default_weight_loader: Callable | None = None,
-) -> CaptureResult:
+) -> SourceToEngineMapping:
     """Capture per-param slice geometry by dry-running ``load_weights`` with the
     pre-built ``weights`` against ``model`` (ideally a disposable meta twin).
 
@@ -339,7 +339,7 @@ def capture_weights(
             copies for params that have no explicit ``weight_loader`` (e.g. vLLM's
             ``default_weight_loader``). Optional.
 
-    Returns a ``CaptureResult`` (recorded copies + unsupported/unattributed).
+    Returns a ``SourceToEngineMapping`` (recorded copies + unsupported/unattributed).
     """
     recorder = _shared_recorder(weights)
     saved = _install_stamps(model, recorder, default_weight_loader)
@@ -383,7 +383,7 @@ def capture_weights(
         logger.warning(
             "reshard capture: %d source(s) unsupported, cause: %s", count, reason
         )
-    return CaptureResult(
+    return SourceToEngineMapping(
         copies=recorder.copies,
         unsupported=unsupported,
         unattributed=recorder.unattributed,
@@ -395,7 +395,7 @@ def capture_geometry(
     model: torch.nn.Module,
     manifest: list[tuple[str, Any, tuple]],
     default_weight_loader: Callable | None = None,
-) -> CaptureResult:
+) -> SourceToEngineMapping:
     """Convenience wrapper: build lazies from ``manifest`` (source names already
     HF-canonical) and capture. See :func:`build_lazy_weights` + :func:`capture_weights`
     for the pre-built-weights entry point used when a source conversion runs first."""

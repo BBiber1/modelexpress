@@ -2148,7 +2148,7 @@ def test_hook_replacing_a_submodule_never_leaves_the_live_child_stale(
 
 def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     monkeypatch,
-):
+) -> None:
     """install_streaming abandons the transfer with close(), not throw().
 
     The generator therefore sees GeneratorExit even while an install error is
@@ -2160,7 +2160,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
     from modelexpress.refit.reshard.slice_plan import Shard
     from modelexpress.refit.reshard.transfer_plan import SourceInfo
-    from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+    from modelexpress.refit.reshard.types import SourceToEngineMapping, RecordedCopy
 
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -2187,7 +2187,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
     planned = transfer_module._bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 512
+        SourceToEngineMapping(copies=copies), layout, {"w": source}, 512
     )
     drained = []
 
@@ -2479,7 +2479,8 @@ def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
     installer = _VllmInstaller(
         model=model,
         vllm_config=SimpleNamespace(
-            quant_config=object(), load_config=SimpleNamespace(load_format="modelexpress")
+            quant_config=object(),
+            load_config=SimpleNamespace(load_format="modelexpress"),
         ),
         model_config=SimpleNamespace(model="/launch", revision="main"),
         device=torch.device("cpu"),

@@ -125,7 +125,7 @@ from modelexpress.refit.reshard import ReshardReceiver
 class RuntimeReceiver(ReshardReceiver):
     def _capture(self, manifest):
         # Dry-run the runtime's loader and return:
-        # (CaptureResult, {parameter_name: (load_time_shape, load_time_dtype)})
+        # (SourceToEngineMapping, {parameter_name: (load_time_shape, load_time_dtype)})
         ...
 
     def _install(self, receive_buffers):

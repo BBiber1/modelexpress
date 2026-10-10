@@ -9,27 +9,33 @@ from types import ModuleType
 
 import pytest
 import torch
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.refit.reshard.types import SourceToEngineMapping, RecordedCopy
 from modelexpress_rl.inference.engines.vllm import _capture_snapshot as snapshot_module
 from modelexpress_rl.inference.engines.vllm import installer as module
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
 from torch import nn
 
 
-def _result(op_chain=()):
+def _result(op_chain=()) -> tuple[SourceToEngineMapping, dict]:
     record = RecordedCopy(
         "source", op_chain, "weight", 0, (2, 2), (2, 1), torch.float32
     )
-    return CaptureResult(copies=[record, record]), {"weight": ((2, 2), torch.float32)}
+    return SourceToEngineMapping(copies=[record, record]), {
+        "weight": ((2, 2), torch.float32)
+    }
 
 
-def test_snapshot_returns_fresh_mutable_records_and_preserves_shared_references():
+def test_snapshot_returns_fresh_mutable_records_and_preserves_shared_references() -> (
+    None
+):
     result = _result()
     snapshot = _CaptureSnapshot.create(result)
     assert type(snapshot) is _CaptureSnapshot
     first, layout = snapshot.clone()
     second, other_layout = snapshot.clone()
-    assert type(first) is CaptureResult and type(first.copies[0]) is RecordedCopy
+    assert (
+        type(first) is SourceToEngineMapping and type(first.copies[0]) is RecordedCopy
+    )
     assert first.copies[0] is first.copies[1]
     assert first.copies[0] is not second.copies[0]
     assert first.copies[0] is not result[0].copies[0]

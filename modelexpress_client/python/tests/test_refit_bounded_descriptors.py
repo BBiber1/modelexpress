@@ -23,7 +23,7 @@ from modelexpress.refit.reshard.rendezvous import (
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress.refit.reshard.types import (
-    CaptureResult,
+    SourceToEngineMapping,
     IncompleteRefit,
     RecordedCopy,
 )
@@ -54,7 +54,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             ("exact", (), "d.weight", torch.float32),
         )
     ]
-    capture = CaptureResult(copies=copies)
+    capture = SourceToEngineMapping(copies=copies)
     layout = {copy.param_name: ((20,), copy.dest_dtype) for copy in copies}
     transports = []
     events = []
@@ -220,9 +220,9 @@ def test_warm_descriptors_still_transfer_new_values(harness, monkeypatch, pack) 
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
     prepare = harness.prepare
     first = prepare()
-    assert any(batch.plan.full_pulls for batch in first.batches)
-    assert any(batch.plan.converts for batch in first.batches)
-    assert any(batch.plan.segments for batch in first.batches)
+    assert any(batch.transfer_plan.full_pulls for batch in first.batches)
+    assert any(batch.transfer_plan.converts for batch in first.batches)
+    assert any(batch.transfer_plan.segments for batch in first.batches)
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
     assert cold["descriptor_builds"] == len(first.batches)

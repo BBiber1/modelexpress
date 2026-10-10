@@ -1825,7 +1825,10 @@ full-copy transfer borrowing the engine manager. The version lease remains held 
 installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.
 
-Trainer source rows and captured layouts are owned snapshots inside one pull plan.
+Trainer source rows and source-to-engine mappings are owned snapshots inside one
+weight update plan. `SourceToEngineMapping` records loader geometry;
+`TensorTransferPlan` describes physical reads and conversions, and a bounded
+`_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
 With source caching enabled, byte-identical ordered manifests reuse the resolved
 metadata directly from that plan; a miss resolves and freezes new metadata.
 Full-copy and bounded preparation share metadata/layout resolution, connection

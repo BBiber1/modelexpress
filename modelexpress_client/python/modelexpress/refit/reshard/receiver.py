@@ -47,7 +47,7 @@ from modelexpress.refit.reshard.transport import (
     ReadDescriptor,
 )
 from modelexpress.refit.reshard.types import (
-    CaptureResult,
+    SourceToEngineMapping,
     IncompleteRefit,
     UnsupportedReshard,
     summarize_unsupported,
@@ -455,7 +455,7 @@ class ReshardReceiver:
         )
 
     # ------------------------------------------------------------- engine hooks
-    def _capture(self, manifest: list) -> tuple[CaptureResult, dict]:
+    def _capture(self, manifest: list) -> tuple[SourceToEngineMapping, dict]:
         """Record where each published source lands in the engine's load-time
         param layout, without moving data.
 

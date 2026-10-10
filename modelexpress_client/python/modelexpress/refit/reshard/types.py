@@ -72,7 +72,7 @@ class RecordedCopy:
 
 
 @dataclass
-class CaptureResult:
+class SourceToEngineMapping:
     """Output of a bake: the recorded copies plus what could not be attributed.
 
     ``unsupported`` = source names whose loader used an unsupported op.

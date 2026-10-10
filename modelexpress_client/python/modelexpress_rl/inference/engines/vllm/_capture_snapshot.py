@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from types import FunctionType, GetSetDescriptorType
 
 import torch
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.refit.reshard.types import SourceToEngineMapping, RecordedCopy
 
 _RECORD_FIELDS = (
     "src_name",
@@ -21,7 +21,7 @@ _RECORD_FIELDS = (
     "dest_dtype",
 )
 _CAPTURE_FIELDS = ("copies", "unsupported", "unattributed", "unsupported_reasons")
-_CAPTURE_CLASS = CaptureResult
+_CAPTURE_CLASS = SourceToEngineMapping
 _RECORD_CLASS = RecordedCopy
 _COPY_METHODS = (
     "__new__",
@@ -57,7 +57,7 @@ _COPY_BINDINGS = tuple(
 
 def _ordinary_copy_classes() -> bool:
     if (
-        CaptureResult is not _CAPTURE_CLASS
+        SourceToEngineMapping is not _CAPTURE_CLASS
         or RecordedCopy is not _RECORD_CLASS
         or copy.deepcopy is not _DEEPCOPY
         or type(copy._deepcopy_dispatch) is not dict
@@ -86,7 +86,7 @@ def _ordinary_copy_classes() -> bool:
     ):
         return False
     for cls, fields in (
-        (CaptureResult, _CAPTURE_FIELDS),
+        (SourceToEngineMapping, _CAPTURE_FIELDS),
         (RecordedCopy, _RECORD_FIELDS),
     ):
         if type(cls) is not type or cls.__bases__ != (object,):
@@ -103,7 +103,7 @@ def _ordinary_copy_classes() -> bool:
         if any(
             name in namespace
             and not (
-                cls is CaptureResult
+                cls is SourceToEngineMapping
                 and name == "unattributed"
                 and type(namespace[name]) is int
             )
@@ -159,7 +159,7 @@ class _CaptureSnapshot:
     layout: tuple
 
     @classmethod
-    def create(cls, result: tuple):
+    def create(cls, result: tuple) -> "_CaptureSnapshot | tuple":
         if (
             not _ordinary_copy_classes()
             or type(result) is not tuple
@@ -167,7 +167,7 @@ class _CaptureSnapshot:
         ):
             return result
         capture, layout = result
-        if type(capture) is not CaptureResult or type(layout) is not dict:
+        if type(capture) is not SourceToEngineMapping or type(layout) is not dict:
             return result
         state = vars(capture)
         if tuple(state) != _CAPTURE_FIELDS:
@@ -214,7 +214,7 @@ class _CaptureSnapshot:
             return result
         return cls(result, tuple(records), tuple(indices), tuple(layout.items()))
 
-    def clone(self):
+    def clone(self) -> tuple:
         if not _ordinary_copy_classes():
             return copy.deepcopy(self.fallback)
         records = []
@@ -227,7 +227,7 @@ class _CaptureSnapshot:
             record = object.__new__(RecordedCopy)
             vars(record).update(zip(_RECORD_FIELDS, values))
             records.append(record)
-        capture = object.__new__(CaptureResult)
+        capture = object.__new__(SourceToEngineMapping)
         vars(capture).update(
             copies=[records[index] for index in self.indices],
             unsupported=[],

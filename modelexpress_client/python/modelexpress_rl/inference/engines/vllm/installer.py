@@ -50,7 +50,7 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
-    from modelexpress.refit.reshard.types import CaptureResult
+    from modelexpress.refit.reshard.types import SourceToEngineMapping
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
@@ -777,7 +777,7 @@ class _VllmInstaller(EngineInstaller):
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
     ) -> tuple[
-        CaptureResult,
+        SourceToEngineMapping,
         dict[str, tuple[tuple[int, ...], torch.dtype]],
     ]:
         """Record how published tensors map into vLLM's load-time parameters.

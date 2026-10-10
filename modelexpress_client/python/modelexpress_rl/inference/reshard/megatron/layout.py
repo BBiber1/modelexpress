@@ -16,7 +16,7 @@ from numbers import Integral
 from typing import Any
 
 from modelexpress.refit.reshard.slice_plan import _row_major_strides
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.refit.reshard.types import SourceToEngineMapping, RecordedCopy
 
 REPLICATED = "replicated"
 COLUMN_ROLES = frozenset(
@@ -116,7 +116,7 @@ def _partition(extent: int, layout: MegatronTargetLayout) -> tuple[int, int]:
 def lower_megatron_target(
     specs: list[MegatronTargetSpec],
     layout: MegatronTargetLayout,
-) -> tuple[CaptureResult, dict[str, tuple[tuple[int, ...], Any]]]:
+) -> tuple[SourceToEngineMapping, dict[str, tuple[tuple[int, ...], Any]]]:
     """Create reshard capture records and native staging layouts for one TP rank.
 
     Each copy describes a destination-owned narrow of the global native
@@ -159,7 +159,7 @@ def lower_megatron_target(
         )
         param_layout[staging_name] = (local_shape_tuple, spec.dtype)
 
-    return CaptureResult(copies=copies), param_layout
+    return SourceToEngineMapping(copies=copies), param_layout
 
 
 __all__ = [

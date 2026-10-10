@@ -41,7 +41,7 @@ def default_loader(param, tensor):
     param.data.copy_(tensor)
 
 
-def serial_capture(model, weights):
+def serial_capture(model, weights) -> geometry.SourceToEngineMapping:
     recorder = geometry._shared_recorder(weights)
     saved = geometry._install_stamps(model, recorder, default_loader)
     unsupported, reasons = [], {}
@@ -55,7 +55,7 @@ def serial_capture(model, weights):
                 reasons[source] = str(error)
     finally:
         geometry._restore_stamps(saved)
-    return geometry.CaptureResult(
+    return geometry.SourceToEngineMapping(
         copies=recorder.copies,
         unsupported=unsupported,
         unattributed=recorder.unattributed,
