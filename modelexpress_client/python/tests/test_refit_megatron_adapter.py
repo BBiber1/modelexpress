@@ -28,7 +28,7 @@ from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     MegatronTrainerAdapter,
 )
-from modelexpress_rl.train.manifest import WeightVersionShardManifestService
+from modelexpress_rl.train.manifest import RefitWorkerService
 
 
 class _Tensor:
@@ -143,7 +143,7 @@ def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
     )
 
 
-def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
+def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch) -> None:
     monkeypatch.setattr(
         "modelexpress_rl.train.engines.megatron.aliases.published_digest",
         lambda _tensor: "tensor-digest",
@@ -157,12 +157,13 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         lambda: 3,
     )
     monkeypatch.setenv("MX_WORKER_HOST", "10.0.0.3")
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     events = []
     refit_service = _RefitService(events)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(refit_service, server)
     port = server.add_insecure_port("127.0.0.1:0")
-    manifest_service = WeightVersionShardManifestService(endpoint=f"127.0.0.1:{port}")
+    manifest_service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
     refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
     server.start()
     resources = SimpleNamespace(
@@ -224,12 +225,16 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         selected_adapter = refit_client._runtime.method._adapter
         refit_client.publish_version(version=WeightVersionRef("version-a"))
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
-            grpc.insecure_channel(refit_service.shard.manifest_endpoint)
+            grpc.insecure_channel(refit_service.shard.metadata_endpoint)
         )
-        fetched = worker_stub.GetWeightVersionShardManifest(
-            refit_pb2.GetWeightVersionShardManifestRequest(
-                version_id="version-a",
-                logical_shard_id=metadata.logical_shard_id,
+        fetched = worker_stub.GetTrainerShardMetadata(
+            refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=refit_service.shard.stable_metadata_digest,
+            )
+        )
+        version_metadata = worker_stub.GetWeightVersionShardMetadata(
+            refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id="version-a", logical_shard_id=metadata.logical_shard_id,
             )
         )
     finally:
@@ -250,19 +255,24 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     assert len(metadata.logical_shard_id) == 64
     assert refit_service.shard.logical_shard_id == metadata.logical_shard_id
     assert refit_service.shard.worker_id == "worker-3"
-    assert refit_service.shard.tensor_count == 1
-    assert refit_service.shard.total_bytes == 128
+    assert json.loads(fetched.metadata)["tensor_count"] == 1
+    assert json.loads(fetched.metadata)["total_bytes"] == 128
     assert (
-        refit_service.shard.manifest_digest
-        == hashlib.sha256(fetched.manifest).hexdigest()
+        refit_service.shard.stable_metadata_digest
+        == hashlib.sha256(fetched.metadata).hexdigest()
     )
-    assert refit_service.shard.manifest_endpoint == f"127.0.0.1:{port}"
-    assert fetched.manifest_digest == refit_service.shard.manifest_digest
+    assert refit_service.shard.metadata_endpoint == f"127.0.0.1:{port}"
+    assert fetched.metadata_digest == refit_service.shard.stable_metadata_digest
     assert metadata.logical_shard_id == hashlib.sha256(
-        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+        bound_tensor_manifest(json.loads(fetched.metadata)["tensors"])
     ).hexdigest()
-    payload = unwrap_rendezvous_blob(fetched.manifest)
+    payload = unwrap_rendezvous_blob(fetched.metadata)
     assert payload.metadata_endpoint == "10.0.0.3:19003"
     assert payload.tensors[0].shards[0].addr == 0x1234
     assert payload.tensors[0].shards[0].shard_offset == (8, 0)
-    assert payload.tensors[0].shards[0].digest == "tensor-digest"
+    assert [(row.tensor_name, row.shard_index, row.digest)
+            for row in version_metadata.metadata.checksums] == [("column", 0, "tensor-digest")]
+    assert version_metadata.version_metadata_digest == refit_service.shard.version_metadata_digest
+    assert version_metadata.version_metadata_digest == hashlib.sha256(
+        version_metadata.metadata.SerializeToString(deterministic=True)
+    ).hexdigest()

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 from time import monotonic, sleep
 
@@ -14,14 +15,22 @@ import grpc
 from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
+from ..manifest import version_metadata, version_metadata_digest
+from modelexpress import envs as mx_envs
 from ...version import TrainerTensorsMetadata, WeightVersionRef
 from ..adapter import (
     StagedWeightVersionShardData,
     TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
-    WeightVersionShardManifestPublisher,
+    TrainerShardMetadataPublisher,
 )
+
+
+@dataclass
+class _Publication:
+    staged: list[StagedWeightVersionShardData] = field(default_factory=list)
+    uncertain: bool = False
 
 
 class FullTensorNixlPublicationMethod:
@@ -33,7 +42,7 @@ class FullTensorNixlPublicationMethod:
         adapter: TrainerEngineAdapter,
         staging_mode: TrainerStagingMode,
         payload_format: WeightPayloadFormat,
-        manifest_publisher: WeightVersionShardManifestPublisher,
+        manifest_publisher: TrainerShardMetadataPublisher,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         worker_id: str,
         rpc_timeout_seconds: float,
@@ -53,7 +62,8 @@ class FullTensorNixlPublicationMethod:
         self._service = service
         self._worker_id = worker_id
         self._rpc_timeout_seconds = rpc_timeout_seconds
-        self.published: dict[str, list[StagedWeightVersionShardData]] = {}
+        self.published: dict[str, _Publication] = {}
+        self._metadata_identity: tuple[str, int, str] | None = None
         self._binding: TrainerTensorsMetadata | None = None
 
     @property
@@ -113,9 +123,9 @@ class FullTensorNixlPublicationMethod:
             duration_key="staging_sync_s",
         ):
             staged.publish_ready.wait()
-        if staged.manifest.transport.upper() != "NIXL":
+        if staged.metadata.transport.upper() != "NIXL":
             raise ValueError(
-                f"unsupported shard transport {staged.manifest.transport!r}"
+                f"unsupported shard transport {staged.metadata.transport!r}"
             )
         # A cached property that hashes the whole manifest, so the first read is
         # the digest being computed and every later one is free.
@@ -125,44 +135,78 @@ class FullTensorNixlPublicationMethod:
             accumulate_metadata=True,
             duration_key="manifest_digest_s",
         ):
-            manifest_digest = staged.manifest.digest
+            stable_digest = staged.metadata.digest
+        identity = (
+            version_response.version.trainer_mesh_id,
+            version_response.version.trainer_mesh_generation,
+            stable_digest,
+        )
+        if self._metadata_identity != identity and self.published:
+            raise RuntimeError("release published versions before changing trainer metadata")
+        record = (
+            version_metadata(
+                version_id=version.version_id,
+                worker_id=self._worker_id,
+                logical_shard_id=logical_shard_id,
+                stable_metadata_digest=stable_digest,
+                checksums=staged.checksums,
+            ) if mx_envs.MX_RESHARD_PUBLISH_DIGEST else None
+        )
+        content_digest = version_metadata_digest(record) if record is not None else ""
         with refit_span(
             "setup_registration",
             metadata={"manifest_publications": 1},
             accumulate_metadata=True,
             duration_key="manifest_publish_s",
         ):
-            endpoint = self._manifest_publisher.publish_manifest(
-                version_id=version.version_id,
-                logical_shard_id=logical_shard_id,
-                manifest=staged.manifest,
-            )
+            if self._metadata_identity != identity:
+                if self._metadata_identity is not None:
+                    self._manifest_publisher.release_metadata()
+                    self._metadata_identity = None
+                endpoint = self._manifest_publisher.publish_metadata(metadata=staged.metadata)
+                self._metadata_identity = identity
+            else:
+                endpoint = self._manifest_publisher.endpoint
+            if record is not None:
+                self._manifest_publisher.publish_version_metadata(record)
         if not endpoint.strip():
-            raise ValueError("manifest_endpoint is required")
+            raise ValueError("metadata_endpoint is required")
         shard = refit_pb2.WeightVersionShard(
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
             worker_id=self._worker_id,
-            tensor_count=staged.manifest.tensor_count,
-            total_bytes=staged.manifest.total_bytes,
-            manifest_digest=manifest_digest,
-            manifest_endpoint=endpoint,
+            stable_metadata_digest=stable_digest,
+            version_metadata_digest=content_digest,
+            metadata_endpoint=endpoint,
         )
-        with refit_span(
-            "setup_registration",
-            metadata={"publication_rpcs": 1},
-            accumulate_metadata=True,
-            duration_key="publication_rpc_s",
-        ):
-            self._service().CreateWeightVersionShard(
-                refit_pb2.CreateWeightVersionShardRequest(shard=shard),
-                timeout=self._rpc_timeout_seconds,
-            )
-        self.published.setdefault(version.version_id, []).append(staged)
+        publication = self.published.setdefault(version.version_id, _Publication())
+        publication.staged.append(staged)
+        try:
+            with refit_span(
+                "setup_registration",
+                metadata={"publication_rpcs": 1},
+                accumulate_metadata=True,
+                duration_key="publication_rpc_s",
+            ):
+                self._service().CreateWeightVersionShard(
+                    refit_pb2.CreateWeightVersionShardRequest(shard=shard),
+                    timeout=self._rpc_timeout_seconds,
+                )
+        except Exception:
+            publication.uncertain = True
+            raise
 
     def release(self, *, version: WeightVersionRef) -> None:
-        if version.version_id not in self.published:
+        publication = self.published.get(version.version_id)
+        if publication is None:
             return
+        if publication.uncertain:
+            response = self._service().GetWeightVersion(
+                refit_pb2.GetWeightVersionRequest(uid=version.version_id),
+                timeout=self._rpc_timeout_seconds,
+            )
+            if response.version.state != refit_pb2.WEIGHT_VERSION_STATE_RELEASING:
+                raise RuntimeError("uncertain trainer publication requires a releasing version")
         logical_shard_id = self.logical_shard_id
         request = refit_pb2.DeleteWeightVersionShardRequest(
             version_id=version.version_id,
@@ -178,6 +222,8 @@ class FullTensorNixlPublicationMethod:
                 )
                 break
             except grpc.RpcError as error:
+                if publication.uncertain and error.code() is grpc.StatusCode.NOT_FOUND:
+                    break
                 if (
                     error.code() is not grpc.StatusCode.FAILED_PRECONDITION
                     or error.details() != "weight version has an active lease"
@@ -185,7 +231,7 @@ class FullTensorNixlPublicationMethod:
                 ):
                     raise
                 sleep(min(0.05, max(deadline - monotonic(), 0)))
-        self._manifest_publisher.release_manifest(
+        self._manifest_publisher.release_version_metadata(
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
         )

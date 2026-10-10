@@ -5,6 +5,8 @@ import time
 import json
 import hashlib
 from concurrent import futures
+from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import grpc
@@ -25,38 +27,52 @@ from modelexpress_rl.train.adapter import (
     CompletionFence,
     StagedWeightVersionShardData,
     TrainerEngineAdapter,
-    WeightVersionShardManifest,
+    TrainerShardMetadata,
 )
-from modelexpress_rl.train.manifest import WeightVersionShardManifestService, bound_tensor_manifest
+from modelexpress_rl.train.manifest import RefitWorkerService, bound_tensor_manifest
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
-    def __init__(self):
+    def __init__(self) -> None:
         self.registrations = {}
         self.registration_count = 0
         self.shards = []
         self.deleted_shards = []
         self.mesh_id = None
+        self.mesh_generation = 1
+        self.version_states = {}
+        self.create_failures = 0
+        self.reader_lease_active = False
+        self.missing_on_delete = False
+        self.events = []
 
     def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
-        version = refit_pb2.WeightVersion(uid=request.uid)
+        self.events.append(("get", request.uid))
+        version = refit_pb2.WeightVersion(
+            uid=request.uid,
+            state=self.version_states.get(request.uid, refit_pb2.WEIGHT_VERSION_STATE_READY),
+        )
         if self.mesh_id is not None:
             version.trainer_mesh_id = self.mesh_id
-            version.trainer_mesh_generation = 1
+            version.trainer_mesh_generation = self.mesh_generation
         return refit_pb2.GetWeightVersionResponse(version=version)
 
-    def RegisterWorker(self, request, _context):
+    def RegisterWorker(self, request, _context) -> refit_pb2.RegisterWorkerResponse:
         self.registration_count += 1
         worker = request.worker
         worker.expires_at_unix_ms = 1234
         self.registrations[worker.worker_id] = worker
         return refit_pb2.RegisterWorkerResponse(worker=worker)
 
-    def CreateWeightVersionShard(self, request, context):
+    def CreateWeightVersionShard(self, request, context) -> refit_pb2.CreateWeightVersionShardResponse:
         shard = request.shard
         if shard.worker_id not in self.registrations:
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, "worker not registered")
         self.shards.append(shard)
+        self.events.append(("create", shard.version_id))
+        if self.create_failures:
+            self.create_failures -= 1
+            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "publication committed but acknowledgement lost")
         return refit_pb2.CreateWeightVersionShardResponse(
             shard=shard,
             version=refit_pb2.WeightVersion(
@@ -65,7 +81,12 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             ),
         )
 
-    def DeleteWeightVersionShard(self, request, _context):
+    def DeleteWeightVersionShard(self, request, context) -> refit_pb2.DeleteWeightVersionShardResponse:
+        self.events.append(("delete", request.version_id))
+        if self.reader_lease_active:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "weight version has an active lease")
+        if self.missing_on_delete:
+            context.abort(grpc.StatusCode.NOT_FOUND, "weight version was not found")
         self.deleted_shards.append(request)
         return refit_pb2.DeleteWeightVersionShardResponse(deleted=True)
 
@@ -88,20 +109,21 @@ class _Adapter(TrainerEngineAdapter):
     supported_staging_modes = frozenset({TrainerStagingMode.COPY_TO_DEVICE})
     supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.calls = []
+        self.metadata_revision = 0
 
     def bind_tensors(self, tensors):
         if tensors is None:
             raise ValueError("tensors must not be None")
         return self.logical_shard_id
 
-    def stage_shard(self, *, tensors, staging_mode, payload_format):
+    def stage_shard(self, *, tensors, staging_mode, payload_format) -> StagedWeightVersionShardData:
         self.calls.append((tensors, staging_mode, payload_format))
 
         return StagedWeightVersionShardData(
-            manifest=WeightVersionShardManifest(
-                data=json.dumps({"tensors": [{
+            metadata=TrainerShardMetadata(
+                data=json.dumps({"storage_revision": self.metadata_revision, "tensor_count": 2, "total_bytes": 128, "tensors": [{
                     "name": "weight", "dtype": "torch.bfloat16", "elsize": 2,
                     "full_shape": [4], "shards": [{"shard_offset": [0], "shape": [4]}],
                 }]}).encode(),
@@ -111,6 +133,7 @@ class _Adapter(TrainerEngineAdapter):
             ),
             publish_ready=CompletionFence(lambda: None),
             buffer_owner=tensors,
+            checksums=(("weight", 0, "weight-digest"),),
         )
 
 
@@ -159,10 +182,10 @@ def test_trainer_config_preserves_original_positional_field_order():
     assert config.engine_context is None
 
 
-def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
-    shard = refit_pb2.WeightVersionShard(manifest_endpoint="trainer:9000")
+def test_refit_shard_advertises_its_metadata_endpoint() -> None:
+    shard = refit_pb2.WeightVersionShard(metadata_endpoint="trainer:9000")
 
-    assert shard.manifest_endpoint == "trainer:9000"
+    assert shard.metadata_endpoint == "trainer:9000"
     assert (
         refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["object_storage"].number == 10
     )
@@ -182,37 +205,99 @@ def test_refit_service_uses_named_response_messages():
     )
 
 
-def test_released_manifests_do_not_accumulate():
-    service = WeightVersionShardManifestService(endpoint="trainer:9000")
-    manifest = WeightVersionShardManifest(
-        data=b"manifest",
+def test_stable_and_version_metadata_have_independent_publication_lifetimes() -> None:
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    port = server.add_insecure_port("127.0.0.1:0")
+    service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(service, server)
+    manifest = TrainerShardMetadata(
+        data=b'{"tensor_count":1,"total_bytes":2}',
         tensor_count=1,
         total_bytes=2,
         transport="NIXL",
     )
+    service.publish_binding(_Adapter.bound_manifest)
+    version_metadata = refit_pb2.WeightVersionShardMetadata(
+        version_id="version-a",
+        worker_id="trainer-0",
+        logical_shard_id="rank:0",
+        stable_metadata_digest=manifest.digest,
+        checksums=[refit_pb2.ShardChecksum(tensor_name="weight", digest="digest")],
+    )
+    with pytest.raises(ValueError):
+        service.publish_version_metadata(version_metadata)
+    assert service.publish_metadata(metadata=manifest) == service.endpoint
+    server.start()
+    try:
+        with grpc.insecure_channel(service.endpoint) as channel:
+            worker = refit_pb2_grpc.RefitWorkerServiceStub(channel)
+            request = refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id="version-a", logical_shard_id="rank:0",
+            )
+            stable_request = refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=manifest.digest,
+            )
+            stable = worker.GetTrainerShardMetadata(stable_request)
+            assert stable.metadata == manifest.data
+            assert stable.metadata_digest == manifest.digest
+            with pytest.raises(grpc.RpcError) as unpublished:
+                worker.GetWeightVersionShardMetadata(request)
+            assert unpublished.value.code() is grpc.StatusCode.NOT_FOUND
+            service.publish_version_metadata(version_metadata)
+            service.publish_version_metadata(metadata=version_metadata)
+            assert worker.GetWeightVersionShardMetadata(request).metadata == version_metadata
+            conflicting = refit_pb2.WeightVersionShardMetadata()
+            conflicting.CopyFrom(version_metadata)
+            conflicting.checksums[0].digest = "different-content"
+            with pytest.raises(ValueError):
+                service.publish_version_metadata(conflicting)
+            assert worker.GetWeightVersionShardMetadata(request).metadata == version_metadata
+            replacement_metadata = TrainerShardMetadata(
+                data=b'{"tensor_count":1,"total_bytes":2,"address":8192}',
+                tensor_count=1, total_bytes=2, transport="NIXL",
+            )
+            with pytest.raises(ValueError):
+                service.publish_metadata(metadata=replacement_metadata)
+            assert worker.GetTrainerShardMetadata(stable_request) == stable
+            service.release_version_metadata(version_id="version-a", logical_shard_id="rank:0")
+            with pytest.raises(grpc.RpcError) as released:
+                worker.GetWeightVersionShardMetadata(request)
+            assert released.value.code() is grpc.StatusCode.NOT_FOUND
+            assert worker.GetTrainerShardMetadata(stable_request) == stable
+            service.release_metadata()
+            service.publish_metadata(metadata=replacement_metadata)
+            with pytest.raises(grpc.RpcError) as replaced:
+                worker.GetTrainerShardMetadata(stable_request)
+            assert replaced.value.code() is grpc.StatusCode.NOT_FOUND
+            assert worker.GetTrainerShardMetadata(refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=replacement_metadata.digest,
+            )).metadata == replacement_metadata.data
+            old_coverage_request = refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=hashlib.sha256(_Adapter.bound_manifest).hexdigest(),
+            )
+            assert worker.GetTrainerShardMetadata(old_coverage_request).metadata == _Adapter.bound_manifest
+            changed_coverage = json.loads(_Adapter.bound_manifest)
+            changed_coverage["tensors"][0]["full_shape"] = [8]
+            changed_coverage["tensors"][0]["shards"][0]["shape"] = [8]
+            new_coverage = json.dumps(changed_coverage).encode()
+            service.publish_binding(new_coverage)
+            with pytest.raises(grpc.RpcError) as old_binding:
+                worker.GetTrainerShardMetadata(old_coverage_request)
+            assert old_binding.value.code() is grpc.StatusCode.NOT_FOUND
+            assert worker.GetTrainerShardMetadata(refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=hashlib.sha256(new_coverage).hexdigest(),
+            )).metadata == new_coverage
+    finally:
+        server.stop(grace=None).wait()
 
-    for index in range(1000):
-        version_id = f"version-{index}"
-        service.publish_manifest(
-            version_id=version_id,
-            logical_shard_id="rank:0",
-            manifest=manifest,
-        )
-        service.release_manifest(
-            version_id=version_id,
-            logical_shard_id="rank:0",
-        )
 
-    assert service._manifests == {}
-
-
-def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
+def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch) -> None:
     service = _RefitService()
     service.mesh_id = "mesh-a"
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
     port = server.add_insecure_port("127.0.0.1:0")
-    manifest_service = WeightVersionShardManifestService(endpoint=f"127.0.0.1:{port}")
+    manifest_service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
     refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
     server.start()
     adapter = _Adapter()
@@ -222,6 +307,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "test/model")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", "COPY_TO_DEVICE")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR")
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     monkeypatch.setenv("MX_WORKER_HOST", "127.0.0.1")
     monkeypatch.setenv("MX_WORKER_GRPC_PORT", str(port))
     _patch_resources(
@@ -258,27 +344,40 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         with grpc.insecure_channel(metadata.metadata_endpoint) as channel:
             binding = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
-            ).GetWeightVersionShardManifest(
-                refit_pb2.GetWeightVersionShardManifestRequest(
-                    logical_shard_id=metadata.logical_shard_id
+            ).GetTrainerShardMetadata(
+                refit_pb2.GetTrainerShardMetadataRequest(
+                    metadata_digest=metadata.logical_shard_id
                 )
             )
-        assert binding.manifest == adapter.bound_manifest
-        assert binding.manifest_digest == metadata.logical_shard_id
+        assert binding.metadata == adapter.bound_manifest
+        assert binding.metadata_digest == metadata.logical_shard_id
         trainer.publish_version(version=WeightVersionRef("version-a"))
         metrics = trainer.pop_metrics()
         assert metrics["trainer_refit_e2e_s"] >= 0
         assert metrics["publication_rpc_s"] >= 0
 
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
-            grpc.insecure_channel(service.shards[0].manifest_endpoint)
+            grpc.insecure_channel(service.shards[0].metadata_endpoint)
         )
-        fetched = worker_stub.GetWeightVersionShardManifest(
-            refit_pb2.GetWeightVersionShardManifestRequest(
-                version_id="version-a",
-                logical_shard_id=metadata.logical_shard_id,
+        fetched = worker_stub.GetTrainerShardMetadata(
+            refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=service.shards[0].stable_metadata_digest,
             )
         )
+        version_metadata = worker_stub.GetWeightVersionShardMetadata(
+            refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id="version-a", logical_shard_id=metadata.logical_shard_id,
+            )
+        )
+        assert version_metadata.metadata.version_id == "version-a"
+        assert version_metadata.metadata.worker_id == "trainer-0"
+        assert version_metadata.metadata.stable_metadata_digest == fetched.metadata_digest
+        assert [(row.tensor_name, row.shard_index, row.digest)
+                for row in version_metadata.metadata.checksums] == [("weight", 0, "weight-digest")]
+        assert version_metadata.version_metadata_digest == service.shards[0].version_metadata_digest
+        assert version_metadata.version_metadata_digest == hashlib.sha256(
+            version_metadata.metadata.SerializeToString(deterministic=True)
+        ).hexdigest()
         with pytest.raises(TypeError, match="tensors"):
             trainer.stage_shard(
                 version=WeightVersionRef("version-a"),
@@ -291,16 +390,14 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
                 hf_tensor_iter=iter([]),
             )
         trainer.publish_version(version=WeightVersionRef("version-a"))
-        method = trainer._runtime.method
         retained_owners = [
-            staged.buffer_owner for staged in method.published["version-a"]
+            staged.buffer_owner for staged in trainer._runtime.method.published["version-a"].staged
         ]
         trainer.release_version(version=WeightVersionRef("version-a"))
         trainer.release_version(version=WeightVersionRef("version-a"))
-        assert "version-a" not in method.published
         with pytest.raises(grpc.RpcError) as released:
-            worker_stub.GetWeightVersionShardManifest(
-                refit_pb2.GetWeightVersionShardManifestRequest(
+            worker_stub.GetWeightVersionShardMetadata(
+                refit_pb2.GetWeightVersionShardMetadataRequest(
                     version_id="version-a",
                     logical_shard_id=metadata.logical_shard_id,
                 )
@@ -328,16 +425,15 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert len(service.deleted_shards) == 1
     assert service.deleted_shards[0].logical_shard_id == metadata.logical_shard_id
     assert service.registrations["trainer-0"].role == refit_pb2.WORKER_ROLE_TRAINER
-    assert "endpoint" not in refit_pb2.WorkerRegistration.DESCRIPTOR.fields_by_name
     assert service.shards[0].version_id == "version-a"
     assert service.shards[0].logical_shard_id == metadata.logical_shard_id
     assert service.shards[0].worker_id == "trainer-0"
-    assert service.shards[0].tensor_count == 2
-    assert service.shards[0].total_bytes == 128
-    assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
-    assert json.loads(fetched.manifest)["tensors"][0]["name"] == "weight"
+    assert json.loads(fetched.metadata)["tensor_count"] == 2
+    assert json.loads(fetched.metadata)["total_bytes"] == 128
+    assert service.shards[0].metadata_endpoint == f"127.0.0.1:{port}"
+    assert json.loads(fetched.metadata)["tensors"][0]["name"] == "weight"
     assert metadata.logical_shard_id == hashlib.sha256(
-        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+        bound_tensor_manifest(json.loads(fetched.metadata)["tensors"])
     ).hexdigest()
 
 
@@ -529,21 +625,232 @@ def test_trainer_initialization_cleans_up_when_renewal_thread_cannot_start(
     resources.close.assert_called_once_with()
 
 
-def test_binding_manifest_is_available_before_version_publication():
-    service = WeightVersionShardManifestService(endpoint="127.0.0.1:9000")
+def test_binding_manifest_is_available_before_version_publication() -> None:
+    service = RefitWorkerService(endpoint="127.0.0.1:9000")
     manifest = _Adapter.bound_manifest
     service.publish_binding(manifest)
     binding_id = hashlib.sha256(manifest).hexdigest()
-    response = service.GetWeightVersionShardManifest(
-        refit_pb2.GetWeightVersionShardManifestRequest(
-            version_id="", logical_shard_id=binding_id
-        ),
+    response = service.GetTrainerShardMetadata(
+        refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=binding_id),
         None,
     )
-    assert response.manifest == manifest
-    assert response.manifest_digest == binding_id
-    service.release_manifest(version_id="version-a", logical_shard_id=binding_id)
-    assert service.GetWeightVersionShardManifest(
-        refit_pb2.GetWeightVersionShardManifestRequest(logical_shard_id=binding_id),
+    assert response.metadata == manifest
+    assert response.metadata_digest == binding_id
+    service.release_version_metadata(version_id="version-a", logical_shard_id=binding_id)
+    assert service.GetTrainerShardMetadata(
+        refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=binding_id),
         None,
-    ).manifest == manifest
+    ).metadata == manifest
+
+
+@pytest.fixture
+def lifecycle_trainer(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+    service = _RefitService()
+    service.mesh_id = "mesh-a"
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    publisher = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(publisher, server)
+    adapter = _Adapter()
+    monkeypatch.setattr(runtime_module, "_create_trainer_adapter", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setenv("MX_WORKER_HOST", "127.0.0.1")
+    _patch_resources(monkeypatch, manager=_Manager(), manifest_service=publisher,
+                     worker_endpoint=publisher.endpoint)
+    server.start()
+    trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig(
+        engine_context=FSDPTrainerContext(), model_name="test/model", device_id=0,
+        worker_id="trainer-lifecycle", server_url=publisher.endpoint,
+        rpc_timeout_seconds=0.1, registration_ttl_seconds=60,
+        staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
+        payload_format=WeightPayloadFormat.FULL_TENSOR,
+    ))
+    trainer.bind_tensors("model")
+    with grpc.insecure_channel(publisher.endpoint) as channel:
+        case = SimpleNamespace(
+            trainer=trainer, service=service, adapter=adapter, publisher=publisher,
+            worker=refit_pb2_grpc.RefitWorkerServiceStub(channel),
+        )
+        try:
+            yield case
+        finally:
+            service.reader_lease_active = False
+            service.missing_on_delete = False
+            for version_id in ("version-a", "version-b", "version-c"):
+                service.version_states[version_id] = refit_pb2.WEIGHT_VERSION_STATE_RELEASING
+                trainer.release_version(version=WeightVersionRef(version_id))
+            trainer.close()
+            server.stop(grace=None).wait()
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_lost_publication_ack_remains_fenced_after_successful_retry(
+    lifecycle_trainer: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, verify: bool,
+) -> None:
+    case = lifecycle_trainer
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    version = WeightVersionRef("version-a")
+    case.service.create_failures = 1
+    with pytest.raises(grpc.RpcError) as lost_ack:
+        case.trainer.publish_version(version=version)
+    assert lost_ack.value.code() is grpc.StatusCode.DEADLINE_EXCEEDED
+    publication = case.service.shards[0]
+    stable_request = refit_pb2.GetTrainerShardMetadataRequest(
+        metadata_digest=publication.stable_metadata_digest,
+    )
+    original = case.worker.GetTrainerShardMetadata(stable_request)
+    case.trainer.publish_version(version=version)
+    assert len(case.service.shards) == 2
+    case.service.events.clear()
+    with pytest.raises(RuntimeError):
+        case.trainer.release_version(version=version)
+    assert case.service.events == [("get", "version-a")]
+    case.adapter.metadata_revision = 1
+    case.service.mesh_generation = 2
+    with pytest.raises(RuntimeError):
+        case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    assert case.worker.GetTrainerShardMetadata(stable_request) == original
+    case.service.version_states["version-a"] = refit_pb2.WEIGHT_VERSION_STATE_RELEASING
+    case.service.events.clear()
+    case.trainer.release_version(version=version)
+    assert case.service.events == [("get", "version-a"), ("delete", "version-a")]
+    case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    replacement = case.service.shards[-1]
+    assert replacement.stable_metadata_digest != publication.stable_metadata_digest
+    with pytest.raises(grpc.RpcError) as retired:
+        case.worker.GetTrainerShardMetadata(stable_request)
+    assert retired.value.code() is grpc.StatusCode.NOT_FOUND
+    assert json.loads(case.worker.GetTrainerShardMetadata(
+        refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=replacement.stable_metadata_digest)
+    ).metadata)["storage_revision"] == 1
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("cleanup", ["active_lease", "not_found"])
+def test_uncertain_terminal_cleanup_keeps_lease_fence_and_accepts_not_found(
+    lifecycle_trainer: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    verify: bool, cleanup: str,
+) -> None:
+    case = lifecycle_trainer
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    version = WeightVersionRef("version-a")
+    case.service.create_failures = 1
+    with pytest.raises(grpc.RpcError):
+        case.trainer.publish_version(version=version)
+    publication = case.service.shards[0]
+    stable_request = refit_pb2.GetTrainerShardMetadataRequest(
+        metadata_digest=publication.stable_metadata_digest,
+    )
+    case.service.version_states["version-a"] = refit_pb2.WEIGHT_VERSION_STATE_RELEASING
+    case.service.events.clear()
+    if cleanup == "active_lease":
+        case.service.reader_lease_active = True
+        with pytest.raises(grpc.RpcError) as leased:
+            case.trainer.release_version(version=version)
+        assert leased.value.code() is grpc.StatusCode.FAILED_PRECONDITION
+        assert case.service.events[0] == ("get", "version-a")
+        assert all(event == ("delete", "version-a") for event in case.service.events[1:])
+        assert case.worker.GetTrainerShardMetadata(stable_request).metadata
+        case.adapter.metadata_revision = 1
+        case.service.mesh_generation = 2
+        with pytest.raises(RuntimeError):
+            case.trainer.publish_version(version=WeightVersionRef("version-b"))
+        case.service.reader_lease_active = False
+    else:
+        case.service.missing_on_delete = True
+    case.service.events.clear()
+    case.trainer.release_version(version=version)
+    assert case.service.events == [("get", "version-a"), ("delete", "version-a")]
+    case.service.missing_on_delete = False
+    case.adapter.metadata_revision = 1
+    case.service.mesh_generation = 2
+    case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    assert case.service.shards[-1].version_id == "version-b"
+
+
+def test_confirmed_publication_release_does_not_require_retirement(
+    lifecycle_trainer: SimpleNamespace,
+) -> None:
+    case = lifecycle_trainer
+    case.trainer.publish_version(version=WeightVersionRef("version-a"))
+    case.service.events.clear()
+    case.trainer.release_version(version=WeightVersionRef("version-a"))
+    assert case.service.events == [("delete", "version-a")]
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("change", ["mesh", "generation", "digest"])
+def test_replacement_waits_for_every_published_version_to_release(
+    lifecycle_trainer: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    verify: bool, change: str,
+) -> None:
+    case = lifecycle_trainer
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    for version_id in ("version-a", "version-b"):
+        case.trainer.publish_version(version=WeightVersionRef(version_id))
+    case.trainer.release_version(version=WeightVersionRef("version-a"))
+    if change == "mesh":
+        case.service.mesh_id = "mesh-b"
+    elif change == "generation":
+        case.service.mesh_generation = 2
+    else:
+        case.adapter.metadata_revision = 1
+    with pytest.raises(RuntimeError):
+        case.trainer.publish_version(version=WeightVersionRef("version-c"))
+    case.service.mesh_id = "mesh-a"
+    case.service.mesh_generation = 1
+    case.adapter.metadata_revision = 0
+    case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    case.trainer.release_version(version=WeightVersionRef("version-b"))
+    if change == "mesh":
+        case.service.mesh_id = "mesh-b"
+    elif change == "generation":
+        case.service.mesh_generation = 2
+    else:
+        case.adapter.metadata_revision = 1
+    case.trainer.publish_version(version=WeightVersionRef("version-c"))
+    assert [publication.version_id for publication in case.service.shards] == [
+        "version-a", "version-b", "version-b", "version-c",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["release", "publish"])
+@pytest.mark.parametrize("retry_revision", [0, 1])
+def test_failed_metadata_replacement_can_recover_old_or_new_storage(
+    lifecycle_trainer: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    failure: str, retry_revision: int,
+) -> None:
+    case = lifecycle_trainer
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    case.trainer.publish_version(version=WeightVersionRef("version-a"))
+    original = case.service.shards[-1]
+    stable_request = refit_pb2.GetTrainerShardMetadataRequest(
+        metadata_digest=original.stable_metadata_digest,
+    )
+    case.trainer.release_version(version=WeightVersionRef("version-a"))
+    operation = "release_metadata" if failure == "release" else "publish_metadata"
+    original_operation = getattr(case.publisher, operation)
+
+    def fail_replacement(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("metadata store failed")
+
+    monkeypatch.setattr(case.publisher, operation, fail_replacement)
+    case.adapter.metadata_revision = 1
+    with pytest.raises(RuntimeError, match="metadata store failed"):
+        case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    assert [shard.version_id for shard in case.service.shards] == ["version-a"]
+    if failure == "release":
+        assert case.worker.GetTrainerShardMetadata(stable_request).metadata
+    else:
+        with pytest.raises(grpc.RpcError) as retired:
+            case.worker.GetTrainerShardMetadata(stable_request)
+        assert retired.value.code() is grpc.StatusCode.NOT_FOUND
+    monkeypatch.setattr(case.publisher, operation, original_operation)
+    case.adapter.metadata_revision = retry_revision
+    case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    recovered = case.service.shards[-1]
+    response = case.worker.GetTrainerShardMetadata(
+        refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=recovered.stable_metadata_digest),
+    )
+    assert json.loads(response.metadata)["storage_revision"] == retry_revision
+    assert recovered.version_id == "version-b"

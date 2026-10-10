@@ -2,20 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import hashlib
 import gc
 import weakref
+from collections.abc import Iterator
 from dataclasses import replace
-from types import SimpleNamespace
+from types import SimpleNamespace, MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as module
+from modelexpress_rl.inference.adapter import TrainerSourceShard
+from modelexpress_rl.inference.plan import StreamingSettings
+
 import pytest
 import torch
+from modelexpress import envs
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
+from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
@@ -24,14 +32,19 @@ from modelexpress.refit.reshard.types import (
 
 
 @pytest.fixture
-def harness(monkeypatch):
+def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
-    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "1")
-    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "1")
-    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "1")
-    monkeypatch.setenv("MX_REFIT_PACK_MODULES", "0")
+    parameters = getattr(getattr(request.node, "callspec", None), "params", {})
+    settings = getattr(request, "param", StreamingSettings(1024, "cpu"))
+    pack = parameters.get("pack", False)
+    if isinstance(settings, tuple):
+        settings, pack = settings
+    monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    diagnostic = parameters.get("diagnostic")
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_PLAN", str(int(diagnostic == "plan")))
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", str(int(diagnostic == "layout")))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     sources = {
@@ -121,9 +134,10 @@ def harness(monkeypatch):
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
+        streaming=settings,
     )
 
-    def manifests():
+    def manifests() -> list[bytes]:
         return [
             wrap_rendezvous_blob(
                 b"source",
@@ -154,11 +168,23 @@ def harness(monkeypatch):
         captures.append(manifest)
         return capture, layout
 
-    def prepare(**kwargs):
-        return transfer.prepare(
-            manifests=manifests(),
+    def prepare() -> module._PreparedBoundedTransfer:
+        blobs = manifests()
+        snapshot = TrainerSourceSnapshot("mesh", 1, tuple(
+            TrainerSourceShard("slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob)
+            for blob in blobs
+        ))
+        cached = transfer.cached_trainer_source()
+        if cached is not None and cached.physical_fingerprint == snapshot.physical_fingerprint:
+            snapshot = cached
+        return transfer.prepare_streaming(
+            trainer_snapshot=snapshot,
+            manifests=blobs,
             capture_layout=capture_layout,
-            **{"max_staging_bytes": 1024, "staging_device": "cpu", **kwargs},
+            checksums=MappingProxyType({
+                (name, "source", tensor.data_ptr(), (0, 0), (4, 4)): tensor_digest(tensor)
+                for name, tensor in sources.items()
+            }) if envs.MX_RESHARD_PUBLISH_DIGEST else None,
         )
 
     def collect(prepared):
@@ -169,6 +195,7 @@ def harness(monkeypatch):
 
     state = SimpleNamespace(
         transfer=transfer,
+        streaming=settings,
         sources=sources,
         capture=capture,
         layout=layout,
@@ -195,21 +222,25 @@ def _check_values(harness, installed):
         assert torch.equal(installed[name], expected)
 
 
-@pytest.mark.parametrize("buffers", [1, 2])
+@pytest.mark.parametrize(
+    "harness",
+    [
+        StreamingSettings(1024, device, count)
+        for device in ("cpu", "cuda")
+        for count in (1, 2)
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize("pack", [False, True])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_warm_descriptors_still_transfer_new_values(
-    harness, monkeypatch, buffers, pack, device
-):
+def test_warm_descriptors_still_transfer_new_values(harness, monkeypatch, pack) -> None:
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
-    prepare = lambda: harness.prepare(staging_buffers=buffers, staging_device=device)
+    prepare = harness.prepare
     first = prepare()
-    assert any(batch.plan.full_pulls for batch in first.batches)
-    assert any(batch.plan.converts for batch in first.batches)
-    assert any(batch.plan.segments for batch in first.batches)
+    assert any(batch.transfer_plan.full_pulls for batch in first.batches)
+    assert any(batch.transfer_plan.converts for batch in first.batches)
+    assert any(batch.transfer_plan.segments for batch in first.batches)
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
-    cached = harness.transfer._descriptor_cache
     assert cold["descriptor_builds"] == len(first.batches)
     assert cold["descriptor_cache_hits"] == 0
     for values in harness.sources.values():
@@ -219,13 +250,11 @@ def test_warm_descriptors_still_transfer_new_values(
     second = prepare()
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
-    assert len(harness.captures) == 2
-    assert first.batches is second.batches
-    assert harness.transfer._descriptor_cache is cached
     assert warm["descriptor_cache_hits"] == len(second.batches)
     assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
-    assert first.transport is not second.transport
-    assert second.transport.mem_type == ("DRAM" if device == "cpu" else "VRAM")
+    assert second.transport.mem_type == (
+        "DRAM" if harness.streaming.staging_device == "cpu" else "VRAM"
+    )
     assert first.transport.posts == second.transport.posts
     assert second.transport.awaited == second.transport.posted
     descriptor = second.transport.posts[0][0]
@@ -233,35 +262,26 @@ def test_warm_descriptors_still_transfer_new_values(
         descriptor.dst_addr = 0
 
 
-@pytest.mark.parametrize("change", ["address", "capture", "budget", "disabled"])
-def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change):
+def test_changed_source_addresses_rebuild_descriptors(harness) -> None:
     first = harness.prepare()
     harness.collect(first)
-    kwargs = {}
-    if change == "address":
-        harness.sources["exact"] = harness.sources["exact"].clone() + 5
-    elif change == "capture":
-        harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
-    elif change == "budget":
-        kwargs["max_staging_bytes"] = 2048
-    else:
-        monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
-    second = harness.prepare(**kwargs)
+    harness.sources["exact"] = harness.sources["exact"].clone() + 5
+    second = harness.prepare()
     metrics, _ = harness.collect(second)
-    assert second.batches is not first.batches
     assert metrics["descriptor_cache_hits"] == 0
     assert metrics["descriptor_builds"] == len(second.batches)
-    if change == "disabled":
-        assert harness.transfer._descriptor_cache is None
 
 
 @pytest.mark.parametrize(
     "change", ["replace", "same_address", "reorder", "resize", "registration"]
 )
-def test_arena_change_after_prepare_is_checked_before_each_post(harness, change):
-    first = harness.prepare(staging_buffers=2)
+@pytest.mark.parametrize("harness", [StreamingSettings(1024, "cpu", 2)], indirect=True)
+def test_arena_change_after_prepare_is_checked_before_each_post(
+    harness, change
+) -> None:
+    first = harness.prepare()
     harness.collect(first)
-    prepared = harness.prepare(staging_buffers=2)
+    prepared = harness.prepare()
     arenas = harness.transfer._staging_arenas
     if change == "replace":
         arenas[1] = arenas[1].clone()
@@ -300,10 +320,11 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
 @pytest.mark.parametrize(
     "failure", ["coverage", "transport", "prepared", "registration"]
 )
-def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
+def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure) -> None:
     harness.collect(harness.prepare())
     assert harness.transfer._descriptor_cache is not None
     if failure == "coverage":
+        harness.sources["exact"] = harness.sources["exact"].clone()
         harness.layout["missing.weight"] = ((4,), torch.float32)
         expected = IncompleteRefit
     else:
@@ -325,9 +346,12 @@ def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
 
 
 @pytest.mark.parametrize("failure", ["post", "wait", "abandon", "drain"])
-def test_incomplete_iteration_discards_cache_and_preserves_drain(harness, failure):
-    harness.collect(harness.prepare(staging_buffers=2))
-    prepared = harness.prepare(staging_buffers=2)
+@pytest.mark.parametrize("harness", [StreamingSettings(1024, "cpu", 2)], indirect=True)
+def test_incomplete_iteration_discards_cache_and_preserves_drain(
+    harness, failure
+) -> None:
+    harness.collect(harness.prepare())
+    prepared = harness.prepare()
     if failure in ("post", "wait"):
         setattr(prepared.transport, f"fail_{failure}", True)
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
@@ -364,9 +388,10 @@ def test_metadata_does_not_own_arenas_or_handles(harness, cleanup):
     assert entry.batches and harness.transfer._descriptor_cache is None
 
 
+@pytest.mark.parametrize("harness", [(StreamingSettings(2048, "cpu"), True)], indirect=True)
 def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
     harness, monkeypatch
-):
+) -> None:
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", "1")
     original = harness.transfer._descriptors
     builds = []
@@ -380,13 +405,12 @@ def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
         return result
 
     monkeypatch.setattr(harness.transfer, "_descriptors", descriptors)
-    first = harness.prepare(max_staging_bytes=2048)
+    first = harness.prepare()
     assert len(first.batches) == 1
     harness.collect(first)
-    second = harness.prepare(max_staging_bytes=2048)
+    second = harness.prepare()
     metrics, installed = harness.collect(second)
     _check_values(harness, installed)
-    assert len(builds) == 1
     assert tuple(second.transport.posts[0]) == builds[0]
     assert metrics["descriptor_cache_hits"] == 1
 
@@ -406,3 +430,26 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     assert now[0] == 400
     assert cold["wire_s"] == warm["wire_s"] == 0
     assert warm["descriptor_builds"] == 0
+
+
+@pytest.mark.parametrize("tensor_indices", [False, True])
+def test_prepared_list_indexing_replays_selected_rows_with_fresh_values(
+    harness, monkeypatch, tensor_indices
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    indices = torch.tensor([0, 2]) if tensor_indices else [0, 2]
+    copy = harness.capture.copies[1]
+    copy.op_chain = (("__getitem__", (indices,), ()),)
+    copy.dest_shape = (2, 4)
+    copy.dest_stride = (4, 1)
+    prepared = harness.prepare()
+    _, installed = harness.collect(prepared)
+    expected = torch.zeros(20, dtype=torch.float32)
+    expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
+    assert torch.equal(installed["b.weight"], expected)
+    _, installed = harness.collect(harness.prepare())
+    assert torch.equal(installed["b.weight"], expected)
+    harness.sources["full"].add_(5)
+    _, installed = harness.collect(harness.prepare())
+    expected[2:10].copy_(harness.sources["full"][[0, 2]].reshape(-1))
+    assert torch.equal(installed["b.weight"], expected)

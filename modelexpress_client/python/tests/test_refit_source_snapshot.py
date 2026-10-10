@@ -1,65 +1,83 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import gc
 import json
-import sys
 from dataclasses import field, fields, make_dataclass, replace
 
 import pytest
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo
-from modelexpress_rl.inference import _source_snapshot as snapshot
 from modelexpress_rl.inference import nixl_staged_transfer as transfer
+from modelexpress_rl.inference import _source_snapshot as snapshot
 
-from tests.test_refit_warm_caches import _bounded_cache_inputs
-
-
-def _freeze(resolved):
-    token = snapshot._freeze_sources(resolved.sources)
-    assert token is not None
-    return replace(resolved, sources=token.sources), token
+from tests.test_refit_warm_caches import _bounded_cache_inputs, _transfer_with_resolved_plan
 
 
-def test_source_snapshot_isolated_from_mutable_parser_rows(monkeypatch):
-    args = _bounded_cache_inputs()
-    original = args["resolved"]
-    frozen, token = _freeze(original)
-    expected = tuple(
-        (name, snapshot._source_structure(source))
-        for name, source in original.sources.items()
-    )
-    assert snapshot._snapshot_structure(frozen, token) == expected
+def test_source_rows_are_isolated_from_mutable_parser_rows() -> None:
+    original = _bounded_cache_inputs()["resolved"]
+    frozen_sources = snapshot._freeze_sources(original.sources)
+
+    assert frozen_sources is not None
     original.sources["weight"].shards[0].addr += 16
     original.sources["weight"].shards.reverse()
-    assert snapshot._snapshot_structure(frozen, token) == expected
-    assert frozen.sources["weight"].shards[0].addr == 100
-    args.update(resolved=frozen, source_snapshot=token)
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
-    monkeypatch.setattr(
-        transfer,
-        "_source_structure",
-        lambda source: pytest.fail("immutable metadata rebuilt on a warm hit"),
-    )
-    metrics = {}
-    assert cache.compile(**args, metrics=metrics) is first
-    assert metrics["plan_cache_hits"] == 1
-
-
-@pytest.mark.parametrize("target", ["sources", "source", "shards", "shard", "shape"])
-def test_source_snapshot_rejects_nested_writes(target):
-    frozen, _token = _freeze(_bounded_cache_inputs()["resolved"])
-    source = frozen.sources["weight"]
-    mutate = {
-        "sources": lambda: frozen.sources.__setitem__("new", source),
-        "source": lambda: object.__setattr__(source, "elsize", 8),
-        "shards": lambda: source.shards.append(source.shards[0]),
-        "shard": lambda: object.__setattr__(source.shards[0], "addr", 999),
-        "shape": lambda: source.global_shape.__setitem__(0, 7),
-    }[target]
+    assert frozen_sources["weight"].shards[0].addr == 100
+    with pytest.raises(TypeError):
+        frozen_sources["other"] = frozen_sources["weight"]
     with pytest.raises((AttributeError, TypeError)):
-        mutate()
+        frozen_sources["weight"].shards[0].addr = 999
+
+
+def test_unrecognized_source_rows_keep_the_mutable_resolver_result() -> None:
+    resolved = _bounded_cache_inputs()["resolved"]
+    source = resolved.sources["weight"]
+    source.extra = []
+
+    assert snapshot._freeze_sources(resolved.sources) is None
+
+
+@pytest.mark.parametrize(
+    ("cls", "field", "replacement"),
+    [
+        (snapshot._ShardSnapshot, "addr", property(lambda self: 999)),
+        (snapshot._TensorSnapshot, "global_shape", property(lambda self: (8,))),
+    ],
+)
+def test_changed_frozen_row_accessors_are_not_retained(cls, field, replacement, monkeypatch) -> None:
+    monkeypatch.setattr(cls, field, replacement)
+
+    assert snapshot._freeze_sources(_bounded_cache_inputs()["resolved"].sources) is None
+
+
+@pytest.mark.parametrize("cls", [snapshot._ShardSnapshot, snapshot._TensorSnapshot])
+def test_frozen_rows_do_not_call_replaceable_constructors(monkeypatch, cls) -> None:
+    def custom_new(*args, **kwargs) -> None:
+        pytest.fail("private tuple constructor was invoked")
+
+    monkeypatch.setattr(cls, "__new__", custom_new)
+    frozen = snapshot._freeze_sources(_bounded_cache_inputs()["resolved"].sources)
+
+    assert frozen is not None
+    assert frozen["weight"].shards[0].addr == 100
+
+
+def test_freeze_rechecks_row_classes_after_mid_copy_mutation(monkeypatch) -> None:
+    original = snapshot._snapshot_classes_unchanged
+    checked = False
+
+    def mutate_after_initial_check() -> bool:
+        nonlocal checked
+        result = original()
+        if not checked:
+            checked = True
+            monkeypatch.setattr(
+                snapshot._ShardSnapshot, "addr", property(lambda self: 999)
+            )
+        return result
+
+    monkeypatch.setattr(snapshot, "_snapshot_classes_unchanged", mutate_after_initial_check)
+
+    assert snapshot._freeze_sources(_bounded_cache_inputs()["resolved"].sources) is None
+
 
 
 @pytest.mark.parametrize(
@@ -79,7 +97,7 @@ def test_source_snapshot_rejects_nested_writes(target):
         "source_dict_subclass",
     ],
 )
-def test_nonordinary_sources_keep_original_mutable_path(field_name):
+def test_nonordinary_sources_keep_original_mutable_path(field_name) -> None:
     resolved = _bounded_cache_inputs()["resolved"]
     source = resolved.sources["weight"]
     shard = source.shards[0]
@@ -110,43 +128,16 @@ def test_nonordinary_sources_keep_original_mutable_path(field_name):
             resolved, sources=type("CustomDict", (dict,), {})(resolved.sources)
         )
     assert snapshot._freeze_sources(resolved.sources) is None
-    assert snapshot._snapshot_structure(resolved, None) is None
-
-
-@pytest.mark.parametrize("field_name", ["addr", "session", "shape"])
-def test_changed_snapshot_accessor_rebuilds_current_source_fields(
-    monkeypatch, field_name
-):
-    args = _bounded_cache_inputs()
-    frozen, token = _freeze(args["resolved"])
-    args.update(resolved=frozen, source_snapshot=token)
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
-    replacement = {"addr": 900, "session": "new-session", "shape": (1,)}[field_name]
-    monkeypatch.setattr(
-        snapshot._ShardSnapshot, field_name, property(lambda self: replacement)
-    )
-    assert snapshot._snapshot_structure(frozen, token) is None
-    assert (
-        snapshot._source_structure(frozen.sources["weight"])
-        != tuple.__getitem__(token, 1)[0][1]
-    )
-    metrics = {}
-    try:
-        assert cache.compile(**args, metrics=metrics) is not first
-    except (RuntimeError, ValueError):
-        assert cache._entry is None
-    assert metrics["plan_cache_hits"] == 0
 
 
 @pytest.mark.parametrize(
     "field_name", ["addr", "digest", "device_id", "agent_meta_b64"]
 )
-def test_changed_manifest_keeps_current_version_metadata(field_name):
+def test_changed_manifest_keeps_current_version_metadata(
+    monkeypatch: pytest.MonkeyPatch, field_name: str,
+) -> None:
     args = _bounded_cache_inputs()
-    cache = transfer._SourceResolutionCache()
-    first = cache.resolve(args["manifests"], enabled=True, metrics={})
-    assert snapshot._snapshot_structure(first, cache._snapshot) is not None
+    cache, _ = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
     payload = json.loads(args["manifests"][0])
     values = {
         "addr": 900,
@@ -161,8 +152,7 @@ def test_changed_manifest_keeps_current_version_metadata(field_name):
     )
     target[field_name] = values[field_name]
     manifests = [json.dumps(payload).encode(), args["manifests"][1]]
-    second = cache.resolve(manifests, enabled=True, metrics={})
-    assert second is not first
+    second = cache._resolve_metadata(manifests, {})
     expected = transfer._resolve_sources(manifests)
     for item in fields(expected):
         if item.name != "sources":
@@ -170,34 +160,9 @@ def test_changed_manifest_keeps_current_version_metadata(field_name):
     assert [shard.digest for shard in second.sources["weight"].shards] == [
         shard.digest for shard in expected.sources["weight"].shards
     ]
-    assert snapshot._snapshot_structure(second, cache._snapshot) == tuple(
-        (name, snapshot._source_structure(source))
-        for name, source in expected.sources.items()
-    )
 
 
-@pytest.mark.parametrize("which", ["agents", "devices", "metadata"])
-def test_outer_metadata_remains_fresh_and_mutable(which):
-    args = _bounded_cache_inputs()
-    original = args["resolved"]
-    resolved, token = _freeze(original)
-    for name in ("session_to_agent", "session_to_device", "agent_metadata"):
-        assert getattr(resolved, name) is getattr(original, name)
-    args.update(resolved=resolved, source_snapshot=token)
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
-    if which == "agents":
-        resolved.session_to_agent["a"] = "changed"
-    elif which == "devices":
-        resolved.session_to_device["a"] = 7
-    else:
-        resolved.agent_metadata["a"] = b"changed"
-    metrics = {}
-    assert cache.compile(**args, metrics=metrics) is not first
-    assert metrics["plan_cache_misses"] == 1
-
-
-def test_cache_preserves_extended_outer_schema_without_copying_maps(monkeypatch):
+def test_metadata_preserves_extended_outer_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     args = _bounded_cache_inputs()
     original = transfer._resolve_sources
     extra_maps = {
@@ -213,7 +178,7 @@ def test_cache_preserves_extended_outer_schema_without_copying_maps(monkeypatch)
     )
     parsed = []
 
-    def resolve(*values, **kwargs):
+    def resolve(*values, **kwargs) -> transfer._ResolvedSources:
         base = original(*values, **kwargs)
         value = extended(
             **{item.name: getattr(base, item.name) for item in fields(base)},
@@ -223,98 +188,12 @@ def test_cache_preserves_extended_outer_schema_without_copying_maps(monkeypatch)
         return value
 
     monkeypatch.setattr(transfer, "_resolve_sources", resolve)
-    cache = transfer._SourceResolutionCache()
-    result = cache.resolve(args["manifests"], enabled=True, metrics={})
+    cache, result = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
     assert type(result) is extended
-    assert snapshot._snapshot_structure(result, cache._snapshot) is not None
     for item in fields(result):
         if item.name != "sources":
-            assert getattr(result, item.name) is getattr(parsed[0], item.name)
-    assert cache.resolve(args["manifests"], enabled=True, metrics={}) is result
-
-
-def test_snapshot_token_requires_current_table_identity():
-    original = _bounded_cache_inputs()["resolved"]
-    first, token = _freeze(original)
-    second, other = _freeze(original)
-    assert snapshot._snapshot_structure(first, token) is not None
-    assert snapshot._snapshot_structure(first, other) is None
-    assert snapshot._snapshot_structure(second, token) is None
-    assert snapshot._snapshot_structure(original, token) is None
-
-
-def test_snapshot_does_not_change_mutable_plan_input_invalidation():
-    args = _bounded_cache_inputs()
-    cache = transfer._BoundedPlanCache()
-    first = cache.compile(**args, metrics={})
-    args["resolved"].sources["weight"].shards[0].addr += 16
-    metrics = {}
-    assert cache.compile(**args, metrics=metrics) is not first
-    assert metrics["plan_cache_misses"] == 1
-
-
-def test_snapshot_failure_and_disabled_cache_clear_token(monkeypatch):
-    args = _bounded_cache_inputs()
-    cache = transfer._SourceResolutionCache()
-    first = cache.resolve(args["manifests"], enabled=True, metrics={})
-    changed = [args["manifests"][0] + b" ", args["manifests"][1]]
-    original = transfer._freeze_sources
-    monkeypatch.setattr(
-        transfer, "_freeze_sources", lambda _: (_ for _ in ()).throw(MemoryError())
-    )
-    with pytest.raises(MemoryError):
-        cache.resolve(changed, enabled=True, metrics={})
-    assert cache._entry is None and cache._snapshot is None
-    monkeypatch.setattr(transfer, "_freeze_sources", original)
-    assert cache.resolve(args["manifests"], enabled=True, metrics={}) is not first
-    cache.resolve(args["manifests"], enabled=False, metrics={})
-    assert cache._entry is None and cache._snapshot is None
-
-
-@pytest.mark.parametrize(
-    "cls", [snapshot._ShardSnapshot, snapshot._TensorSnapshot, snapshot._SourceSnapshot]
-)
-def test_private_snapshot_construction_cannot_inject_mutable_fields(monkeypatch, cls):
-    def custom_new(*args, **kwargs):
-        pytest.fail("private tuple construction invoked a replaceable constructor")
-
-    monkeypatch.setattr(cls, "__new__", custom_new)
-    frozen, token = _freeze(_bounded_cache_inputs()["resolved"])
-    assert snapshot._snapshot_structure(frozen, token) is not None
-
-
-def test_warm_class_checks_do_not_return_a_key_stale_after_gc_callback():
-    frozen, token = _freeze(_bounded_cache_inputs()["resolved"])
-    original = snapshot._ShardSnapshot.addr
-    changed = False
-
-    def change_already_checked_class(phase, info):
-        nonlocal changed
-        if phase != "start" or changed:
-            return
-        frame = sys._getframe(1)
-        while frame:
-            if (
-                frame.f_code is snapshot._snapshot_classes_unchanged.__code__
-                and frame.f_locals.get("cls") is snapshot._TensorSnapshot
-            ):
-                snapshot._ShardSnapshot.addr = property(lambda self: 999)
-                changed = True
-                return
-            frame = frame.f_back
-
-    previous = gc.get_threshold()
-    gc.collect()
-    gc.callbacks.append(change_already_checked_class)
-    gc.set_threshold(1, 1, 1)
-    try:
-        key = snapshot._snapshot_structure(frozen, token)
-        fresh = tuple(
-            (name, snapshot._source_structure(source))
-            for name, source in frozen.sources.items()
-        )
-        assert key is None or key == fresh
-    finally:
-        gc.set_threshold(*previous)
-        gc.callbacks.remove(change_already_checked_class)
-        snapshot._ShardSnapshot.addr = original
+            assert getattr(result, item.name) == getattr(parsed[0], item.name)
+    reused = cache._resolve_metadata(args["manifests"], {})
+    assert type(reused) is extended
+    for item in fields(result):
+        assert getattr(reused, item.name) == getattr(result, item.name)
