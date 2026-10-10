@@ -685,7 +685,7 @@ def test_staged_verification_rejects_missing_or_mismatched_digest():
 def test_digest_verification_has_its_own_receive_sync_timing(
     monkeypatch, mismatch
 ) -> None:
-    monkeypatch.setattr(transfer_module.envs, "MX_RESHARD_PUBLISH_DIGEST", True)
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
     tensor = torch.arange(64, dtype=torch.int32)
     class Transport:

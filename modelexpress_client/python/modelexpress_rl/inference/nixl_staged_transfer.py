@@ -962,19 +962,20 @@ class _NixlStagedTransfer:
                 raise ValueError(
                     "max_staging_bytes must cover at least one byte per staging buffer"
                 )
-            compiled = self._plan_cache.compile(
-                manifests=manifests,
-                resolved=resolved,
-                capture=capture,
-                parameter_layout=parameter_layout,
-                max_staging_bytes=buffer_budget,
-                enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
-                metrics=metrics,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
-                total_staging_bytes=max_staging_bytes,
-                source_snapshot=self._source_cache._snapshot,
-            )
+            with telemetry.span("mx.refit.transfer_planning"):
+                compiled = self._plan_cache.compile(
+                    manifests=manifests,
+                    resolved=resolved,
+                    capture=capture,
+                    parameter_layout=parameter_layout,
+                    max_staging_bytes=buffer_budget,
+                    enabled=envs.MX_REFIT_CACHE_BOUNDED_PLANS,
+                    metrics=metrics,
+                    staging_device=staging_device,
+                    staging_buffers=staging_buffers,
+                    total_staging_bytes=max_staging_bytes,
+                    source_snapshot=self._source_cache._snapshot,
+                )
             plan, batches = compiled.plan, compiled.batches
         else:
             self._plan_cache.clear()
@@ -1027,28 +1028,33 @@ class _NixlStagedTransfer:
         if batches is not None:
             assert buffer_budget is not None
             arena_bytes = max(b.nbytes for b in batches)
-            if not self._staging_arenas:
-                self._staging_device = torch.device(staging_device)
-                for index in range(staging_buffers):
-                    arena = self._allocate_arena(arena_bytes)
-                    # Keep the buffer referenced before registering it so a
-                    # failed registration still has live storage to deregister
-                    # when the workspace is reset.
-                    self._staging_arenas.append(arena)
-                    if host_staging:
-                        self._staging_registrations.append(
-                            self._manager.register_dram_buffer(arena)
-                        )
-                    else:
-                        self._manager.register_tensors(
-                            {f"__bounded_arena_{index}__": arena}
-                        )
-            elif self._staging_arenas[0].numel() < arena_bytes:
-                raise RuntimeError(
-                    "bounded workspace layout grew; restart the generator engine"
-                )
-            if self._staging_arenas[0].numel() > buffer_budget:
-                raise RuntimeError("existing bounded arena exceeds the requested limit")
+            with telemetry.span("mx.refit.receive_workspace"):
+                if not self._staging_arenas:
+                    self._staging_device = torch.device(staging_device)
+                    for index in range(staging_buffers):
+                        with telemetry.span("mx.refit.arena_allocation"):
+                            arena = self._allocate_arena(arena_bytes)
+                        # Keep the buffer referenced before registering it so a
+                        # failed registration still has live storage to deregister
+                        # when the workspace is reset.
+                        self._staging_arenas.append(arena)
+                        with telemetry.span("mx.refit.arena_registration"):
+                            if host_staging:
+                                self._staging_registrations.append(
+                                    self._manager.register_dram_buffer(arena)
+                                )
+                            else:
+                                self._manager.register_tensors(
+                                    {f"__bounded_arena_{index}__": arena}
+                                )
+                elif self._staging_arenas[0].numel() < arena_bytes:
+                    raise RuntimeError(
+                        "bounded workspace layout grew; restart the generator engine"
+                    )
+                if self._staging_arenas[0].numel() > buffer_budget:
+                    raise RuntimeError(
+                        "existing bounded arena exceeds the requested limit"
+                    )
             metrics["connection_registration_s"] = time.perf_counter() - phase_started
             descriptor_cache = None
             if metrics["plan_cache_enabled"] and all(
@@ -1444,7 +1450,12 @@ class _NixlStagedTransfer:
                     span.set_attribute("descriptor.count", len(prepared.descriptors))
                     span.set_attribute(
                         "wire.host_staging",
-                        int(any(t.device.type == "cpu" for t in self._recv_buffers.values())),
+                        int(
+                            any(
+                                t.device.type == "cpu"
+                                for t in self._recv_buffers.values()
+                            )
+                        ),
                     )
             post_seconds = time.perf_counter() - post_started
         return self._complete_stage(prepared, posted, post_seconds)
@@ -1468,32 +1479,33 @@ class _NixlStagedTransfer:
         wire_seconds = post_seconds + wire_wait_seconds
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.plan.full_pulls:
-            source = self._full_buffers[full.src_name]
-            for copy in full.copies:
-                destination = self._recv_buffers[copy.param_name].as_strided(
+        with telemetry.span("mx.refit.reconstruct"):
+            for full in prepared.plan.full_pulls:
+                source = self._full_buffers[full.src_name]
+                for copy in full.copies:
+                    destination = self._recv_buffers[copy.param_name].as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        self._recv_buffers[copy.param_name].storage_offset()
+                        + copy.dest_offset,
+                    )
+                    destination.copy_(_replay_ops(source, copy.op_chain))
+            converted = {convert.param_name for convert in prepared.plan.converts}
+            conversion_copies = {
+                copy.param_name: copy
+                for copy in prepared.capture.copies
+                if copy.param_name in converted
+            }
+            for convert in prepared.plan.converts:
+                copy = conversion_copies[convert.param_name]
+                target = self._recv_buffers[convert.param_name]
+                destination = target.as_strided(
                     copy.dest_shape,
                     copy.dest_stride,
-                    self._recv_buffers[copy.param_name].storage_offset()
-                    + copy.dest_offset,
+                    target.storage_offset() + copy.dest_offset,
                 )
-                destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.plan.converts}
-        conversion_copies = {
-            copy.param_name: copy
-            for copy in prepared.capture.copies
-            if copy.param_name in converted
-        }
-        for convert in prepared.plan.converts:
-            copy = conversion_copies[convert.param_name]
-            target = self._recv_buffers[convert.param_name]
-            destination = target.as_strided(
-                copy.dest_shape,
-                copy.dest_stride,
-                target.storage_offset() + copy.dest_offset,
-            )
-            destination.copy_(self._convert_buffers[convert.param_name])
-        torch.cuda.synchronize(self._device)
+                destination.copy_(self._convert_buffers[convert.param_name])
+            torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
@@ -1529,7 +1541,6 @@ class _NixlStagedTransfer:
                 "bytes_received": bytes_received,
                 "segments": len(prepared.descriptors),
                 "wire_host_s": wire_seconds,
-                "wire_s": wire_seconds,
                 "wire_wait_s": wire_wait_seconds,
                 "reconstruct_s": reconstruct_seconds,
                 "full_pull_sources": len(prepared.plan.full_pulls),
@@ -1670,7 +1681,7 @@ class _NixlStagedTransfer:
         return {
             "bytes_received": bytes_received,
             "segments": tensor_count,
-            "wire_s": round(wire_seconds, 6),
+            "wire_host_s": round(wire_seconds, 6),
             "peer_s": round(time.perf_counter() - started, 6),
         }
 
