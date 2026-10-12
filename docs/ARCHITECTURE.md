@@ -661,7 +661,7 @@ when installation exits, including failure paths.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
-plans complete owning-module batches and uses
+preserves recorded source-write order for vLLM and uses
 one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
 memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
 full-source reconstruction buffers, and alignment all count toward each
@@ -714,8 +714,8 @@ full-copy descriptors before entering bounded preparation. Preparation retries
 retain one version lease and discard failed setup state; installation failures
 still fence the engine rather than retrying a partially committed update.
 
-Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
-models. It does not publish generator peers or roll back partially installed
+Streaming is opt-in and trainer-only. vLLM supports unquantized and captured
+quantized reloads; online FP8 configurations requiring loader patching are rejected. It does not publish generator peers or roll back partially installed
 versions. An installation failure marks the client engine state uncertain and
 makes the failed handle unusable for another installation. A subsequent
 `stage_weight()` releases the failed transaction after proven cleanup, acquires
@@ -1705,15 +1705,16 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 
 ### Bounded vLLM streaming installation
 
-The generator streams complete owning-module groups through reusable receive
-arenas. The transport planner derives those groups from captured loader geometry;
-applications do not select individual layers or depend on model-specific names.
-One installer uses vLLM's reload lifecycle for all supported unquantized models.
+The generator streams captured source writes through reusable receive arenas in
+loader order, including writes that revisit an earlier owner. Each source write
+must fit one arena; preparation rejects oversized writes before connecting sources.
+One installer uses vLLM's reload lifecycle for supported unquantized and quantized
+models. Online FP8 reloads requiring changes to vLLM internals are unsupported.
 
 ```mermaid
 flowchart LR
     T[Trainer shards in HBM or DRAM] -->|NIXL READ| A[Bounded receive arenas]
-    A -->|Copy complete module inputs| E[Engine-owned load-time tensors]
+    A -->|Replay captured writes in order| E[Engine-owned load-time tensors]
     E --> P[vLLM post-load processing]
     P --> L[Original live parameter storage]
     L --> F[vLLM deferred attention finalization]
@@ -1722,7 +1723,9 @@ flowchart LR
 ```
 
 The installer opens one reload window per update. It materializes the engine's
-load-time destinations and copies each completed receive group into them. vLLM
+load-time destinations and replays captured views, casts and copies into them.
+An owner is processed only after its last write and overlapping-owner dependencies
+are complete. vLLM
 performs post-load processing and restores the original kernel tensor bindings;
 finalization handles attention dependencies after all inputs arrive. Native
 materialization selects its recorded device, while host bookkeeping can be
@@ -1734,16 +1737,18 @@ Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
 custom dispatch modes. A callback may retain an engine-owned tensor without
 preventing arena reuse; CUDA completion is required before another READ overwrites
-an arena. The current alias and buffer restoration execution remains in place.
-An installation redesign based on captured-operation order is deferred.
+an arena. Installation retains aliases needed for tied parameters and runtime
+bindings, but removes the separate alias-lookup, local-materialization and custom
+assignment paths. The fixed installation plan resolves current native targets.
 
 The vLLM installer lazily creates one canonical installation plan on the first
-capture for a generator client. It retains captured loader operations, owning
-module groups, alias restoration metadata and graph destinations. Construction
-validates complete coverage and restores the live model before publishing the
-plan. Failed construction leaves the client without a plan so a later attempt
-can retry. The first successful reload after capture validates recreated graph-buffer
-geometry; subsequent reloads trust that generator-lifetime contract.
+successful capture for a generator client. Captured loader operations, destination
+geometry, owning module groups, alias restoration metadata and graph destinations
+belong to that plan. Construction validates complete capture and restores the
+live model before publishing it. Unrecorded writes to persistent destination
+storage are rejected before mutation. Missing parameter coverage also fails
+capture. Failed construction leaves the client without a plan so a later attempt
+can retry.
 
 The plan is reused for every update without source-schema keys, independent
 mapping caches, deep copies or comparisons against current model parameters.
@@ -1771,7 +1776,12 @@ slice, ellipsis and new-axis indexing remain supported. Grouped plans inherit
 the complete plan’s full-source verification policy.
 `plan_transfer_groups` derives module plans from a complete
 plan, keeping the shared source table and its index map inside the planner.
-Module batching and packing preserve the same read order.
+Module batching and packing preserve the same read order for legacy captures.
+Source replay instead batches consecutive writes without regrouping by owner;
+module packing does not reorder those writes. Each write stages the exact
+representable source-view prefix and locally replays the remaining operations.
+Digest verification stages the complete source and checks the current version
+checksums before replay. No descriptor coarsening is applied to source replay.
 
 `bind_transfer(plan, resolve_source, resolve_destination)` returns a separate
 `PhysicalTransferPlan`. It resolves each used source buffer and each named
@@ -1794,11 +1804,12 @@ and resource-safety checks remain in place.
 Alias restoration distinguishes repeated paths to one slot from ties between
 slots. vLLM's recorded parameter metadata separates load-time ties from runtime
 aliases such as WNA16's `w13_weight` and `w2_weight`; native post-processing
-recreates runtime aliases. Existing local-materialization and custom-assignment
-paths remain. Supported quantized FullCopy refits use the same fixed-client
-contract; quantized streaming remains unsupported.
+recreates runtime aliases. Quantized full-copy and streaming refits use this same
+fixed-client contract and process completed owners in captured operation order.
 
-The staging limit bounds receive, conversion and transfer scratch allocations.
+The staging limit bounds registered receive arenas. Replay operations can require
+additional local scratch, reported as `replay_scratch_peak_bytes`. Estimated
+installation owner and materialization peaks are also reported separately.
 Engine-owned materialized destinations and post-load workspaces consume
 additional memory, as do the live model and runtime state. The staging limit is
 therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
