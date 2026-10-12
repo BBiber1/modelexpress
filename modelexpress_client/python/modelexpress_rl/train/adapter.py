@@ -118,6 +118,7 @@ class StagedWeightVersionShardData:
     publish_ready: CompletionFence
     buffer_owner: object | None = None
     checksums: tuple[tuple[str, int, str], ...] = ()
+    publish_ready_completed: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checksums", tuple(tuple(row) for row in self.checksums))

@@ -9,9 +9,10 @@ from functools import partial
 from itertools import chain
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping
-from time import perf_counter
+from time import perf_counter, time_ns
 
 import grpc
+from modelexpress import telemetry
 from modelexpress import envs
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress.refit.timing import add_refit_duration, refit_span
@@ -116,11 +117,15 @@ class _ResolutionRound:
         self._counters: dict[str, int | float] = defaultdict(int)
         self._seconds = 0.0
         self._failed = False
+        self._trace_started = None
 
     def resolve(self, shard: refit_pb2.WeightVersionShard) -> TrainerSourceShard:
         identity = (shard.logical_shard_id, shard.worker_id)
         if identity in self.sources:
             return self.sources[identity]
+        if (self._trace_started is None and telemetry.recording()
+                and (identity not in self._stable_sources or self._verify)):
+            self._trace_started = time_ns()
         started = perf_counter()
         try:
             source, checksums = self._resolve_source(
@@ -145,6 +150,12 @@ class _ResolutionRound:
             status="error" if self._failed else "ok", metadata=dict(self._counters),
             accumulate_metadata=True,
         )
+        if self._trace_started is not None:
+            telemetry.completed_span(
+                "mx.refit.source_resolution", self._trace_started, time_ns(),
+                {**self._counters, "status": "error" if self._failed else "ok"},
+            )
+            self._trace_started = None
         self._counters.clear()
         self._seconds = 0.0
         self._failed = False
