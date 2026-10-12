@@ -1780,7 +1780,15 @@ Source replay instead batches consecutive writes without regrouping by owner;
 module packing does not reorder those writes. Each write stages the exact
 representable source-view prefix and locally replays the remaining operations.
 Digest verification stages the complete source and checks the current version
-checksums before replay. No descriptor coarsening is applied to source replay.
+checksums before replay. When an exact prefix exceeds
+`MX_RESHARD_MAX_SEGMENTS_PER_COPY`, the planner considers contiguous earlier
+prefixes and replays their remaining operations locally. It chooses the least
+wire overhead that meets the descriptor target, or the greatest available
+reduction when fragmentation prevents meeting it. Candidates must fit the aligned
+per-arena capacity; if none do, exact reads remain. Arithmetic cost counting
+avoids constructing discarded descriptor lists. Preparation reports exact and
+planned descriptor counts, descriptor savings and extra wire bytes, including on
+warm updates. Whole-source checksum verification retains its complete reads.
 
 `bind_transfer(plan, resolve_source, resolve_destination)` returns a separate
 `PhysicalTransferPlan`. It resolves each used source buffer and each named
