@@ -49,19 +49,19 @@ from modelexpress_rl.inference.plan import (
     SourceReplayBatch,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard.geometry import (
     capture_weights,
     build_lazy_weights,
     overlapping_destination_groups,
 )
-from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress.refit.timing import refit_span
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.timing import refit_span
 
 if TYPE_CHECKING:
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
-    from modelexpress.refit.reshard.types import CaptureResult
+    from modelexpress_rl.refit.reshard.types import CaptureResult
 
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
 _MODULE_GETATTRIBUTE = torch.nn.Module.__getattribute__

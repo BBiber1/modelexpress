@@ -145,11 +145,6 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
-│       ├── refit/                      # Engine-agnostic live-refit primitives
-│       │   ├── __init__.py             # Public refit exports
-│       │   ├── timing.py               # Structured refit stage timing
-│       │   └── reshard/                # Geometry capture, planning, rendezvous and transport
-│       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
@@ -180,11 +175,7 @@ ModelExpress/
 │       │   ├── vllm/                   # vLLM integration
 │       │   │   ├── __init__.py         # vLLM loader registration
 │       │   │   ├── adapter.py          # VllmAdapter and context builder
-│       │   │   ├── loader.py           # MxModelLoader implementation
-│       │   │   ├── mdl.py              # Compatibility shim for vLLM refit
-│       │   │   └── refit/
-│       │   │       ├── __init__.py     # vLLM refit exports
-│       │   │       └── installer.py    # Mapped Direct Load installer
+│       │   │   └── loader.py           # MxModelLoader implementation
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
 │       │       ├── adapter.py          # SglangAdapter and context builder
@@ -196,6 +187,13 @@ ModelExpress/
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
 │       └── p2p_pb2_grpc.py             # Generated gRPC stubs
+│   └── modelexpress_rl/
+│       ├── envs.py                      # RL-specific environment registry
+│       ├── refit/
+│       │   ├── timing.py                # RL refit stage timing
+│       │   └── reshard/                 # Geometry, planning, rendezvous and transport
+│       └── inference/engines/vllm/
+│           └── installer.py             # RL vLLM load-layout capture and installation
 │
 ├── modelexpress_common/
 │   ├── Cargo.toml
@@ -1180,7 +1178,6 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
-| `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
@@ -1190,7 +1187,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
 | `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
-| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the separate vLLM-specific MDL installer |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map initial-load strategy hooks to vLLM loader APIs |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
@@ -1207,6 +1204,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/runtime.py` | Trainer publication composition, bound tensor state, and transport-resource ownership |
 | `train/context.py` | Public explicit Megatron and FSDP engine selection |
 | `train/methods/` | Independent full-tensor NIXL and canonical-checkpoint publication methods |
+| `refit/` | RL refit timing and engine-neutral geometry capture, transfer planning, rendezvous, and transport |
 | `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place, pinned host-copy, or device-copy staging |
@@ -1301,36 +1299,22 @@ and installation metrics and logs each numeric `perf/` phase as a separate INFO
 line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
 complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
 
-`engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
-been translated into the inference model's naming and numerical format. The
-first update records validated destinations in the live vLLM model. Later
-updates reuse those destinations for direct parameters, fused query/key/value
-and MLP slices, local experts, tensor-parallel shards, and FP8 scales.
+The active vLLM refit installer lives in
+`modelexpress_rl.inference.engines.vllm.installer`. It captures canonical
+load-time destinations and aliases once for the generator client's lifetime,
+then installs updates into the live model. Checkpoint reloads use vLLM's
+layerwise loader and post-load processing so quantized and graph-bound weights
+retain their engine-owned behavior. Replacing the engine or changing its loader
+semantics requires a new client.
 
-Loaderless FP8 updates resolve the complete batch before the first in-place
-write. Unknown destinations, failed expert-ID translation, and incomplete
-scale coverage reject the update. Stock-loader errors propagate unless the
-FP8 loaderless policy was selected before loading.
-
-The destination-map signature includes parameter names, shapes, strides,
-storage identities, data types, devices, and expert mapping. Replacing or
-reshaping a parameter invalidates the map and records the next update as cold.
-`RefitTimingRecorder` emits one stable timing payload for discovery through
-readiness.
-
-MDL does not discover sources, plan resharding, transfer bytes, or translate
-trainer tensors. Those stages provide the translated tensor stream and use
-`MdlLoader.load_weights()` as the final installation callback.
-
-The package boundary is intentional: timing and future install-plan contracts
-belong in engine-agnostic `modelexpress.refit`, while RL-specific vLLM loader
-observation, placement, PWAL interaction, and installation belong in
-`modelexpress_rl.inference.engines.vllm`. Trainer adapters are separate from
-the inference-engine integration.
+RL refit timing and transfer planning live under `modelexpress_rl.refit`.
+The RL-specific `MX_REFIT_*` and `MX_RESHARD_*` settings are registered in
+`modelexpress_rl.envs`; shared client configuration remains in
+`modelexpress.envs`.
 
 ### No-gather Refit Resharding
 
-`modelexpress.refit.reshard` captures the slices and destination views selected
+`modelexpress_rl.refit.reshard` captures the slices and destination views selected
 by an engine's own weight loader, intersects them with trainer-published
 shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
@@ -1377,10 +1361,10 @@ storage without re-running PWAL. The adapter rebuilds a trainer plan when
 validated source manifests change; an incompatible destination staging layout
 requires an engine restart.
 
-See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
-for the end-to-end design, integration contract, implementation status, and
-validation requirements, including descriptor bounding for strided slices,
-receive and staging buffer ownership, and when PWAL applies rather than MDL.
+See the [RL refit package](../modelexpress_client/python/modelexpress_rl/refit/__init__.py)
+for its public timing and resharding exports. The deployment behavior and
+validation details are described in this architecture section and the
+[deployment reference](DEPLOYMENT.md).
 
 ### SGLang Loader
 
@@ -1763,7 +1747,7 @@ canonical loader-input schema needed for lazy capture; the installer retains no
 trainer identity, source conversion or source-bound mapping. Transfer consumers
 must not mutate the retained canonical capture or destination metadata.
 
-`modelexpress.refit.reshard.plan_transfer` builds an immutable
+`modelexpress_rl.refit.reshard.plan_transfer` builds an immutable
 `LogicalTransferPlan` directly from captured geometry. Exact reads, conversions
 and full-source pulls index a shared source-buffer table and carry shard-relative
 byte offsets. The table identifies logical source slots and tensor shards; it

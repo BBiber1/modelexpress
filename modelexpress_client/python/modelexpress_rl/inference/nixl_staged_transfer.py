@@ -32,18 +32,18 @@ from modelexpress.nixl_transfer import (
     NIXL_VRAM_MEM_TYPE,
     NixlTransferManager,
 )
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.geometry import (
     _validate_physical_destination,
     convert_source_weights,
 )
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.rendezvous import (
     build_sources,
     merge_shard_tables,
     unwrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.transfer_plan import (
     LogicalTransferPlan,
     PlannedCapture,
     bind_transfer,
@@ -52,15 +52,16 @@ from modelexpress.refit.reshard.transfer_plan import (
     plan_transfer,
     replay_scratch_bytes,
 )
-from modelexpress.refit.reshard.transport import ReadDescriptor
-from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.transport import ReadDescriptor
+from modelexpress_rl.refit.reshard.transport.nixl import NixlReshardTransport
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
     summarize_unsupported,
 )
-from modelexpress.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress_rl.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress_rl import envs as refit_envs
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
 from modelexpress_rl.inference.plan import SourceReplayBatch, TrainerSourceSnapshot
@@ -272,7 +273,7 @@ def _bounded_batches(
     if complete is None:
         complete = plan_transfer(capture, sources, source_slots=source_slots,
                                  max_staging_bytes=max_staging_bytes,
-                                 verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST)
+                                 verify_full_sources=refit_envs.MX_RESHARD_PUBLISH_DIGEST)
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
     started = time.perf_counter()
@@ -586,8 +587,8 @@ class _NixlStagedTransfer:
         self._staging_device: torch.device | None = None
         self._manager_ready = True
         self._weight_update_plan: _WeightUpdatePlan | None = None
-        self._debug_validate_plan = envs.MX_REFIT_DEBUG_VALIDATE_PLAN
-        self._pack_modules = envs.MX_REFIT_PACK_MODULES
+        self._debug_validate_plan = refit_envs.MX_REFIT_DEBUG_VALIDATE_PLAN
+        self._pack_modules = refit_envs.MX_REFIT_PACK_MODULES
         self._plan_compile_lock = threading.Lock()
 
     @property
@@ -813,7 +814,7 @@ class _NixlStagedTransfer:
                     session: slots_by_agent[agent]
                     for session, agent in trainer.resolved_metadata.session_to_agent.items()
                 },
-                verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+                verify_full_sources=refit_envs.MX_RESHARD_PUBLISH_DIGEST,
             )
             metrics["initial_whole_plan_s"] = time.perf_counter() - started
             modules = _bounded_batches(
@@ -1074,7 +1075,7 @@ class _NixlStagedTransfer:
                 session: slots_by_agent[agent]
                 for session, agent in trainer.resolved_metadata.session_to_agent.items()
             },
-            verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+            verify_full_sources=refit_envs.MX_RESHARD_PUBLISH_DIGEST,
         )
         metrics["initial_whole_plan_s"] = time.perf_counter() - started
         validation_started = time.perf_counter()
@@ -1566,7 +1567,7 @@ class _NixlStagedTransfer:
         torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
-        if envs.MX_RESHARD_PUBLISH_DIGEST:
+        if refit_envs.MX_RESHARD_PUBLISH_DIGEST:
             self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
