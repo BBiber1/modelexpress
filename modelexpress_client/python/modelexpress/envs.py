@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     MX_MODEL_URI: Optional[str]
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
+    MX_REFIT_EXPERIMENT: Optional[str]
+    MX_REFIT_STAGING_MODE: Optional[str]
+    MX_REFIT_TRACE_DETAIL: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -243,6 +246,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
+    "MX_REFIT_EXPERIMENT": lambda: os.environ.get("MX_REFIT_EXPERIMENT"),
+    "MX_REFIT_STAGING_MODE": lambda: os.environ.get("MX_REFIT_STAGING_MODE"),
+    "MX_REFIT_TRACE_DETAIL": lambda: _env_bool("MX_REFIT_TRACE_DETAIL", False),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get(
         "MX_K8S_SERVICE_PATTERN", "mx-sources"

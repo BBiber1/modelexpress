@@ -1178,6 +1178,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
+  | `telemetry.py` | Optional OpenTelemetry facade for refit spans, duration metrics, and W3C context propagation |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
@@ -1911,6 +1912,40 @@ prefix, including incomplete publications. A separate CPU pod performs cleanup,
 so failed or expired benchmark pods are not required for recovery. CI deletes the
 owned namespace only after cleanup is verified; a failed attempt releases GPUs
 and preserves namespace credentials for retry.
+
+### Native NIXL refit telemetry
+
+With MX OpenTelemetry tracing enabled, NIXL agents capture native request
+telemetry. Each posted group has an `mx.refit.nixl_batch` span from request
+posting through completion, with `mx.refit.nixl_transfer` children. Serial,
+concurrent, prefetched, and direct reads use the same instrumentation. Spans
+include experiment, step, role, and rank attributes.
+
+Request attributes report bytes, descriptor count, monotonic start time, post
+duration, and transfer duration. Batch attributes summarize bytes, descriptors,
+posting durations, request-duration percentiles, and completion and telemetry
+coverage. `nixl.observed_batch_duration_s` includes polling delay and time while
+the consumer installs another batch; `nixl.observed_payload_gbps` is an observed
+logical payload rate, not a NIC link counter. Unavailable native telemetry does
+not fail a transfer, and incomplete coverage remains explicit. MX exports these
+spans and metrics through its configured OTLP endpoints.
+
+`modelexpress_rl.RefitTrace` owns the `mx.refit.cycle` root and trainer,
+orchestrator, and generator role envelopes. Shared version, step, experiment,
+and staging attributes cross process boundaries in W3C baggage; role and rank
+remain local. Cycle context is retained in the weight version's `trace_context`
+map and returned by lifecycle RPCs. Operations measured before the parent is
+known preserve their original timestamps and export when context arrives.
+
+Refit spans cover weight staging, application, release, source metadata and
+resolution, canonical layout capture, planning, source registration, workspace
+allocation, descriptor construction, READ posting and waiting, reconstruction,
+and installation. Bounded compilation emits one aggregate
+`mx.refit.bounded_plan_compile` span; full-copy preparation retains separate
+planning and validation spans. Source resolution exports counters once per
+flush, excluding lazy iterator pauses and consumer work. Reconstruction spans
+include the device completion fence. Trace-only work is skipped when spans are
+not recording and adds no application synchronization or ports.
 
 Runtime code is organized into `harness/` for shared orchestration and validation,
 `scenarios/delta/` for seed download, delta publication and delta-specific checks,

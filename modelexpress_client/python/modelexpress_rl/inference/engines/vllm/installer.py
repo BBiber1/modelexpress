@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from weakref import ref
 
 import torch
+from modelexpress import telemetry
 from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
@@ -409,6 +410,7 @@ class _VllmInstaller(EngineInstaller):
             )
         )
 
+    @telemetry.span("mx.refit.install")
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
         self._tied_input_peak_bytes = 0
@@ -747,6 +749,7 @@ class _VllmInstaller(EngineInstaller):
                 ownership.drain_failed = True
                 raise
 
+        @telemetry.span("mx.refit.vllm_streaming_load")
         def load(initial_aliases: _ParameterAliases) -> None:
             nonlocal load_s, commit_s
             load_started = time.perf_counter()
@@ -764,6 +767,7 @@ class _VllmInstaller(EngineInstaller):
                 ownership.source_failed = True
                 raise
             sentinel = object()
+            batch_index = 0
             while True:
                 try:
                     tensors = next(ownership.iterator, sentinel)
@@ -773,31 +777,40 @@ class _VllmInstaller(EngineInstaller):
                     raise
                 if tensors is sentinel:
                     break
-                source_replay = isinstance(tensors, SourceReplayBatch)
-                names = set() if source_replay else set(tensors)
-                if not source_replay and (
-                    not names or names - expected or names & installed
-                ):
-                    raise IncompleteRefit(
-                        "invalid or repeated streaming parameter batch"
-                    )
-                commit_started = time.perf_counter()
-                received_storages = {
-                    tensor.untyped_storage().data_ptr() for tensor in tensors.values()
-                }
-                if (received_storages & live_storages) - {0}:
-                    raise IncompleteRefit(
-                        "received streaming tensor aliases live storage"
-                    )
-                if source_replay:
-                    self._apply_source_batch(plan, tensors)
-                    installed.update(plan.installed)
-                else:
-                    self._apply_batch(plan, tensors, kind="streaming")
-                    installed.update(names)
-                drain()
-                commit_s += time.perf_counter() - commit_started
-                del tensors
+                with telemetry.span("mx.refit.vllm_load_batch") as current:
+                    if current.is_recording():
+                        current.set_attribute("batch.index", batch_index)
+                        current.set_attribute(
+                            "parameter.count", len(tensors.parameter_names)
+                            if isinstance(tensors, SourceReplayBatch) else len(tensors)
+                        )
+                    source_replay = isinstance(tensors, SourceReplayBatch)
+                    names = set() if source_replay else set(tensors)
+                    if not source_replay and (
+                        not names or names - expected or names & installed
+                    ):
+                        raise IncompleteRefit(
+                            "invalid or repeated streaming parameter batch"
+                        )
+                    commit_started = time.perf_counter()
+                    received_storages = {
+                        tensor.untyped_storage().data_ptr() for tensor in tensors.values()
+                    }
+                    if (received_storages & live_storages) - {0}:
+                        raise IncompleteRefit(
+                            "received streaming tensor aliases live storage"
+                        )
+                    with telemetry.span("mx.refit.install_commit"):
+                        if source_replay:
+                            self._apply_source_batch(plan, tensors)
+                            installed.update(plan.installed)
+                        else:
+                            self._apply_batch(plan, tensors, kind="streaming")
+                            installed.update(names)
+                    drain()
+                    commit_s += time.perf_counter() - commit_started
+                    del tensors
+                batch_index += 1
             if plan.replay_metadata is not None:
                 self._finish_source_replay(plan)
             if installed != expected:
@@ -808,7 +821,8 @@ class _VllmInstaller(EngineInstaller):
 
         reload_started = time.perf_counter()
         try:
-            self._reload(load)
+            with telemetry.span("mx.refit.reload"):
+                self._reload(load)
             reload_s = time.perf_counter() - reload_started - load_s
         except BaseException as error:
             primary_error = error
@@ -817,7 +831,10 @@ class _VllmInstaller(EngineInstaller):
             if not ownership.drain_failed:
                 try:
                     sync_started = time.perf_counter()
-                    with refit_span("post_install"):
+                    with (
+                        telemetry.span("mx.refit.post_install_sync"),
+                        refit_span("post_install"),
+                    ):
                         drain()
                     metrics["post_install_sync_s"] = time.perf_counter() - sync_started
                     if ownership.iterator is not None and not ownership.source_failed:

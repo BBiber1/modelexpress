@@ -29,6 +29,7 @@ use crate::refit::{
 };
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
+use crate::telemetry::RefitTraceLayer;
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
@@ -398,6 +399,9 @@ pub async fn run_server(
     // without a second edit. It sits outside `AuthLayer`, so a rejected call is
     // counted as `outcome="unauthenticated"` instead of vanishing.
     let router = Server::builder()
+        .layer(RefitTraceLayer::new(
+            std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some(),
+        ))
         .layer(metrics::grpc::GrpcMetricsLayer::new(grpc_metrics))
         .add_service(health_service_v1)
         .add_service(HealthServiceServer::new(health_service));

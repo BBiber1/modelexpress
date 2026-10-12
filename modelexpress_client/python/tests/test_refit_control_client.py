@@ -6,6 +6,7 @@ from concurrent import futures
 import grpc
 import pytest
 from modelexpress_rl import control as control_module
+from modelexpress import telemetry
 from modelexpress_rl import (
     ModelExpressControlClient,
     ObjectStorageSource,
@@ -66,6 +67,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             payload_format=request.payload_format,
             state=request.state,
             created_at_unix_ms=1234,
+            trace_context=request.trace_context,
         )
         if request.HasField("base_version_id"):
             self.version.base_version_id = request.base_version_id
@@ -198,7 +200,9 @@ def test_control_client_links_version_to_trainer_mesh():
 
 
 @pytest.mark.parametrize("generation", [1, 2**64 - 1])
-def test_control_client_owns_global_weight_version_lifecycle(generation) -> None:
+def test_control_client_owns_global_weight_version_lifecycle(generation, monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://127.0.0.1:1")
+    monkeypatch.setattr(telemetry, "configure", lambda _role: None)
     service = _RefitService()
     service.mesh.generation = generation
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -208,13 +212,25 @@ def test_control_client_owns_global_weight_version_lifecycle(generation) -> None
 
     try:
         control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+        context = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01", "baggage": "step=4"}
         created = control.create_weight_version(
             model_name="test/model",
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.FULL_TENSOR,
             trainer_mesh_id="mesh-a",
+            trace_context=context,
         )
         fetched = control.get_weight_version(created.version_id)
+        service.mesh.generation = 2
+        with telemetry.extracted(context):
+            fresh = control.create_weight_version(
+                model_name="test/model",
+                idempotency_key="training-step-8",
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                trainer_mesh_id="mesh-a",
+            )
+        assert fresh.trainer_mesh_generation == 2
+        assert fresh.trace_context == context
         ready = control.update_weight_version_state(
             created.version_id,
             WeightVersionState.READY,
@@ -225,6 +241,8 @@ def test_control_client_owns_global_weight_version_lifecycle(generation) -> None
             control.close()
         server.stop(grace=None).wait()
 
+    assert created.trace_context == context
+    assert fetched.trace_context == context
     assert created.ref.version_id == "version-a"
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
     assert created.trainer_mesh_id == "mesh-a"
