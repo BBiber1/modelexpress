@@ -14,7 +14,7 @@ from typing import Any
 
 import grpc
 import torch
-from modelexpress import auth, envs
+from modelexpress import auth, envs, telemetry
 from modelexpress.client import _get_server_url
 
 from .. import envs as rl_envs
@@ -233,7 +233,9 @@ class ModelExpressTrainerClient:
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
         if self._channel is None:
-            self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
+            self._channel = telemetry.refit_channel(
+                auth.with_auth(grpc.insecure_channel(self.server_url))
+            )
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
         assert self._stub is not None
         return self._stub
@@ -276,6 +278,7 @@ class ModelExpressTrainerClient:
         )
         return StagedWeightVersionShard(client=self, version=version, staged=staged)
 
+    @telemetry.span("mx.refit.publish")
     def publish_version(self, *, version: WeightVersionRef) -> None:
         self._active_runtime().publish_bound(version=version)
 
@@ -284,6 +287,7 @@ class ModelExpressTrainerClient:
     ) -> None:
         self._active_runtime().publish(version=version, staged=staged)
 
+    @telemetry.span("mx.refit.release")
     def release_version(self, *, version: WeightVersionRef) -> None:
         if self._closed:
             raise RuntimeError("trainer client is closed")

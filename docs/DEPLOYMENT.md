@@ -1914,3 +1914,19 @@ run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunni
 the whole GitHub workflow uses a new attempt and does not recover an older retained
 namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.
+
+### Refit OpenTelemetry export
+
+Install the Python client's `otel` extra and set
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to the OTLP HTTP signal URLs in each
+refit process. Refit gRPC calls propagate W3C trace context, and server spans
+join the caller's trace. Client tracing is initialized after worker forks so
+each rank owns its exporter. Tracing adds no application synchronization or
+ports; when no spans are recording, trace-only work is skipped.
+
+`MX_REFIT_TRACE_DETAIL` enables additional per-request diagnostics. The
+optional `MX_REFIT_EXPERIMENT` and `MX_REFIT_STAGING_MODE` values label traces.
+Native NIXL telemetry is collected without setting NIXL exporter variables and
+is exported through the configured OTLP endpoints. Missing native samples are
+reported as incomplete telemetry and do not fail transfers.

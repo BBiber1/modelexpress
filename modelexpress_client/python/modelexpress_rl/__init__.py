@@ -23,10 +23,12 @@ from .train import (
     WeightPayloadFormat,
 )
 from .object_storage import ObjectStorageSource, ObjectStorageType
+from .telemetry import RefitTrace
 from .version import TrainerTensorsMetadata, WeightVersionRef
 
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Framework-facing clients.
+    "RefitTrace",
     "ModelExpressControlClient",
     "ModelExpressGeneratorClient",
     "ModelExpressTrainerClient",
