@@ -42,8 +42,9 @@ def sample(size=64, duration=2000000) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("detail", [False, True])
+@pytest.mark.parametrize("peers", [("trainer-0", "trainer-0"), ("trainer-0", "trainer-1")])
 def test_batch_encloses_distinct_completions_and_aggregates(
-    recording, monkeypatch, detail
+    recording, monkeypatch, detail, peers
 ) -> None:
     monkeypatch.setenv("MX_REFIT_TRACE_DETAIL", str(int(detail)))
     agent = SimpleNamespace(
@@ -57,7 +58,7 @@ def test_batch_encloses_distinct_completions_and_aggregates(
     ):
         batch = telemetry._NixlBatch()
         with batch.posting():
-            first, second = batch.post("trainer-0"), batch.post("trainer-1")
+            first, second = (batch.post(peer) for peer in peers)
             assert trace.get_current_span() is refit
         batch.complete(first, agent, 64)
         finished = recording.get_finished_spans()
@@ -77,7 +78,14 @@ def test_batch_encloses_distinct_completions_and_aggregates(
     assert parent.parent.span_id == refit.get_span_context().span_id
     assert all(s.parent.span_id == parent.context.span_id for s in children)
     assert len(children) == (2 if detail else 0)
+    if peers[0] == peers[1]:
+        assert parent.attributes["nixl.remote_agent"] == peers[0]
+    else:
+        assert "nixl.remote_agent" not in parent.attributes
+    assert "nixl.destination_agent" not in parent.attributes
     if detail:
+        assert tuple(s.attributes["nixl.remote_agent"] for s in children) == peers
+        assert all("nixl.destination_agent" not in s.attributes for s in children)
         assert (
             parent.start_time
             <= children[0].start_time
@@ -132,6 +140,8 @@ def test_incomplete_native_coverage_and_failure(recording, failure) -> None:
     assert (parent.status.status_code == trace.StatusCode.ERROR) == (
         failure == "transfer"
     )
+    requests = [s for s in recording.get_finished_spans() if s.name == "mx.refit.nixl_transfer"]
+    assert [s.attributes["nixl.remote_agent"] for s in requests] == ["one", "two"]
 
 
 def test_serial_batch_remains_open_between_requests(recording) -> None:
@@ -215,6 +225,12 @@ def test_manager_collects_each_completion_before_any_release(recording) -> None:
             manager._trace_post(h, "trainer")
     posted = [PostedRead(h, "trainer", 64, 1) for h in handles]
     assert manager.await_read_batches(posted)[:2] == (128, 2)
+    requests = [
+        s for s in recording.get_finished_spans()
+        if s.name == "mx.refit.nixl_transfer"
+    ]
+    assert len(requests) == 2
+    assert all(s.attributes["nixl.remote_agent"] == "trainer" for s in requests)
     assert [e[0] for e in events] == [
         "telemetry",
         "telemetry",

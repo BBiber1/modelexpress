@@ -1962,6 +1962,11 @@ ports; when no spans are recording, trace-only work is skipped.
 
 `MX_REFIT_TRACE_DETAIL` enables additional per-request diagnostics. The
 optional `MX_REFIT_EXPERIMENT` and `MX_REFIT_STAGING_MODE` values label traces.
+Each detailed `mx.refit.nixl_transfer` READ span identifies the remote source
+agent as `nixl.remote_agent`; the enclosing generator span identifies the
+receiver. `mx.refit.nixl_batch` also carries `nixl.remote_agent` when every
+request has the same peer. Mixed-peer batches omit that field; use their
+request spans to inspect source distribution. Agent IDs are not metric labels.
 Native NIXL telemetry is collected without setting NIXL exporter variables and
 is exported through the configured OTLP endpoints. Missing native samples are
 reported as incomplete telemetry and do not fail transfers.

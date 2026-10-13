@@ -701,6 +701,9 @@ class _NixlBatch:
             "post_duration_s": sum(s["post_duration_s"] for s in samples),
         }
         attrs = {"nixl." + k: v for k, v in values.items()}
+        peers = {r["peer"] for r in self._requests.values()}
+        if len(peers) == 1:
+            attrs["nixl.remote_agent"] = next(iter(peers))
         attrs.update(
             {
                 "nixl.request_count": len(self._requests),
