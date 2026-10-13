@@ -66,6 +66,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             payload_format=request.payload_format,
             state=request.state,
             created_at_unix_ms=1234,
+            trace_context=request.trace_context,
         )
         if request.HasField("base_version_id"):
             self.version.base_version_id = request.base_version_id
@@ -116,6 +117,31 @@ def test_weight_version_rejects_invalid_mesh_generation(generation) -> None:
             trainer_mesh_id="mesh-a",
             trainer_mesh_generation=generation,
         )
+
+
+def test_weight_version_required_fields_precede_optional_fields():
+    from dataclasses import MISSING, fields
+
+    optional_seen = False
+    for field in fields(control_module.WeightVersion):
+        if field.default is MISSING and field.default_factory is MISSING:
+            assert not optional_seen
+        else:
+            optional_seen = True
+    version = control_module.WeightVersion(
+        version_id="version-a",
+        model_name="test/model",
+        payload_format=WeightPayloadFormat.FULL_TENSOR,
+        layout_signature="",
+        state=WeightVersionState.STAGING,
+        created_at_unix_ms=1234,
+        trainer_mesh_generation=0,
+    )
+    assert version.base_version_id is None
+    assert version.object_storage is None
+    assert version.trainer_mesh_id is None
+    assert version.version_number is None
+    assert version.trace_context == {}
 
 
 def test_control_client_rejects_missing_version_response():
@@ -206,6 +232,7 @@ def test_control_client_owns_global_weight_version_lifecycle(generation) -> None
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
 
+    context = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
     try:
         control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
         created = control.create_weight_version(
@@ -213,6 +240,7 @@ def test_control_client_owns_global_weight_version_lifecycle(generation) -> None
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.FULL_TENSOR,
             trainer_mesh_id="mesh-a",
+            trace_context=context,
         )
         fetched = control.get_weight_version(created.version_id)
         ready = control.update_weight_version_state(
@@ -225,6 +253,8 @@ def test_control_client_owns_global_weight_version_lifecycle(generation) -> None
             control.close()
         server.stop(grace=None).wait()
 
+    assert created.trace_context == context
+    assert fetched.trace_context == context
     assert created.ref.version_id == "version-a"
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
     assert created.trainer_mesh_id == "mesh-a"

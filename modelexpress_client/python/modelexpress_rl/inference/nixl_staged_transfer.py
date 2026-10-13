@@ -23,7 +23,7 @@ from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
 import torch
-from modelexpress import envs, p2p_pb2
+from modelexpress import envs, p2p_pb2, telemetry
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -34,6 +34,7 @@ from modelexpress.nixl_transfer import (
     NixlTransferManager,
 )
 from modelexpress.refit.reshard import throughput
+from modelexpress.refit.timing import current_refit_timing, refit_span
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
@@ -622,7 +623,8 @@ class _NixlStagedTransfer:
         )
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        capture, parameter_layout = capture_layout(list(source_schema))
+        with telemetry.span("mx.refit.layout_capture"):
+            capture, parameter_layout = capture_layout(list(source_schema))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout
 
@@ -655,6 +657,23 @@ class _NixlStagedTransfer:
         )
 
     def _compile_streaming(
+        self,
+        trainer: TrainerSourceSnapshot,
+        capture: CaptureResult,
+        parameter_layout: Mapping,
+        metrics: dict,
+        binding: _SourceBinding,
+    ) -> _StreamingSchedule:
+        with telemetry.span("mx.refit.bounded_plan_compile") as span:
+            try:
+                return self._compile_streaming_impl(
+                    trainer, capture, parameter_layout, metrics, binding
+                )
+            finally:
+                if span.is_recording():
+                    span.set_attributes(metrics)
+
+    def _compile_streaming_impl(
         self,
         trainer: TrainerSourceSnapshot,
         capture: CaptureResult,
@@ -701,12 +720,17 @@ class _NixlStagedTransfer:
                 if self._pack_modules else modules
             )
             compiled = _StreamingSchedule(plan, modules, batches)
+            metrics.update(
+                module_batches=len(compiled.module_batches),
+                batches=len(compiled.batches),
+            )
             logger.info("compiled bounded transfer plan")
             return compiled
 
         finally:
             self._plan_compile_lock.release()
 
+    @telemetry.span("mx.refit.connection_registration")
     def _connect_sources(
         self,
         resolved: _ResolvedSources,
@@ -767,6 +791,7 @@ class _NixlStagedTransfer:
         finally:
             self._native_setup_started = False
 
+    @telemetry.span("mx.refit.transfer_prepare")
     def prepare(
         self,
         *,
@@ -859,6 +884,7 @@ class _NixlStagedTransfer:
             self._active = prepared
             return prepared
 
+    @telemetry.span("mx.refit.required_agents")
     def _prepare_transport(self, trainer, transfer_plan, source_binding, metrics):
         streaming = self._streaming
         compiled = transfer_plan if isinstance(transfer_plan, _StreamingSchedule) else None
@@ -889,6 +915,7 @@ class _NixlStagedTransfer:
             metrics["connection_registration_s"] = time.perf_counter() - started
         return transport
 
+    @telemetry.span("mx.refit.transfer_planning")
     def _compile_full_copy(
         self,
         trainer: TrainerSourceSnapshot,
@@ -915,6 +942,7 @@ class _NixlStagedTransfer:
         metrics["transfer_planning_s"] = time.perf_counter() - started
         return plan
 
+    @telemetry.span("mx.refit.receive_workspace")
     def _prepare_full_copy(
         self,
         cached: _WeightUpdatePlan,
@@ -948,6 +976,7 @@ class _NixlStagedTransfer:
             checksums=checksums,
         )
 
+    @telemetry.span("mx.refit.receive_workspace")
     def _prepare_streaming(
         self,
         cached: _WeightUpdatePlan,
@@ -971,6 +1000,7 @@ class _NixlStagedTransfer:
         )
         return prepared
 
+    @telemetry.span("mx.refit.receive_workspace")
     def _prepare_arenas(
         self,
         batches: tuple[_StreamingBatch, ...],
@@ -1068,7 +1098,10 @@ class _NixlStagedTransfer:
             checksums=prepared.checksums,
         )
         started = time.perf_counter()
-        posted = prepared.transport.post_reads(list(chunk.descriptors))
+        with telemetry.span("mx.refit.wire_post") as span:
+            posted = prepared.transport.post_reads(list(chunk.descriptors))
+            if span.is_recording():
+                span.set_attribute("descriptor.count", len(chunk.descriptors))
         return chunk, (recv, convert, full), posted, started
 
     def iter_bounded(
@@ -1222,6 +1255,7 @@ class _NixlStagedTransfer:
                 }
             )
 
+    @telemetry.span("mx.refit.receive_workspace")
     def _ensure_workspace(
         self,
         plan: LogicalTransferPlan,
@@ -1303,7 +1337,10 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL transfer plan is no longer active")
         started = time.perf_counter()
         try:
-            posted = prepared.transport.post_reads(list(prepared.descriptors))
+            with telemetry.span("mx.refit.wire_post") as span:
+                posted = prepared.transport.post_reads(list(prepared.descriptors))
+                if span.is_recording():
+                    span.set_attribute("descriptor.count", len(prepared.descriptors))
             return self._complete_stage(prepared, posted, started)
         except BaseException:
             self._invalidate_cached_transfer()
@@ -1315,41 +1352,52 @@ class _NixlStagedTransfer:
     ) -> _StagedNixlWeights:
         """Wait for posted READs, then reconstruct, convert, and verify."""
         wait_started = time.perf_counter()
-        prepared.transport.await_reads(posted)
+        with telemetry.span("mx.refit.wire_wait") as span:
+            prepared.transport.await_reads(posted)
+            if span.is_recording():
+                span.set_attribute("wire.wait_s", time.perf_counter() - wait_started)
         wire_wait_seconds = time.perf_counter() - wait_started
         wire_seconds = time.perf_counter() - started
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.transfer_plan.full_pulls:
-            source = self._full_buffers[full.src_name]
-            for copy in full.copies:
-                destination = self._recv_buffers[copy.param_name].as_strided(
+        with telemetry.span("mx.refit.reconstruct"):
+            for full in prepared.transfer_plan.full_pulls:
+                source = self._full_buffers[full.src_name]
+                for copy in full.copies:
+                    destination = self._recv_buffers[copy.param_name].as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        self._recv_buffers[copy.param_name].storage_offset()
+                        + copy.dest_offset,
+                    )
+                    destination.copy_(_replay_ops(source, copy.op_chain))
+            converted = {
+                convert.param_name for convert in prepared.transfer_plan.converts
+            }
+            conversion_copies = {
+                copy.param_name: copy
+                for copy in prepared.capture.copies
+                if copy.param_name in converted
+            }
+            for convert in prepared.transfer_plan.converts:
+                copy = conversion_copies[convert.param_name]
+                target = self._recv_buffers[convert.param_name]
+                destination = target.as_strided(
                     copy.dest_shape,
                     copy.dest_stride,
-                    self._recv_buffers[copy.param_name].storage_offset()
-                    + copy.dest_offset,
+                    target.storage_offset() + copy.dest_offset,
                 )
-                destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.transfer_plan.converts}
-        conversion_copies = {
-            copy.param_name: copy
-            for copy in prepared.capture.copies
-            if copy.param_name in converted
-        }
-        for convert in prepared.transfer_plan.converts:
-            copy = conversion_copies[convert.param_name]
-            target = self._recv_buffers[convert.param_name]
-            destination = target.as_strided(
-                copy.dest_shape,
-                copy.dest_stride,
-                target.storage_offset() + copy.dest_offset,
-            )
-            destination.copy_(self._convert_buffers[convert.param_name])
-        torch.cuda.synchronize(self._device)
+                destination.copy_(self._convert_buffers[convert.param_name])
+            torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
-            self._verify(prepared)
+            if current_refit_timing() is None:
+                with telemetry.span("mx.refit.digest_verification"):
+                    self._verify(prepared)
+            else:
+                with refit_span("receive_sync", duration_key="digest_verification_s"):
+                    self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
         # This is the path the FSDP trainer refits over, and the path the 20x
@@ -1379,6 +1427,7 @@ class _NixlStagedTransfer:
                 "bytes_received": bytes_received,
                 "segments": len(prepared.descriptors),
                 "wire_s": wire_seconds,
+                "wire_host_s": wire_seconds,
                 "wire_wait_s": wire_wait_seconds,
                 "reconstruct_s": reconstruct_seconds,
                 "full_pull_sources": len(prepared.transfer_plan.full_pulls),
@@ -1520,6 +1569,7 @@ class _NixlStagedTransfer:
             "bytes_received": bytes_received,
             "segments": tensor_count,
             "wire_s": round(wire_seconds, 6),
+            "wire_host_s": round(wire_seconds, 6),
             "peer_s": round(time.perf_counter() - started, 6),
         }
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import grpc
+from modelexpress import telemetry
 from modelexpress.refit.timing import refit_span
 from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.types import ManifestMismatchError
@@ -95,6 +96,7 @@ class WeightUpdateSession:
         self._start_lease = start_lease
         self._resolve_replay_chain = resolve_replay_chain
 
+    @telemetry.span("mx.refit.prepare_update")
     def stage(
         self,
         version: WeightVersion,
@@ -146,6 +148,7 @@ class WeightUpdateSession:
             versions,
         )
 
+    @telemetry.span("mx.refit.prepare_candidates")
     def _stage_one(
         self,
         version: WeightVersion,

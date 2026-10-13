@@ -5,12 +5,13 @@
 
 import hashlib
 import logging
+from contextlib import nullcontext
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping
 from time import perf_counter
 
 import grpc
-from modelexpress import envs
+from modelexpress import envs, telemetry
 from modelexpress.refit.reshard.rendezvous import structural_manifest_digest, unwrap_rendezvous_blob
 from modelexpress.refit.timing import add_refit_duration, refit_span
 
@@ -104,10 +105,11 @@ class _ResolutionRound:
             return self.sources[identity]
         started = perf_counter()
         try:
-            source, checksums = self._resolve_source(
-                shard, self._manifest_cache.get(identity),
-                verify=self._verify, counters=self._counters,
-            )
+            with telemetry.span("mx.refit.source_manifest_resolve"):
+                source, checksums = self._resolve_source(
+                    shard, self._manifest_cache.get(identity),
+                    verify=self._verify, counters=self._counters,
+                )
         except BaseException:
             self._failed = True
             raise
@@ -157,13 +159,24 @@ class TrainerSourceResolver(SourceResolver):
         return version.payload_format
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
+        parent = (
+            telemetry.extracted(version.trace_context)
+            if version.trace_context
+            else nullcontext()
+        )
+        with parent:
+            yield from self._candidates(version)
+
+    def _candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         if version.trainer_mesh_id is None:
             raise RuntimeError("trainer publication requires trainer_mesh_id")
-        mesh = self._get_mesh(version)
+        with telemetry.span("mx.refit.trainer_mesh_lookup"):
+            mesh = self._get_mesh(version)
         if mesh is None:
             return
         mesh_workers, expected_slots, mesh_generation = mesh
-        published = self._list_published_shards(version, mesh_workers)
+        with telemetry.span("mx.refit.source_manifest_list"):
+            published = self._list_published_shards(version, mesh_workers)
         if published is None:
             return
 
