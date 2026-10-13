@@ -2345,48 +2345,6 @@ def test_layer_plan_replays_in_model_order_for_shuffled_input(monkeypatch, strea
     assert events == [model[0], model[1]]
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_capture_restores_torchao_reload_state(monkeypatch, fail):
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.zeros(2))
-            self._do_torchao_reload = True
-
-        def load_weights(self, weights):
-            if fail:
-                raise RuntimeError("trace failed")
-            for _name, value in weights:
-                self.weight.weight_loader(self.weight, value)
-
-    def initialize(target):
-        target._original_do_torchao_reload = target._do_torchao_reload
-        target._do_torchao_reload = False
-
-    _install_fake_vllm(monkeypatch, initialize)
-    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
-    layerwise._place_kernel_tensors = lambda *_args: None
-    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
-    weight_utils.default_weight_loader = lambda target, value: target.data.copy_(value)
-    layerwise._get_original_loader = lambda _parameter: (
-        weight_utils.default_weight_loader
-    )
-    monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
-    model = Model()
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
-    if fail:
-        with pytest.raises(RuntimeError, match="trace failed"):
-            installer.capture([("weight", torch.float32, (2,))])
-    else:
-        installer.capture([("weight", torch.float32, (2,))])
-    assert model._do_torchao_reload is True
-
-
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("mutation", ["replace", "remove"])
 @pytest.mark.parametrize("restore", [False, True])
@@ -2449,86 +2407,6 @@ def test_update_boundary_validates_parameterless_owner_aliases(
         with pytest.raises(IncompleteRefit, match="owner 'state_alias'"):
             install()
     assert events == ["mutate", "repair"]
-
-
-def test_staged_quantization_restores_renamed_runtime_slots(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
-    model = nn.Module()
-    model.weight = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
-    model.register_buffer("scale", torch.ones(1))
-    original_weight, original_scale = model.weight, model.scale
-    pointers = (model.weight.data_ptr(), model.scale.data_ptr())
-    events = []
-
-    class Info:
-        loaded_weights = ()
-
-        def __init__(self):
-            self.kernel_tensors = (
-                {"weight": original_weight},
-                {"scale": original_scale},
-            )
-
-        def reset(self):
-            self.kernel_tensors = None
-            events.append("reset")
-
-    def initialize(target):
-        layerwise.LAYERWISE_INFO[target] = Info()
-        del target.weight
-        del target.scale
-        target.weight_packed = nn.Parameter(torch.empty(2, 2, device="meta"))
-        target.weight_scale = nn.Parameter(torch.empty(1, device="meta"))
-
-    _install_fake_vllm(monkeypatch, initialize)
-    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
-    quant_base = sys.modules[
-        "vllm.model_executor.layers.quantization.base_config"
-    ].QuantizeMethodBase
-
-    class Quant(quant_base):
-        def process_weights_after_loading(self, layer):
-            layer.weight = nn.Parameter(layer.weight_packed * layer.weight_scale)
-            layer.register_buffer("scale", layer.weight_scale.detach().clone())
-            del layer.weight_packed
-            del layer.weight_scale
-            events.append("process")
-
-    def restore(layer, info):
-        parameters, buffers = info.kernel_tensors
-        for name, original in (*parameters.items(), *buffers.items()):
-            original.copy_(getattr(layer, name))
-        for name in (*layer._parameters, *layer._buffers):
-            delattr(layer, name)
-        for name, parameter in parameters.items():
-            layer.register_parameter(name, parameter)
-        for name, buffer in buffers.items():
-            layer.register_buffer(name, buffer)
-        events.append("restore")
-
-    layerwise._copy_and_restore_kernel_tensors = restore
-    model.quant_method = Quant()
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=SimpleNamespace(quant_config=object()),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
-    for value in (3.0, 7.0):
-        installer.install_tensors(
-            {
-                "weight_packed": torch.full((2, 2), value),
-                "weight_scale": torch.tensor([2.0]),
-            }
-        )
-        assert set(model._parameters) == {"weight"}
-        assert set(model._buffers) == {"scale"}
-        assert model.weight is original_weight
-        assert model.scale is original_scale
-        assert (model.weight.data_ptr(), model.scale.data_ptr()) == pointers
-        assert torch.equal(model.weight, torch.full((2, 2), value * 2))
-        assert torch.equal(model.scale, torch.tensor([2.0]))
-    assert events == ["process", "restore", "reset"] * 2
 
 
 @pytest.mark.parametrize("streaming", [False, True])

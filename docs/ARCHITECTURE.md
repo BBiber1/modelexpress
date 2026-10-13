@@ -1708,8 +1708,7 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 The generator streams captured source writes through reusable receive arenas in
 loader order, including writes that revisit an earlier owner. Each source write
 must fit one arena; preparation rejects oversized writes before connecting sources.
-One installer uses vLLM's reload lifecycle for supported unquantized and quantized
-models. Online FP8 reloads requiring changes to vLLM internals are unsupported.
+One installer uses vLLM's reload lifecycle for all supported unquantized models.
 
 ```mermaid
 flowchart LR
@@ -1804,8 +1803,8 @@ and resource-safety checks remain in place.
 Alias restoration distinguishes repeated paths to one slot from ties between
 slots. vLLM's recorded parameter metadata separates load-time ties from runtime
 aliases such as WNA16's `w13_weight` and `w2_weight`; native post-processing
-recreates runtime aliases. Quantized full-copy and streaming refits use this same
-fixed-client contract and process completed owners in captured operation order.
+recreates runtime aliases. Supported quantized FullCopy refits retain the same
+fixed-client contract; quantized streaming remains unsupported.
 
 The staging limit bounds registered receive arenas. Replay operations can require
 additional local scratch, reported as `replay_scratch_peak_bytes`. Estimated
