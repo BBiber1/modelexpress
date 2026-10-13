@@ -36,7 +36,8 @@ from modelexpress_rl.train import WeightPayloadFormat
 STAGED_METRICS = {
     "bytes_received": 4_000_000_000,
     "segments": 12,
-    "wire_s": 1.5,
+    "wire_host_s": 1.5,
+    "wire_wait_s": 1.0,
     "reconstruct_s": 0.25,
 }
 
@@ -47,6 +48,15 @@ def test_a_cycle_is_opened_by_default(monkeypatch):
     monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
 
     assert timing.start_cycle(version_id="run.a1:7", rank=0) is not None
+
+
+def test_cycle_uses_global_rank_when_local_rank_is_zero(monkeypatch):
+    monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
+    monkeypatch.setenv("RANK", "8")
+    recorder = timing.start_cycle(version_id="run.a1:7", rank=0)
+
+    assert recorder is not None
+    assert recorder.rank == 8
 
 
 def test_a_cycle_can_be_turned_off(monkeypatch):
@@ -80,6 +90,8 @@ def test_the_wire_and_the_work_after_it_are_charged_apart(monkeypatch):
 
     stages = recorder.as_dict()["stages"]
     assert stages["wire_transfer"]["duration_ms"] == 1500.0
+    assert stages["wire_transfer"]["metadata"]["wire_host_s"] == 1.5
+    assert stages["wire_transfer"]["metadata"]["wire_wait_s"] == 1.0
     assert stages["receive_sync"]["duration_ms"] == 250.0
 
 
@@ -104,7 +116,7 @@ def test_a_peer_pull_reports_a_wire_time_and_no_reconstruction(monkeypatch):
     recorder = timing.start_cycle(version_id="run.a1:7", rank=0)
 
     with timing.active(recorder):
-        _attribute_transfer({"bytes_received": 1, "wire_s": 0.5, "peer_s": 0.6})
+        _attribute_transfer({"bytes_received": 1, "wire_host_s": 0.5, "peer_s": 0.6})
 
     assert recorder.has_measurements("wire_transfer")
     assert not recorder.has_measurements("receive_sync")

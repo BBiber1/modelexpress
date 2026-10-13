@@ -590,6 +590,15 @@ sum their actual sizes. Existing receiver dtype conversion remains available,
 but casting a rounded BF16 value back to FP32 cannot recover source precision.
 Verify installed parameters and generation separately from transfer completion.
 
+### Refit OpenTelemetry export
+
+Install the Python client's `otel` extra to enable optional refit telemetry. Set
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to OTLP HTTP
+signal URLs in each refit process. The server uses the traces endpoint for refit gRPC spans.
+Refit calls propagate W3C trace context, and framework adapters can use
+`modelexpress_rl.RefitTrace` to retain trainer and generator groups across coordination gaps.
+Structured `MX_REFIT_TIMING` records and the server's Prometheus endpoint remain available.
+
 ### Choosing trainer staging for synchronous refits
 
 Choose an existing `TrainerStagingMode` explicitly for the integration:
@@ -1935,3 +1944,5 @@ run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunni
 the whole GitHub workflow uses a new attempt and does not recover an older retained
 namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.
+
+Refit telemetry follows instrumentation source `f4f516809e8e2fab66bf71661dfcbf00939aa3fe`, adapted to each PR’s existing APIs. Bounded-plan compile spans carry plan metrics; digest verification emits a span even without a timing recorder.

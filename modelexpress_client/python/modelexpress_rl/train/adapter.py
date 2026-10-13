@@ -114,6 +114,7 @@ class StagedWeightVersionShardData:
     manifest: WeightVersionShardManifest
     publish_ready: CompletionFence
     buffer_owner: object | None = None
+    publish_ready_completed: bool = False
 
 
 class TrainerEngineAdapter(ABC):

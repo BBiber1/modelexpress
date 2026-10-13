@@ -103,10 +103,11 @@ class TrainerSourceResolver(SourceResolver):
         if version.trainer_mesh_id is None:
             raise RuntimeError("trainer publication requires trainer_mesh_id")
         try:
-            mesh_response = self._service().GetTrainerMesh(
-                refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
-                timeout=self._rpc_timeout_seconds,
-            )
+            with refit_span("source_preparation", duration_key="mesh_lookup_s"):
+                mesh_response = self._service().GetTrainerMesh(
+                    refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
+                    timeout=self._rpc_timeout_seconds,
+                )
         except grpc.RpcError as error:
             logger.warning(
                 "trainer mesh lookup failed for version %s: %s",

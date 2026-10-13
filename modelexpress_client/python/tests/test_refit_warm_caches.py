@@ -3,7 +3,6 @@
 
 import json
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
@@ -98,7 +97,7 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
     )
     for version in range(3):
         source.add_(1)
-        transfer._complete_stage(prepared, [], time.perf_counter())
+        transfer._complete_stage(prepared, [], 0.0)
         assert torch.equal(target[:, offset : offset + 4], source.to(torch.bfloat16))
         assert torch.all(arena[:8] == -17) and torch.all(arena[-8:] == -17)
         if padded:
@@ -254,6 +253,106 @@ def test_bounded_plan_cache_snapshots_callback_inputs_and_revalidates(
     assert first.module_batches[0].layouts[0]["layer.weight"][0] == (4,)
     assert cache.compile(**args, metrics=metrics) is not first
     assert metrics["plan_cache_misses"] == 1
+
+
+
+def test_bounded_plan_compile_span_is_rank_level_and_records_outcome(monkeypatch):
+    class RecordingSpan:
+        def __init__(self, name):
+            self.name = name
+            self.attributes = {}
+            self.error = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, _exc, _traceback):
+            self.error = exc_type is not None
+            return False
+
+        def is_recording(self):
+            return True
+
+        def set_attributes(self, attributes):
+            self.attributes.update(attributes)
+
+    spans = []
+
+    def record_span(name, *_args, **_kwargs):
+        span = RecordingSpan(name)
+        spans.append(span)
+        return span
+
+    monkeypatch.setattr(transfer_module.telemetry, "span", record_span)
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "0")
+    args = _bounded_cache_inputs()
+    args["capture"] = replace(args["capture"], copies=(
+        replace(args["capture"].copies[0], param_name="layer1.weight"),
+        replace(args["capture"].copies[0], param_name="layer2.weight"),
+    ))
+    args["parameter_layout"] = {
+        "layer1.weight": ((4,), torch.float32),
+        "layer2.weight": ((4,), torch.float32),
+    }
+    cache = _BoundedPlanCache()
+    compiled = cache.compile(
+        **args,
+        metrics={
+            "source_cache_enabled": 0,
+            "source_cache_hits": 0,
+            "source_cache_misses": 1,
+        },
+    )
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 1
+    assert bounded_spans[0].attributes["owner_plan_builds"] == 2
+    assert bounded_spans[0].attributes["module_batches"] == 2
+    assert bounded_spans[0].attributes["plan_cache.misses"] == 1
+    assert bounded_spans[0].attributes["source_cache.enabled"] is False
+    assert bounded_spans[0].attributes["source_cache.misses"] == 1
+
+    cache.compile(
+        **args,
+        metrics={
+            "source_cache_enabled": 1,
+            "source_cache_hits": 1,
+            "source_cache_misses": 0,
+        },
+    )
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 2
+    assert bounded_spans[1].attributes["plan_cache.hits"] == 1
+    assert bounded_spans[1].attributes["source_cache.enabled"] is True
+    assert bounded_spans[1].attributes["source_cache.hits"] == 1
+    invalid = {**args, "parameter_layout": {**args["parameter_layout"], "missing": ((4,), torch.float32)}}
+    with pytest.raises(IncompleteRefit, match="cover every"):
+        cache.compile(**invalid, metrics={})
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 3
+    assert bounded_spans[-1].error
+
+    args["capture"] = replace(args["capture"], copies=(args["capture"].copies[0],))
+    args["parameter_layout"] = {"layer1.weight": ((4,), torch.float32)}
+    single = _BoundedPlanCache().compile(**args, metrics={})
+    bounded_spans = [
+        span for span in spans if span.name == "mx.refit.bounded_plan_compile"
+    ]
+    assert len(bounded_spans) == 4
+    assert (
+        len(
+            single.module_batches
+            if hasattr(single, "module_batches")
+            else single.modules
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize("concurrent", [False, True])

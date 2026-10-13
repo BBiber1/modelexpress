@@ -257,7 +257,7 @@ def test_bounded_install_reports_transfer_and_apply_without_install_only_metric(
     transfer_metrics = {}
 
     def batches():
-        transfer_metrics.update(wire_s=0.25, bytes_received=16.0)
+        transfer_metrics.update(wire_host_s=0.25, bytes_received=16.0)
         yield {"weight": values}
 
     source = PreparedStreamingTensors(batches, frozenset({"weight"}), transfer_metrics)
@@ -274,7 +274,7 @@ def test_bounded_install_reports_transfer_and_apply_without_install_only_metric(
     metrics = installer.install(prepared)
 
     assert torch.equal(model.weight, values)
-    assert metrics["wire_s"] == 0.25
+    assert metrics["wire_host_s"] == 0.25
     assert metrics["bytes_received"] == 16.0
     assert metrics["streaming_apply_s"] >= 0
     assert "perf/mx_receive_install_time" not in metrics
