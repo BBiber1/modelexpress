@@ -865,6 +865,7 @@ class _NixlStagedTransfer:
         resolved: _ResolvedSources,
         required_metadata: dict[str, bytes],
         *,
+        source_binding: _SourceBinding,
         host_staging: bool = False,
         recreate_workspace: bool = False,
     ) -> NixlReshardTransport:
@@ -888,6 +889,7 @@ class _NixlStagedTransfer:
             timeout_seconds=self._timeout,
             local_mem_type=NIXL_DRAM_MEM_TYPE if host_staging else NIXL_VRAM_MEM_TYPE,
             session_to_memory=resolved.session_to_memory,
+            source_slots={agent: slot for slot, agent in source_binding.agents_by_slot.items()},
         )
 
     @contextmanager
@@ -1069,6 +1071,7 @@ class _NixlStagedTransfer:
         transport = self._connect_sources(
             resolved,
             required_metadata,
+            source_binding=source_binding,
             host_staging=(
                 streaming is not None and streaming.staging_device == "cpu"
             ),

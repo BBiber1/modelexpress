@@ -105,6 +105,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
 
     class Transport:
         def __init__(self, manager, agents, devices, **kwargs):
+            self.source_slots = kwargs["source_slots"]
             self.posts = []
             self.posted = []
             self.awaited = []

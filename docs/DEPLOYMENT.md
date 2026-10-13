@@ -1967,6 +1967,10 @@ agent as `nixl.remote_agent`; the enclosing generator span identifies the
 receiver. `mx.refit.nixl_batch` also carries `nixl.remote_agent` when every
 request has the same peer. Mixed-peer batches omit that field; use their
 request spans to inspect source distribution. Agent IDs are not metric labels.
+Trainer-source request spans also carry `nixl.logical_shard_id`, the logical
+source slot served by the selected replica. Unlike the agent ID, this identity
+is preserved across replica rebinding. Batches carry it only when every request
+has the same known logical shard ID; paths without logical shard metadata omit it.
 Native NIXL telemetry is collected without setting NIXL exporter variables and
 is exported through the configured OTLP endpoints. Missing native samples are
 reported as incomplete telemetry and do not fail transfers.

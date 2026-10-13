@@ -550,6 +550,7 @@ class _NixlBatch:
 
             self._parent_context = context.get_current()
             self._attributes = dict(_refit_attributes.get())
+            self._attributes.pop("nixl.logical_shard_id", None)
         self._span: Any | None = None
         self._requests: dict[Any, dict[str, Any]] = {}
         self._posting = False
@@ -591,6 +592,7 @@ class _NixlBatch:
         self._requests[request] = {
             "start_ns": time.time_ns(),
             "peer": peer,
+            "logical_shard_id": _refit_attributes.get().get("nixl.logical_shard_id"),
             "end_ns": None,
             "complete": False,
             "native": None,
@@ -675,6 +677,10 @@ class _NixlBatch:
                         "nixl.telemetry.available": item["native"] is not None,
                     },
                 )
+                if item["logical_shard_id"] is not None:
+                    request.set_attribute(
+                        "nixl.logical_shard_id", item["logical_shard_id"]
+                    )
                 if item["native"] is not None:
                     request.set_attributes(
                         {"nixl." + k: v for k, v in item["native"].items()}
@@ -704,6 +710,9 @@ class _NixlBatch:
         peers = {r["peer"] for r in self._requests.values()}
         if len(peers) == 1:
             attrs["nixl.remote_agent"] = next(iter(peers))
+        logical_ids = {r["logical_shard_id"] for r in self._requests.values()}
+        if len(logical_ids) == 1 and None not in logical_ids:
+            attrs["nixl.logical_shard_id"] = next(iter(logical_ids))
         attrs.update(
             {
                 "nixl.request_count": len(self._requests),
