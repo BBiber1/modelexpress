@@ -791,6 +791,7 @@ class TestWaitForXfer:
     @staticmethod
     def _manager(statuses):
         manager = object.__new__(NixlTransferManager)
+        manager._transfer_traces = {}
         manager._agent = MagicMock()
         manager._agent.check_xfer_state.side_effect = statuses
         return manager
