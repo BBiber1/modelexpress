@@ -23,7 +23,7 @@ from typing import Any, NamedTuple, cast
 
 import torch
 from modelexpress import envs, p2p_pb2, telemetry
-from modelexpress_rl.refit.timing import current_refit_timing, refit_span
+from modelexpress.refit.timing import current_refit_timing, refit_span
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,

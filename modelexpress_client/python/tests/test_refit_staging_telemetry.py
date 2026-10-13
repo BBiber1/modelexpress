@@ -11,7 +11,7 @@ import pytest
 from opentelemetry import trace
 
 from modelexpress import telemetry
-from modelexpress_rl.refit.timing import use_refit_timing
+from modelexpress.refit.timing import use_refit_timing
 from modelexpress_rl import refit_pb2
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.plan import (
@@ -90,7 +90,7 @@ def test_streaming_prepare_exports_cache_counters_on_existing_outer_span(recordi
         def iter_bounded(self, _prepared, _metrics):
             return iter(())
 
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=lambda manifest, *, trainer_mesh: None)
     source = ResolvedTrainerSource(
         TrainerSourceSnapshot(
             mesh_id="mesh",
@@ -397,7 +397,7 @@ def test_real_checksum_verification_exports_success_and_error_timing(
 ) -> None:
     from types import MappingProxyType
 
-    from modelexpress_rl.refit.timing import RefitTimingRecorder
+    from modelexpress.refit.timing import RefitTimingRecorder
 
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     valid = harness.prepare()
