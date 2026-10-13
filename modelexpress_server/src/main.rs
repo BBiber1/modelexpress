@@ -7,9 +7,12 @@ use modelexpress_server::{
     config::{ServerArgs, ServerConfig},
     run_server,
 };
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -37,10 +40,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize tracing with the configured log level
     let log_level = config.log_level();
 
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_max_level(log_level)
-        .finish();
+    let trace_provider = match std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
+        Ok(endpoint) => {
+            // OTLP's HTTP client uses rustls before model providers initialize it.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let exporter = SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint)
+                .build()?;
+            Some(
+                SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(
+                        Resource::builder()
+                            .with_service_name("modelexpress-server")
+                            .build(),
+                    )
+                    .build(),
+            )
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let otel_layer = trace_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer().with_tracer(provider.tracer("modelexpress-server"))
+    });
+    let filter = refit_log_filter(
+        log_level,
+        trace_provider.is_some(),
+        &std::env::var("RUST_LOG").unwrap_or_default(),
+    );
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer);
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Shut down gracefully on CTRL+C (SIGINT) or SIGTERM. SIGTERM is what
@@ -59,5 +92,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let backend = BackendConfig::from_env()?;
 
-    run_server(config, backend, shutdown).await
+    let result = run_server(config, backend, shutdown).await;
+    if let Some(provider) = trace_provider
+        && let Err(error) = provider.shutdown()
+    {
+        if result.is_ok() {
+            return Err(error.into());
+        }
+        error!("Failed to shut down telemetry: {error}");
+    }
+    result
+}
+
+fn refit_log_filter(
+    log_level: tracing::Level,
+    telemetry_enabled: bool,
+    overrides: &str,
+) -> EnvFilter {
+    let mut directives = log_level.to_string();
+    if telemetry_enabled {
+        directives.push_str(
+            ",modelexpress_server::telemetry=info,modelexpress_server::refit::service=info",
+        );
+    }
+    directives.push(',');
+    directives.push_str(overrides);
+    EnvFilter::new(directives)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_log_directives_override_server_and_telemetry_defaults() {
+        for (telemetry, overrides, general_debug, telemetry_info, service_info) in [
+            (false, "", false, false, false),
+            (false, "debug", true, true, true),
+            (true, "", false, true, true),
+            (
+                true,
+                "debug,modelexpress_server::telemetry=off,modelexpress_server::refit::service=error",
+                true,
+                false,
+                false,
+            ),
+        ] {
+            let subscriber = tracing_subscriber::registry().with(refit_log_filter(
+                tracing::Level::WARN,
+                telemetry,
+                overrides,
+            ));
+            tracing::subscriber::with_default(subscriber, || {
+                assert_eq!(
+                    tracing::enabled!(target: "modelexpress_server::server", tracing::Level::DEBUG),
+                    general_debug
+                );
+                assert_eq!(
+                    tracing::enabled!(target: "modelexpress_server::telemetry", tracing::Level::INFO),
+                    telemetry_info
+                );
+                assert_eq!(
+                    tracing::enabled!(target: "modelexpress_server::refit::service", tracing::Level::INFO),
+                    service_info
+                );
+            });
+        }
+    }
 }
