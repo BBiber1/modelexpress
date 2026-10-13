@@ -320,7 +320,6 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
     def update(source):
         prepared = method.prepare(version=None, source=ResolvedTrainerSource(source))
         try:
-            assert harness.transports[-1].source_slots == {source.shards[0].worker_id: "slot"}
             if harness.streaming:
                 installed = {name: value.clone() for batch in prepared.batches()
                              for name, value in batch.items()}

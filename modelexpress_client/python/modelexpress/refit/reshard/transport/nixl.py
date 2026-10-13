@@ -60,7 +60,6 @@ class NixlReshardTransport:
         session_to_memory: per-source memory kinds from the manifest; host
             sources require an explicit local memory type.
         timeout_seconds: per-batch READ timeout.
-        source_slots: remote agent to logical source shard ID, when known.
     """
 
     def __init__(
@@ -72,7 +71,6 @@ class NixlReshardTransport:
         timeout_seconds: float | None = None,
         local_mem_type: str | None = None,
         session_to_memory: dict | None = None,
-        source_slots: dict[str, str] | None = None,
     ) -> None:
         self._manager = manager
         self._session_to_agent = session_to_agent
@@ -80,7 +78,6 @@ class NixlReshardTransport:
         self._mem_type = mem_type
         self._local_mem_type = local_mem_type
         self._session_to_memory = dict(session_to_memory or {})
-        self._source_slots = dict(source_slots or {})
         for kind in self._session_to_memory.values():
             if kind not in NIXL_MEM_TYPES:
                 raise ValueError(f"unsupported source memory type {kind!r}")
@@ -113,7 +110,6 @@ class NixlReshardTransport:
                 self._agent_for(session),
                 self._ranges_for(session, group),
                 self._session_to_memory.get(session, self._mem_type),
-                self._source_slots.get(self._agent_for(session)),
             )
             for session, group in by_session.items()
         ]
@@ -126,37 +122,31 @@ class NixlReshardTransport:
         )
         with posting:
             if _serial_reads_enabled():
-                for agent, ranges, memory_type, slot in batches:
-                    with telemetry.refit_attributes(
-                        {"nixl.logical_shard_id": slot} if slot is not None else {}
-                    ):
-                        total_bytes, num_reads, _duration = (
-                            self._manager.execute_read_batch(
-                                remote_agent_name=agent,
-                                ranges=ranges,
-                                mem_type=memory_type,
-                                timeout_seconds=self._timeout,
-                                local_mem_type=self._local_mem_type,
-                            )
+                for agent, ranges, memory_type in batches:
+                    total_bytes, num_reads, _duration = (
+                        self._manager.execute_read_batch(
+                            remote_agent_name=agent,
+                            ranges=ranges,
+                            mem_type=memory_type,
+                            timeout_seconds=self._timeout,
+                            local_mem_type=self._local_mem_type,
                         )
+                    )
                     self.bytes_moved += total_bytes
                     self.reads_issued += num_reads
                 return []
 
             posted: list = []
             try:
-                for agent, ranges, memory_type, slot in batches:
-                    with telemetry.refit_attributes(
-                        {"nixl.logical_shard_id": slot} if slot is not None else {}
-                    ):
-                        posted.append(
-                            self._manager.post_read_batch(
-                                remote_agent_name=agent,
-                                ranges=ranges,
-                                mem_type=memory_type,
-                                local_mem_type=self._local_mem_type,
-                            )
+                for agent, ranges, memory_type in batches:
+                    posted.append(
+                        self._manager.post_read_batch(
+                            remote_agent_name=agent,
+                            ranges=ranges,
+                            mem_type=memory_type,
+                            local_mem_type=self._local_mem_type,
                         )
+                    )
             except Exception:
                 # Batches posted before the failure are in flight and still own
                 # handles. Drain them so nothing leaks, but never let that cleanup

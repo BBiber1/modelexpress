@@ -75,7 +75,12 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
-        for name in ("plan_cache_hits", "plan_cache_misses", "source_cache_hits", "source_cache_misses"):
+        for name in (
+            "plan_cache_hits", "plan_cache_misses", "source_cache_hits", "source_cache_misses",
+            "physical_binding_cache_hits", "physical_binding_cache_misses",
+            "physical_replica_cache_hits", "physical_replica_cache_misses",
+            "physical_replica_rebind_attempts",
+        ):
             if name in prepared.metrics:
                 telemetry.attribute(name, prepared.metrics[name])
         if is_streaming:

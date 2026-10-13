@@ -11,15 +11,18 @@ how an inference engine captures its load layout or installs received weights.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import Any, NamedTuple, cast
+from types import MappingProxyType
 
 import torch
 from modelexpress import envs, p2p_pb2, telemetry
@@ -139,15 +142,24 @@ class _DescriptorCache:
             ), tuple(indices))
         return cls(groups)
 
-    def bind(self, workers: Mapping[str, str], bind_group: Callable) -> tuple[tuple[ReadDescriptor, ...], bool]:
+    def bind(
+        self, workers: Mapping[str, str], bind_group: Callable,
+        group_hits: dict[str, bool] | None = None,
+    ) -> tuple[tuple[ReadDescriptor, ...], bool]:
         selection = tuple((slot, workers[slot]) for slot in self.groups)
         if selection == self.last_selection:
+            if group_hits is not None:
+                for slot, _worker in selection:
+                    group_hits.setdefault(slot, True)
             return self.last_descriptors, True
         descriptors = [None] * sum(len(indices) for _, indices in self.groups.values())
         reused = True
         for identity in selection:
             plan, indices = self.groups[identity[0]]
-            if identity not in self.replicas:
+            hit = identity in self.replicas
+            if group_hits is not None:
+                group_hits[identity[0]] = group_hits.get(identity[0], True) and hit
+            if not hit:
                 self.replicas[identity] = tuple(bind_group(plan))
                 reused = False
             for index, descriptor in zip(indices, self.replicas[identity], strict=True):
@@ -166,6 +178,11 @@ class _WeightUpdatePlan:
     source_binding: _SourceBinding | None
     transport: NixlReshardTransport | None
     descriptor_caches: tuple[_DescriptorCache, ...] | None = None
+    logical_plan_id: str = ""
+    logical_slots: frozenset[str] = frozenset()
+    logical_statistics: Mapping[str, int] = field(default_factory=dict)
+    physical_binding_id: str = ""
+    telemetry_references: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -686,13 +703,11 @@ class _NixlStagedTransfer:
             source_cache_enabled=1,
             source_cache_hits=0,
             source_cache_misses=0,
-            source_cache_lookup_s=0.0,
             source_decode_s=0.0,
             source_merge_s=0.0,
             source_build_s=0.0,
             source_manifest_bytes=sum(len(blob) for blob in manifests),
         )
-        started = time.perf_counter()
         metrics["source_cache_misses"] = 1
         return _resolve_sources(manifests, metrics=metrics)
 
@@ -865,7 +880,6 @@ class _NixlStagedTransfer:
         resolved: _ResolvedSources,
         required_metadata: dict[str, bytes],
         *,
-        source_binding: _SourceBinding,
         host_staging: bool = False,
         recreate_workspace: bool = False,
     ) -> NixlReshardTransport:
@@ -889,7 +903,6 @@ class _NixlStagedTransfer:
             timeout_seconds=self._timeout,
             local_mem_type=NIXL_DRAM_MEM_TYPE if host_staging else NIXL_VRAM_MEM_TYPE,
             session_to_memory=resolved.session_to_memory,
-            source_slots={agent: slot for slot, agent in source_binding.agents_by_slot.items()},
         )
 
     @contextmanager
@@ -913,6 +926,35 @@ class _NixlStagedTransfer:
         finally:
             self._native_setup_started = False
 
+    @staticmethod
+    def _logical_metadata(trainer, plan, started):
+        slots = frozenset(
+            plan.source_buffers[read.source_buffer].source_slot_id
+            for read in plan._all_segments()
+        )
+        statistics = MappingProxyType({
+            "exact_descriptors": plan.exact_descriptor_count,
+            "planned_descriptors": plan.descriptor_count(),
+            "descriptor_savings": plan.descriptor_savings(),
+            "extra_wire_bytes": plan.extra_wire_bytes(),
+        })
+        plan_id = uuid.uuid4().hex
+        if telemetry.recording():
+            replicas = {group.source_slot_id: len(group.replicas)
+                        for group in trainer.replica_groups}
+            telemetry.completed_span("mx.refit.logical_plan_create", started, time.time_ns(), {
+                "mx.logical_plan.id": plan_id,
+                "mx.logical_plan.mesh_id": trainer.mesh_id,
+                "mx.logical_plan.mesh_generation": trainer.mesh_generation,
+                "mx.logical_plan.groups": json.dumps([
+                    {"logical_shard_id": slot, "replica_count": replicas.get(slot)}
+                    for slot in sorted(slots)
+                ]),
+                "mx.measurement.logical_group_count": len(slots),
+                "mx.cache.schema_version": 2,
+            })
+        return plan_id, slots, statistics
+
     def prepare(
         self,
         *,
@@ -933,11 +975,14 @@ class _NixlStagedTransfer:
             reusable = previous is not None and self._can_reuse_binding(previous, trainer_snapshot)
             metrics.update(
                 plan_cache_enabled=1,
-                plan_cache_hits=int(reusable),
-                plan_cache_misses=int(not reusable),
-                plan_cache_lookup_s=time.perf_counter() - lookup_started,
-                plan_cache_validate_s=0.0,
+                plan_cache_hits=int(previous is not None),
+                plan_cache_misses=int(previous is None),
+                physical_binding_cache_hits=int(reusable),
+                physical_binding_cache_misses=int(not reusable),
+                physical_binding_cache_lookup_s=time.perf_counter() - lookup_started,
+                physical_replica_rebind_attempts=int(not reusable),
             )
+            creation_started = time.time_ns() if previous is None else None
             if previous is not None:
                 if reusable:
                     trainer = previous.trainer_source_snapshot
@@ -980,60 +1025,86 @@ class _NixlStagedTransfer:
                 if isinstance(transfer_plan, _StreamingSchedule)
                 else transfer_plan
             )
-            metrics.update(
-                exact_descriptors=plan.exact_descriptor_count,
-                planned_descriptors=plan.descriptor_count(),
-                descriptor_savings=plan.descriptor_savings(),
-                extra_wire_bytes=plan.extra_wire_bytes(),
-            )
+            if previous is None:
+                plan_id, logical_slots, statistics = self._logical_metadata(
+                    trainer, plan, creation_started
+                )
+            else:
+                plan_id, logical_slots, statistics = (
+                    previous.logical_plan_id, previous.logical_slots, previous.logical_statistics
+                )
+            metrics.update(statistics)
             if not reusable:
                 trainer = self._retain_needed_sources(trainer, plan)
             if prepare_groups is not None:
-                prepare_groups(frozenset(shard.source_slot_id for shard in trainer.shards))
-            source_binding = (
-                previous.source_binding if reusable else self._source_binding(trainer)
-            )
+                prepare_groups(logical_slots)
+            prepare = self._prepare_full_copy if streaming is None else self._prepare_streaming
             if reusable:
-                transport = previous.transport
+                cached = previous
                 if streaming is not None:
                     metrics["connection_registration_s"] = 0.0
-            else:
-                transport = self._prepare_transport(
-                    trainer, transfer_plan, source_binding, metrics
+                metrics.update(
+                    physical_replica_cache_hits=len(logical_slots),
+                    physical_replica_cache_misses=0,
                 )
+                prepared = prepare(cached, metrics, checksums, True)
+            else:
+                group_hits = {}
+                with telemetry.span("mx.refit.physical_replica_rebinding") as span:
+                    try:
+                        source_binding = self._source_binding(trainer)
+                        transport = self._prepare_transport(
+                            trainer, transfer_plan, source_binding, metrics
+                        )
+                        retained = self._weight_update_plan
+                        cached = _WeightUpdatePlan(
+                            trainer, capture, parameter_layout, transfer_plan,
+                            source_binding, transport,
+                            descriptor_caches=None if retained is None else retained.descriptor_caches,
+                            logical_plan_id=plan_id,
+                            logical_slots=logical_slots,
+                            logical_statistics=statistics,
+                            physical_binding_id=uuid.uuid4().hex,
+                        )
+                        if cached.descriptor_caches is None:
+                            plans = (
+                                (transfer_plan,) if streaming is None
+                                else tuple(batch.transfer_plan for batch in transfer_plan.batches)
+                            )
+                            cached = replace(cached, descriptor_caches=tuple(
+                                _DescriptorCache.for_plan(item) for item in plans
+                            ))
+                        prepared = prepare(cached, metrics, checksums, False, group_hits)
+                        if span.is_recording():
+                            span.set_attributes({
+                                "mx.logical_plan.id": plan_id,
+                                "mx.physical_binding.id": cached.physical_binding_id,
+                                "mx.physical_binding.groups": json.dumps([
+                                    {"logical_shard_id": slot, "worker_id": shard.worker_id,
+                                     "remote_agent": source_binding.agents_by_slot[slot]}
+                                    for shard in trainer.shards
+                                    if (slot := shard.source_slot_id) in logical_slots
+                                ]),
+                            })
+                    finally:
+                        metrics.update(
+                            physical_replica_cache_hits=sum(group_hits.values()),
+                            physical_replica_cache_misses=len(group_hits) - sum(group_hits.values()),
+                        )
+                        if span.is_recording():
+                            span.set_attributes({"mx.measurement." + key: metrics[key] for key in (
+                                "physical_replica_cache_hits", "physical_replica_cache_misses",
+                                "physical_replica_rebind_attempts",
+                            )})
+                cached = replace(cached, telemetry_references=MappingProxyType({
+                    "mx.logical_plan.id": plan_id,
+                    "mx.physical_binding.id": cached.physical_binding_id,
+                    "mx.cache.schema_version": 2,
+                }))
+            if telemetry.recording():
+                from opentelemetry import trace
 
-            retained = self._weight_update_plan
-            cached = previous if reusable else _WeightUpdatePlan(
-                trainer,
-                capture,
-                parameter_layout,
-                transfer_plan,
-                source_binding,
-                transport,
-                descriptor_caches=None if retained is None else retained.descriptor_caches,
-            )
-            if cached.descriptor_caches is None:
-                plans = (
-                    (transfer_plan,) if streaming is None
-                    else tuple(batch.transfer_plan for batch in transfer_plan.batches)
-                )
-                cached = replace(cached, descriptor_caches=tuple(
-                    _DescriptorCache.for_plan(plan) for plan in plans
-                ))
-            if streaming is None:
-                prepared = self._prepare_full_copy(
-                    cached,
-                    metrics,
-                    checksums,
-                    reusable,
-                )
-            else:
-                prepared = self._prepare_streaming(
-                    cached,
-                    metrics,
-                    checksums,
-                    reusable,
-                )
+                trace.get_current_span().set_attributes(cached.telemetry_references)
             self._weight_update_plan = cached
             self._active = prepared
             return prepared
@@ -1071,7 +1142,6 @@ class _NixlStagedTransfer:
         transport = self._connect_sources(
             resolved,
             required_metadata,
-            source_binding=source_binding,
             host_staging=(
                 streaming is not None and streaming.staging_device == "cpu"
             ),
@@ -1120,19 +1190,24 @@ class _NixlStagedTransfer:
         metrics: dict[str, float],
         checksums: Mapping[ShardChecksumKey, str],
         reusable: bool,
+        group_hits: dict[str, bool] | None = None,
     ) -> _PreparedNixlTransfer:
         plan = cast(LogicalTransferPlan, cached.transfer_plan)
         capture = cached.layout_capture_snapshot
         resolved = cached.trainer_source_snapshot.resolved_metadata
         source_binding = cast(_SourceBinding, cached.source_binding)
-        if not reusable:
+        if reusable:
+            descriptors, reused = cached.descriptor_caches[0].last_descriptors, True
+        else:
             self._ensure_workspace(plan, cached.parameter_layout)
-        workers = {shard.source_slot_id: shard.worker_id
-                   for shard in cached.trainer_source_snapshot.shards}
-        descriptors, reused = cached.descriptor_caches[0].bind(
-            workers, lambda group: self._descriptors(group, source_binding=source_binding)
-        )
+            workers = {shard.source_slot_id: shard.worker_id
+                       for shard in cached.trainer_source_snapshot.shards}
+            descriptors, reused = cached.descriptor_caches[0].bind(
+                workers, lambda group: self._descriptors(group, source_binding=source_binding),
+                group_hits,
+            )
         metrics["descriptor_builds"] = int(not reused)
+        metrics["descriptor_binding_reused"] = int(reused)
         return _PreparedNixlTransfer(
             transfer_plan=plan,
             capture=capture,
@@ -1155,11 +1230,14 @@ class _NixlStagedTransfer:
         metrics: dict[str, float],
         checksums: Mapping[ShardChecksumKey, str],
         reusable: bool,
+        group_hits: dict[str, bool] | None = None,
     ) -> _PreparedBoundedTransfer:
         compiled = cast(_StreamingSchedule, cached.transfer_plan)
         source_binding = cast(_SourceBinding, cached.source_binding)
-        workers = {shard.source_slot_id: shard.worker_id
-                   for shard in cached.trainer_source_snapshot.shards}
+        workers = None if reusable else {
+            shard.source_slot_id: shard.worker_id
+            for shard in cached.trainer_source_snapshot.shards
+        }
         descriptors = []
         reused = []
         for index, batch in enumerate(compiled.batches):
@@ -1174,6 +1252,7 @@ class _NixlStagedTransfer:
                     workers, lambda group: self._descriptors(
                         group, recv, full, convert, source_binding=source_binding
                     ),
+                    group_hits,
                 )
             descriptors.append(reads)
             reused.append(hit)

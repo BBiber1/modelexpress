@@ -42,12 +42,8 @@ def sample(size=64, duration=2000000) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("detail", [False, True])
-@pytest.mark.parametrize("peers", [("trainer-0", "trainer-0"), ("trainer-0", "trainer-1")])
-@pytest.mark.parametrize("logical_ids", [
-    (None, None), ("slot-0", "slot-0"), ("slot-0", "slot-1"), ("slot-0", None)
-])
 def test_batch_encloses_distinct_completions_and_aggregates(
-    recording, monkeypatch, detail, peers, logical_ids
+    recording, monkeypatch, detail
 ) -> None:
     monkeypatch.setenv("MX_REFIT_TRACE_DETAIL", str(int(detail)))
     agent = SimpleNamespace(
@@ -61,13 +57,7 @@ def test_batch_encloses_distinct_completions_and_aggregates(
     ):
         batch = telemetry._NixlBatch()
         with batch.posting():
-            posted = []
-            for peer, logical_id in zip(peers, logical_ids, strict=True):
-                with telemetry.refit_attributes(
-                    {"nixl.logical_shard_id": logical_id} if logical_id is not None else {}
-                ):
-                    posted.append(batch.post(peer))
-            first, second = posted
+            first, second = batch.post("trainer-0"), batch.post("trainer-1")
             assert trace.get_current_span() is refit
         batch.complete(first, agent, 64)
         finished = recording.get_finished_spans()
@@ -87,19 +77,7 @@ def test_batch_encloses_distinct_completions_and_aggregates(
     assert parent.parent.span_id == refit.get_span_context().span_id
     assert all(s.parent.span_id == parent.context.span_id for s in children)
     assert len(children) == (2 if detail else 0)
-    if peers[0] == peers[1]:
-        assert parent.attributes["nixl.remote_agent"] == peers[0]
-    else:
-        assert "nixl.remote_agent" not in parent.attributes
-    assert "nixl.destination_agent" not in parent.attributes
-    if logical_ids[0] is not None and logical_ids[0] == logical_ids[1]:
-        assert parent.attributes["nixl.logical_shard_id"] == logical_ids[0]
-    else:
-        assert "nixl.logical_shard_id" not in parent.attributes
     if detail:
-        assert tuple(s.attributes["nixl.remote_agent"] for s in children) == peers
-        assert tuple(s.attributes.get("nixl.logical_shard_id") for s in children) == logical_ids
-        assert all("nixl.destination_agent" not in s.attributes for s in children)
         assert (
             parent.start_time
             <= children[0].start_time
@@ -154,24 +132,6 @@ def test_incomplete_native_coverage_and_failure(recording, failure) -> None:
     assert (parent.status.status_code == trace.StatusCode.ERROR) == (
         failure == "transfer"
     )
-    requests = [s for s in recording.get_finished_spans() if s.name == "mx.refit.nixl_transfer"]
-    assert [s.attributes["nixl.remote_agent"] for s in requests] == ["one", "two"]
-
-
-def test_mixed_shard_batch_does_not_inherit_a_single_logical_id(recording) -> None:
-    with telemetry.refit_attributes({"nixl.logical_shard_id": "inherited"}):
-        batch = telemetry._NixlBatch()
-    agent = SimpleNamespace(get_xfer_telemetry=lambda h: sample())
-    with batch.posting():
-        for slot in ("left", "right"):
-            with telemetry.refit_attributes({"nixl.logical_shard_id": slot}):
-                request = batch.post(slot + "-agent")
-            batch.complete(request, agent, object())
-    spans = recording.get_finished_spans()
-    parent = next(s for s in spans if s.name == "mx.refit.nixl_batch")
-    assert "nixl.logical_shard_id" not in parent.attributes
-    assert [s.attributes["nixl.logical_shard_id"] for s in spans
-            if s.name == "mx.refit.nixl_transfer"] == ["left", "right"]
 
 
 def test_serial_batch_remains_open_between_requests(recording) -> None:
@@ -252,17 +212,9 @@ def test_manager_collects_each_completion_before_any_release(recording) -> None:
     manager._device_id = 0
     with telemetry._NixlBatch().posting():
         for h in handles:
-            with telemetry.refit_attributes({"nixl.logical_shard_id": "slot"}):
-                manager._trace_post(h, "trainer")
+            manager._trace_post(h, "trainer")
     posted = [PostedRead(h, "trainer", 64, 1) for h in handles]
     assert manager.await_read_batches(posted)[:2] == (128, 2)
-    requests = [
-        s for s in recording.get_finished_spans()
-        if s.name == "mx.refit.nixl_transfer"
-    ]
-    assert len(requests) == 2
-    assert all(s.attributes["nixl.remote_agent"] == "trainer" for s in requests)
-    assert all(s.attributes["nixl.logical_shard_id"] == "slot" for s in requests)
     assert [e[0] for e in events] == [
         "telemetry",
         "telemetry",

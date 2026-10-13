@@ -16,7 +16,6 @@ from dataclasses import dataclass
 
 import pytest
 
-from modelexpress import telemetry
 from modelexpress.refit.reshard.transport import (
     NixlReshardTransport,
     ReadDescriptor,
@@ -37,7 +36,6 @@ class _StubManager:
         self.calls = []  # (remote_agent_name, ranges, mem_type, timeout)
         self.events = []  # ("post", agent) / ("await", n) / ("execute", agent)
         self.local_mem_types = []
-        self.logical_shard_ids = []
         self.released = 0
         self._fail_post_on = fail_post_on
 
@@ -47,7 +45,6 @@ class _StubManager:
         if remote_agent_name == self._fail_post_on:
             raise RuntimeError(f"prep failed for {remote_agent_name}")
         self.local_mem_types.append(local_mem_type)
-        self.logical_shard_ids.append(telemetry._refit_attributes.get().get("nixl.logical_shard_id"))
         self.calls.append((remote_agent_name, list(ranges), mem_type, None))
         self.events.append(("post", remote_agent_name))
         return _StubPosted(
@@ -75,7 +72,6 @@ class _StubManager:
         local_mem_type=None,
     ):
         self.local_mem_types.append(local_mem_type)
-        self.logical_shard_ids.append(telemetry._refit_attributes.get().get("nixl.logical_shard_id"))
         self.calls.append((remote_agent_name, list(ranges), mem_type, timeout_seconds))
         self.events.append(("execute", remote_agent_name))
         total = sum(n for (_r, _l, n, _d) in ranges)
@@ -134,7 +130,6 @@ def test_groups_per_session_and_resolves_agent_device():
 
     # One batched READ per session.
     assert len(mgr.calls) == 2
-    assert mgr.logical_shard_ids == [None, None]
     by_agent = {c[0]: c for c in mgr.calls}
 
     _a_agent, a_ranges, a_mem, _a_timeout = by_agent["trainer-agent-A"]
@@ -144,21 +139,6 @@ def test_groups_per_session_and_resolves_agent_device():
 
     _b_agent, b_ranges, _m, _t = by_agent["trainer-agent-B"]
     assert b_ranges == [(2000, 20, 8, 5)]
-
-
-@pytest.mark.parametrize("serial", [False, True])
-def test_logical_shard_ids_survive_replica_rebinding(monkeypatch, serial):
-    monkeypatch.setenv("MX_RESHARD_SERIAL_READS", str(int(serial)))
-    manager = _StubManager()
-    for suffix in ("original", "replacement"):
-        agents = {"sA": "trainer-A-" + suffix, "sB": "trainer-B-" + suffix}
-        transport = NixlReshardTransport(
-            manager, agents, {"sA": 0, "sB": 1},
-            source_slots={agents["sA"]: "logical-A", agents["sB"]: "logical-B"},
-        )
-        transport.read(_two_session_descriptors())
-        assert "nixl.logical_shard_id" not in telemetry._refit_attributes.get()
-    assert manager.logical_shard_ids == ["logical-A", "logical-B"] * 2
 
 
 def test_stats_accumulate_across_sessions():

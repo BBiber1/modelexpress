@@ -1964,13 +1964,30 @@ ports; when no spans are recording, trace-only work is skipped.
 optional `MX_REFIT_EXPERIMENT` and `MX_REFIT_STAGING_MODE` values label traces.
 Each detailed `mx.refit.nixl_transfer` READ span identifies the remote source
 agent as `nixl.remote_agent`; the enclosing generator span identifies the
-receiver. `mx.refit.nixl_batch` also carries `nixl.remote_agent` when every
-request has the same peer. Mixed-peer batches omit that field; use their
-request spans to inspect source distribution. Agent IDs are not metric labels.
-Trainer-source request spans also carry `nixl.logical_shard_id`, the logical
-source slot served by the selected replica. Unlike the agent ID, this identity
-is preserved across replica rebinding. Batches carry it only when every request
-has the same known logical shard ID; paths without logical shard metadata omit it.
+receiver. Agent IDs are not metric labels. Logical shard attribution is derived
+in Jaeger from this existing source identity and the generator's binding snapshot;
+READs carry no additional shard attributes or tracing context.
+
+`mx.refit.logical_plan_create` records a plan ID, mesh generation, and the logical
+groups used by that generator, including each group's advertised replica count.
+Missing replica information remains unknown; telemetry does not probe replicas.
+This snapshot and descriptor statistics are calculated only at plan creation.
+`mx.refit.physical_replica_rebinding` records the selected worker and remote agent
+for each group when the binding is created or changes. Each preparation attaches
+cached plan and binding references to its enclosing span. Jaeger uses these
+snapshots for generation/rank tables and annotates homogeneous batches only when
+all descendant READs have an unambiguous logical shard identity.
+
+Cache schema version 2 distinguishes logical-plan retention (`plan_cache_hits`
+and `plan_cache_misses`) from whole physical-binding reuse
+(`physical_binding_cache_hits` and `physical_binding_cache_misses`). Replica cache
+hits/misses count each logical group once per preparation, even across multiple
+staging batches; a miss in any batch makes that group a miss. Unchanged bindings
+report all groups as hits using a cached group count. Rebind attempts count
+preparations needing physical setup, including initial setup. Descriptor cache
+hits/misses and builds retain their staging-batch units. A replica change that
+retains the logical plan is a warm update. Historical traces retain their legacy
+physical-binding interpretation of the plan-cache counters.
 Native NIXL telemetry is collected without setting NIXL exporter variables and
 is exported through the configured OTLP endpoints. Missing native samples are
 reported as incomplete telemetry and do not fail transfers.
