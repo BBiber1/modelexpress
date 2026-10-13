@@ -23,7 +23,7 @@ from typing import Any, NamedTuple, cast
 
 import torch
 from modelexpress import envs, p2p_pb2, telemetry
-from modelexpress.refit.timing import refit_span
+from modelexpress_rl.refit.timing import current_refit_timing, refit_span
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -772,8 +772,24 @@ class _NixlStagedTransfer:
             previous.trainer_source_snapshot.mesh_generation,
         ) == (trainer.mesh_id, trainer.mesh_generation)
 
-    @telemetry.span("mx.refit.bounded_plan_compile")
     def _compile_streaming(
+        self,
+        trainer: TrainerSourceSnapshot,
+        capture: CaptureResult,
+        parameter_layout: Mapping,
+        metrics: dict,
+        binding: _SourceBinding,
+    ) -> _StreamingSchedule:
+        with telemetry.span("mx.refit.bounded_plan_compile") as span:
+            try:
+                return self._compile_streaming_impl(
+                    trainer, capture, parameter_layout, metrics, binding
+                )
+            finally:
+                if span.is_recording():
+                    span.set_attributes(metrics)
+
+    def _compile_streaming_impl(
         self,
         trainer: TrainerSourceSnapshot,
         capture: CaptureResult,
@@ -820,6 +836,10 @@ class _NixlStagedTransfer:
                 if self._pack_modules and not plan.source_replay else modules
             )
             compiled = _StreamingSchedule(plan, modules, batches)
+            metrics.update(
+                module_batches=len(compiled.module_batches),
+                batches=len(compiled.batches),
+            )
             logger.info("compiled bounded transfer plan")
             return compiled
 
@@ -1569,7 +1589,12 @@ class _NixlStagedTransfer:
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
-            self._verify(prepared)
+            if current_refit_timing() is None:
+                with telemetry.span("mx.refit.digest_verification"):
+                    self._verify(prepared)
+            else:
+                with refit_span("receive_sync", duration_key="digest_verification_s"):
+                    self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
         # This is the path the FSDP trainer refits over, and the path the 20x
