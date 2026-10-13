@@ -87,7 +87,7 @@ def test_streaming_prepare_exports_cache_counters_on_existing_outer_span(recordi
         def iter_bounded(self, _prepared, _metrics):
             return iter(())
 
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=lambda manifest: None)
     source = ResolvedTrainerSource(
         TrainerSourceSnapshot(
             mesh_id="mesh",
