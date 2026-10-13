@@ -33,6 +33,7 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
+from modelexpress import telemetry
 from modelexpress.refit.timing import (
     RefitTimingRecorder,
     current_refit_timing,
@@ -57,13 +58,15 @@ def start_cycle(
     of a cycle, since lower layers are also reachable from callers that never
     started one.
     """
-    if not envs.MX_REFIT_TIMING:
+    if not envs.MX_REFIT_TIMING and not telemetry.enabled():
         return None
     if current_refit_timing() is not None:
         # A caller driving its own cycle wins. Nesting a second recorder would
         # split one refit across two records and leave both looking incomplete.
         return None
-    return RefitTimingRecorder(backend=backend, version=version_id, rank=rank)
+    return RefitTimingRecorder(
+        backend=backend, version=version_id, rank=rank, log_enabled=envs.MX_REFIT_TIMING
+    )
 
 
 @contextlib.contextmanager

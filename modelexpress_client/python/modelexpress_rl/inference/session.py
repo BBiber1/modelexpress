@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import grpc
+from modelexpress import telemetry
 from modelexpress.refit.timing import refit_span
 from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.types import ManifestMismatchError
@@ -112,6 +113,7 @@ class WeightUpdateSession:
                 errors[source_kind] = error
         return errors
 
+    @telemetry.span("mx.refit.prepare_update")
     def stage(
         self,
         version: WeightVersion,
@@ -187,6 +189,7 @@ class WeightUpdateSession:
             self._close_lease(group, versions[-1].version_id, primary_error)
             raise
 
+    @telemetry.span("mx.refit.prepare_candidates")
     def _stage_candidates(
         self,
         version: WeightVersion,
@@ -229,6 +232,7 @@ class WeightUpdateSession:
             f"no usable refit source for weight version {version.version_id!r}"
         )
 
+    @telemetry.span("mx.refit.prepare_replay_chain")
     def _stage_replay_chain(
         self,
         versions: tuple[WeightVersion, ...],
