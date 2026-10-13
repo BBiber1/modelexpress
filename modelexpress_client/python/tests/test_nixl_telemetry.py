@@ -9,7 +9,7 @@ import pytest
 
 pytest.importorskip("opentelemetry.sdk")
 from modelexpress import telemetry
-from modelexpress_rl.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
