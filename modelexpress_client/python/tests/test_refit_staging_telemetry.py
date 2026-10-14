@@ -90,7 +90,7 @@ def test_streaming_prepare_exports_cache_counters_on_existing_outer_span(recordi
         def iter_bounded(self, _prepared, _metrics):
             return iter(())
 
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=lambda manifest, *, trainer_mesh: None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer())
     source = ResolvedTrainerSource(
         TrainerSourceSnapshot(
             mesh_id="mesh",
@@ -273,7 +273,6 @@ def test_mesh_generation_replacement_exports_cold_work_and_current_values(record
         replacement = harness.transfer.prepare(
             manifests=[shard.metadata for shard in snapshot.shards],
             trainer_snapshot=snapshot,
-            capture_layout=lambda _: (harness.capture, harness.layout),
         )
     metrics, installed = harness.collect(replacement)
     test_refit_bounded_descriptors._check_values(harness, installed)
@@ -417,7 +416,6 @@ def test_real_checksum_verification_exports_success_and_error_timing(
     corrupted = harness.transfer.prepare(
         manifests=[shard.metadata for shard in snapshot.shards],
         trainer_snapshot=snapshot,
-        capture_layout=lambda _: (harness.capture, harness.layout),
         checksums=MappingProxyType({key: "incorrect" for key in valid.checksums}),
     )
     failed_timing = RefitTimingRecorder(backend="rl_generator", version="corrupted", rank=0)

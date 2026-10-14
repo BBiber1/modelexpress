@@ -72,10 +72,10 @@ def _prepare(harness, *, worker="worker", generation=1, known_replicas=True):
         (name, "source", tensor.data_ptr(), (0, 0), (4, 4)): tensor_digest(tensor)
         for name, tensor in harness.sources.items()
     }) if envs.MX_RESHARD_PUBLISH_DIGEST else None
+    harness.transfer._capture_layout = lambda _manifest: (harness.capture, harness.layout)
     return harness.transfer.prepare(
         trainer_snapshot=snapshot,
         manifests=blobs,
-        capture_layout=lambda _manifest: (harness.capture, harness.layout),
         checksums=checksums,
     )
 
