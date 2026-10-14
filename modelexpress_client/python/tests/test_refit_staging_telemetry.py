@@ -73,7 +73,7 @@ def test_streaming_prepare_exports_cache_counters_on_existing_outer_span(recordi
     class Transfer:
         bounded_staging = True
 
-        def prepare(self, **_kwargs):
+        def stage(self, **_kwargs):
             return SimpleNamespace(
                 metrics={
                     "plan_cache_hits": 1,
@@ -97,7 +97,7 @@ def test_streaming_prepare_exports_cache_counters_on_existing_outer_span(recordi
     )
     with telemetry.refit_attributes(role="generator", rank=3):
         with telemetry.span("mx.refit.stage_weight") as parent:
-            method.prepare(version=None, source=source)
+            method.stage(version=None, source=source)
 
     assert parent.attributes["mx.measurement.plan_cache_hits"] == 1
     assert parent.attributes["mx.measurement.plan_cache_misses"] == 0
@@ -267,7 +267,7 @@ def test_mesh_generation_replacement_exports_cold_work_and_current_values(record
     recording.clear()
     with telemetry.span("mx.refit.streaming_prepare"):
         snapshot = replace(harness.transfer.cached_trainer_source(), mesh_generation=2)
-        replacement = harness.transfer.prepare(
+        replacement = harness.transfer.stage(
             manifests=[shard.metadata for shard in snapshot.shards],
             trainer_snapshot=snapshot,
             capture_layout=lambda _: (harness.capture, harness.layout),
@@ -411,7 +411,7 @@ def test_real_checksum_verification_exports_success_and_error_timing(
     assert valid_stage["metadata"]["digest_verification_s"] >= 0
 
     snapshot = harness.transfer.cached_trainer_source()
-    corrupted = harness.transfer.prepare(
+    corrupted = harness.transfer.stage(
         manifests=[shard.metadata for shard in snapshot.shards],
         trainer_snapshot=snapshot,
         capture_layout=lambda _: (harness.capture, harness.layout),
