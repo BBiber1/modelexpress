@@ -13,9 +13,11 @@ from modelexpress.refit.timing import (
     add_refit_duration,
     refit_span,
     set_refit_cold,
+    current_refit_timing,
 )
 
 from ...train import WeightPayloadFormat
+from ...version import TrainerMeshRef
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
     _StagedNixlWeights,
@@ -31,6 +33,8 @@ from ..plan import (
     UpdateMethod,
     WeightSource,
 )
+
+from ..source.trainer import TrainerPreparationInputs
 
 
 class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
@@ -55,6 +59,26 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         return self._transfer.cached_trainer_source()
 
     @property
+    def prepared_mesh(self) -> TrainerMeshRef | None:
+        return self._transfer.prepared_mesh
+
+    def prepare(
+        self,
+        preparation: TrainerPreparationInputs | None = None,
+    ) -> None:
+        if not isinstance(preparation, TrainerPreparationInputs):
+            raise ValueError("trainer preparation requires resolved mesh inputs")
+        if self._active_staged is not None or self._active_streamed is not None:
+            raise RuntimeError("release the active update before preparing another")
+        set_refit_cold(True)
+        with refit_span("transfer_planning", accumulate_metadata=True):
+            plan = self._transfer.compile_mesh(
+                preparation.mesh.ref, preparation.sources, self._capture_layout,
+            )
+        preparation.validate_mesh()
+        self._transfer.retain_mesh_plan(plan)
+
+    @property
     def capabilities(self) -> MethodCapabilities:
         return MethodCapabilities(
             payload_formats=frozenset({WeightPayloadFormat.FULL_TENSOR}),
@@ -62,7 +86,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             artifact_type=PreparedEngineTensors,
         )
 
-    def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
+    def stage(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, ResolvedTrainerSource):
@@ -70,7 +94,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         manifests = [item.metadata for item in source.snapshot.shards]
         is_streaming = self._transfer.bounded_staging
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
-            prepared = self._transfer.prepare(
+            prepared = self._transfer.stage(
                 manifests=manifests,
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
@@ -78,7 +102,8 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 capture_layout=self._capture_layout,
             )
             counters.update(prepared.metrics)
-        set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
+        recorder = current_refit_timing()
+        set_refit_cold(bool(recorder and recorder.cold) or not bool(prepared.metrics.get("plan_cache_hits")))
         if is_streaming:
             metrics = dict(prepared.metrics)
             streamed = PreparedStreamingTensors(
@@ -90,7 +115,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             )
             self._active_streamed = streamed
             return streamed
-        self._active_staged = self._transfer.stage(prepared)
+        self._active_staged = self._transfer.execute(prepared)
         _attribute_transfer(self._active_staged.metrics)
         return PreparedEngineTensors(staged=self._active_staged)
 

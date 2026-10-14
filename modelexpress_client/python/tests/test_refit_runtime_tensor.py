@@ -90,7 +90,7 @@ def test_runtime_method_defers_direct_receive_until_installation():
         worker_id="worker-1",
     )
 
-    prepared = method.prepare(version=object(), source=source)
+    prepared = method.stage(version=object(), source=source)
 
     assert isinstance(prepared, PreparedRuntimeTensors)
     assert transfer.prepared_tensors is runtime_tensors
@@ -117,7 +117,7 @@ def test_runtime_method_keeps_pretransfer_failure_recoverable():
         transfer=transfer,
         runtime_tensors={"model.weight": torch.empty(1)},
     )
-    prepared = method.prepare(
+    prepared = method.stage(
         version=object(),
         source=GeneratorPeerUpdateSource(
             worker=p2p_pb2.WorkerMetadata(),
@@ -141,7 +141,7 @@ def test_runtime_method_reacquires_lease_before_pretransfer_retry():
         transfer=transfer,
         runtime_tensors={"model.weight": torch.empty(1)},
     )
-    prepared = method.prepare(
+    prepared = method.stage(
         version=object(),
         source=GeneratorPeerUpdateSource(
             worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
@@ -170,7 +170,7 @@ def test_runtime_method_rejects_retry_after_transfer_started():
         transfer=transfer,
         runtime_tensors={"model.weight": torch.empty(1)},
     )
-    prepared = method.prepare(
+    prepared = method.stage(
         version=object(),
         source=GeneratorPeerUpdateSource(
             worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
@@ -196,7 +196,7 @@ def test_runtime_method_releases_reserved_peer_without_apply():
         transfer=transfer,
         runtime_tensors={"model.weight": torch.empty(1)},
     )
-    prepared = method.prepare(
+    prepared = method.stage(
         version=object(),
         source=GeneratorPeerUpdateSource(
             worker=p2p_pb2.WorkerMetadata(),
@@ -218,7 +218,7 @@ def test_runtime_method_rejects_a_trainer_source():
     source = TrainerSourceSnapshot(mesh_id="mesh", mesh_generation=1, shards=())
 
     try:
-        method.prepare(version=object(), source=source)
+        method.stage(version=object(), source=source)
     except TypeError as error:
         assert "generator" in str(error).lower()
     else:

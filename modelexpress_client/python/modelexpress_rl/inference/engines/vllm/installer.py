@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from modelexpress.accelerators import accelerator_backend_for
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
@@ -861,8 +862,13 @@ class _VllmInstaller(EngineInstaller):
             self._parameter_aliases(model), LAYERWISE_INFO
         )
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
-            initialize_layerwise_reload(model)
             try:
+                try:
+                    initialize_layerwise_reload(model)
+                except Exception as error:
+                    raise StrategyRecoveryError(
+                        "layout capture initialization failed; restart the generator engine"
+                    ) from error
                 self._restore_parameter_aliases(aliases)
                 # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
                 for _, param in model.named_parameters():
@@ -879,12 +885,21 @@ class _VllmInstaller(EngineInstaller):
                     for name, p in model.named_parameters()
                 }
             finally:
+                restore_error = None
                 for layer in model.modules():
                     info = LAYERWISE_INFO.get(layer)
                     if info is not None:
-                        if info.kernel_tensors is not None:
-                            _place_kernel_tensors(layer, info)
-                        info.reset()
+                        try:
+                            if info.kernel_tensors is not None:
+                                _place_kernel_tensors(layer, info)
+                            info.reset()
+                        except Exception as error:
+                            if restore_error is None:
+                                restore_error = error
+                if restore_error is not None:
+                    raise StrategyRecoveryError(
+                        "layout capture restoration failed; restart the generator engine"
+                    ) from restore_error
         logger.info(
             "captured %d copies and %d unsupported sources (quantized=%s)",
             len(capture.copies),
